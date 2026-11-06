@@ -429,6 +429,108 @@ fn a_retry_with_the_same_key_stores_one_message() {
     assert_eq!(message_count(&ctx), 2);
 }
 
+fn keyed(to: &str, body: &str, response_required: bool, key: &str) -> SendMessage {
+    SendMessage {
+        response_required,
+        to_session_id: SessionId(Arc::from(to)),
+        body: body.into(),
+        as_session: None,
+        idempotency_key: Some(key.into()),
+    }
+}
+
+#[test]
+fn racing_attempts_with_the_same_key_store_one_message() {
+    // A retry sent while the timed-out first attempt is still running: both
+    // look for the first send at once, and only one may store and push.
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    let start = std::sync::Barrier::new(8);
+    let results: Vec<SendMessageResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                s.spawn(|| {
+                    start.wait();
+                    keyed("recipient", "hi", false, "race")
+                        .execute(cmd_ctx(&ctx, Some("c-sender")))
+                        .expect("every attempt succeeds")
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(
+        results
+            .windows(2)
+            .all(|w| w[0].message_id == w[1].message_id),
+        "one message id"
+    );
+    // A fresh send reports its push (`unavailable` here, with no live client);
+    // one that found the first send reports `unknown`. Two fresh sends would
+    // both store over the same id and both push, so the count can't show it.
+    let fresh = results
+        .iter()
+        .filter(|r| r.live_push != LivePushStatus::Unknown)
+        .count();
+    assert_eq!(fresh, 1, "exactly one attempt stored and pushed");
+    assert_eq!(message_count(&ctx), 1);
+}
+
+#[test]
+fn a_retry_finds_its_send_after_the_recipient_left_the_roster() {
+    // The retry isn't resolved again: the token may now name another session,
+    // or none, and it's still the same send.
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    let gone = session("recipient", None);
+    set_session(&ctx, &gone);
+    let first = keyed("recipient", "hi", false, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("first send succeeds");
+    let del = MEvent::from_item(&gone, MEventType::DEL, &Uuid::new_v4().to_string());
+    ctx.apply_event_batch(vec![del]).expect("apply Session DEL");
+
+    let retry = keyed("recipient", "hi", false, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("the retry finds the stored send");
+    assert_eq!(retry.message_id, first.message_id);
+    assert_eq!(retry.to_session_id, first.to_session_id);
+    assert_eq!(message_count(&ctx), 1);
+}
+
+#[test]
+fn a_key_reused_with_another_response_required_is_refused() {
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    keyed("recipient", "hi", false, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("first send succeeds");
+    let err = keyed("recipient", "hi", true, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect_err("a changed response_required isn't the same message");
+    assert!(err.message.contains("different message"), "{}", err.message);
+    assert_eq!(message_count(&ctx), 1);
+}
+
+#[test]
+fn an_empty_or_overlong_key_is_refused() {
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    for key in [String::new(), "  ".into(), "k".repeat(129)] {
+        let err = keyed("recipient", "hi", false, &key)
+            .execute(cmd_ctx(&ctx, Some("c-sender")))
+            .expect_err("the key is refused");
+        assert!(err.message.contains("idempotencyKey"), "{}", err.message);
+    }
+    keyed("recipient", "hi", false, &"k".repeat(128))
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("a 128-byte key is accepted");
+    assert_eq!(message_count(&ctx), 1);
+}
+
 #[test]
 fn operator_token_routes_to_the_humans_most_recently_active_agent() {
     // Human-via-agent routing: address the PERSON by their operator identity

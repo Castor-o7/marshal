@@ -119,7 +119,10 @@ pub struct RecipientStatus {
     /// The recipient's session is on the roster. `false` once it has been
     /// reaped or has ended.
     pub on_roster: bool,
-    /// The recipient has marked this message read.
+    /// The recipient's read mark exists for this message. That isn't proof the
+    /// recipient's agent saw it: for a recipient that doesn't ack its own pushes
+    /// (`acks_pushes`), the daemon writes the mark as soon as a live push is
+    /// queued on its connection, so `true` there can mean only "pushed".
     pub read: bool,
 }
 
