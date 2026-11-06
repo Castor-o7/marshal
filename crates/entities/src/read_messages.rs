@@ -103,6 +103,24 @@ pub struct MessageView {
     pub body: String,
     pub sent_at: i64,
     pub read_by_me: bool,
+    /// On a direct message the caller sent: whether its recipient is still on the
+    /// roster and has read it, so a sender can see mail that went unread when its
+    /// recipient was reaped. The message itself is kept for the recipient's
+    /// return. `None` on anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<RecipientStatus>,
+}
+
+/// What the sender of a direct message can see about its recipient.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-export", derive(myko::TS), ts(export))]
+pub struct RecipientStatus {
+    /// The recipient's session is on the roster. `false` once it has been
+    /// reaped or has ended.
+    pub on_roster: bool,
+    /// The recipient has marked this message read.
+    pub read: bool,
 }
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -202,6 +220,16 @@ impl CommandHandler for ReadMessages {
                 body: m.body.clone(),
                 sent_at: m.sent_at,
                 read_by_me: my_reads.contains(&m.id),
+                recipient: m
+                    .to_session_id
+                    .as_ref()
+                    .filter(|_| m.from_session_id == me.id)
+                    .map(|to| RecipientStatus {
+                        on_roster: sessions.iter().any(|s| &s.id == to),
+                        read: reads
+                            .iter()
+                            .any(|r| r.message_id == m.id && &r.session_id == to),
+                    }),
             })
             .collect();
 

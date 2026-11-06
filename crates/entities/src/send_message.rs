@@ -30,12 +30,16 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    message::{CONTEXT_BODY_MAX_CHARS, Message, MessageId, context_preview},
+    message::{CONTEXT_BODY_MAX_CHARS, GetMessagesByIds, Message, MessageId, context_preview},
     message_read::{MessageRead, MessageReadId},
     notify::NotifyChannel,
     session::{GetAllSessions, Session, SessionId, resolve_caller},
     wake_watcher::{GetAllWakeWatchers, WakeWatcher},
 };
+
+/// Namespace for message ids derived from an idempotency key. Marshal's own,
+/// so these ids can't coincide with those of any other UUIDv5 scheme.
+const IDEMPOTENT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x7a4776dd_d70f_405c_898c_8432b782d05f);
 
 #[myko_command(SendMessageResult)]
 pub struct SendMessage {
@@ -52,6 +56,15 @@ pub struct SendMessage {
     /// this; the server derives the sender from the live connection.
     #[serde(default, rename = "asSession", skip_serializing_if = "Option::is_none")]
     pub as_session: Option<SessionId>,
+
+    /// Makes a retry safe. Sending again with the key of a send whose outcome
+    /// wasn't seen, such as one that timed out, stores and delivers nothing new.
+    #[serde(
+        default,
+        rename = "idempotencyKey",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,10 +175,42 @@ impl CommandHandler for SendMessage {
         let (recipient, to_operator) =
             resolve_recipient(&ctx, &sessions, self.to_session_id.0.as_ref())?;
 
+        // The id comes from the sender and key, so a retry finds the first send.
+        let id = match &self.idempotency_key {
+            Some(key) => Uuid::new_v5(
+                &IDEMPOTENT_ID_NAMESPACE,
+                format!("{}\0{key}", sender.id.0).as_bytes(),
+            ),
+            None => Uuid::now_v7(),
+        };
+        let id = MessageId(Arc::from(id.to_string()));
+        if self.idempotency_key.is_some() {
+            let found: Vec<Arc<Message>> = ctx.exec_query(GetMessagesByIds {
+                ids: vec![id.clone()],
+            })?;
+            if let Some(first) = found.first() {
+                if first.body != self.body || first.to_session_id.as_ref() != Some(&recipient.id) {
+                    return Err(err(
+                        &ctx,
+                        "this idempotency key was already used for a different message",
+                    ));
+                }
+                // Already stored, and delivered or waiting in the inbox. What
+                // happened to its live push wasn't recorded, so don't claim any.
+                return Ok(SendMessageResult {
+                    message_id: first.id.clone(),
+                    to_session_id: recipient.id.clone(),
+                    sent_at: first.sent_at,
+                    live_push: LivePushStatus::Unknown,
+                    wake: WakeStatus::Unobserved,
+                    delivered_live: false,
+                });
+            }
+        }
         let now = Utc::now().timestamp_millis();
         let msg = Message {
             response_required: self.response_required,
-            id: MessageId(Arc::from(Uuid::now_v7().to_string())),
+            id,
             from_session_id: sender.id.clone(),
             to_session_id: Some(recipient.id.clone()),
             to_room_id: None,

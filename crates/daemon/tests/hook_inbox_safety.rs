@@ -119,6 +119,7 @@ impl Daemon {
             body: body.into(),
             response_required: false,
             as_session: Some(SessionId(Arc::from(from))),
+            idempotency_key: None,
         }
         .execute(self.context())
         .expect("send message");

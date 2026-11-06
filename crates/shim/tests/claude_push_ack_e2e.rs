@@ -184,6 +184,7 @@ impl Cell {
             to_session_id: SessionId(Arc::from(to)),
             body: body.into(),
             as_session: Some(SessionId(Arc::from(SENDER))),
+            idempotency_key: None,
         }
         .execute(self.context())
         .expect("send message");

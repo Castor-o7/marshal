@@ -222,6 +222,7 @@ fn del_session_then_reregister_does_not_reinject_acked_direct_dm() {
         to_session_id: SessionId(Arc::from("sess-bravo")),
         body: "the one and only direct DM".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let response_cell = client_a.send_command::<SendMessage, SendMessageResult>(&cmd);
     {
