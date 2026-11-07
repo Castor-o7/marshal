@@ -128,6 +128,12 @@ launcher.
   null `agent_id` because the shim's own subscribed view hadn't caught up. Passes 15 of 15 locally.
   Done when: the test reads again until the view catches up, within its bound, and passes on the
   fork's hosted CI.
+- [ ] **MAR-34: Supporting: runner-bound workflows run only on upstream.** Every Release run on fork
+  main since 8231de7 ended "cancelled" with no jobs, because it waits for upstream's self-hosted
+  runners, so Rally's digest flagged each merge red. Josh chose (2026-11-06) to run them only upstream.
+  Done when: Release's self-hosted jobs and the public CI jobs carry `if: github.repository ==
+  'ignition-is-go/marshal'`, and the next merge's Release run on fork main ends skipped, not cancelled.
+  Fork-only: never send this hunk upstream as-is.
 
 ## Later: other harnesses
 
