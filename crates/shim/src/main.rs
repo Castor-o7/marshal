@@ -19,6 +19,7 @@ mod mcp;
 mod roster_read;
 mod session_discovery;
 mod spawn;
+mod spawn_manage;
 mod spawn_team;
 mod statusline;
 mod terminal_send;
@@ -250,6 +251,7 @@ Commands:
   spawn         Start a session in tmux and wait for it to join:
                 spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]
                       [--task <text>]
+                spawn list | attach <name> | stop <name>   (sessions spawn started)
   spawn-team    Start a team from a TOML file and give each member its task:
                 spawn-team <team.toml> [--timeout <secs>]
 
