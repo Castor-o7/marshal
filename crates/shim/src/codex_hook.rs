@@ -489,6 +489,15 @@ pub(crate) fn register_session(base: &str, session_id: &str, cwd: &str) -> Optio
     None
 }
 
+/// End `session_id` at the daemon, as a harness's SessionEnd hook does: its
+/// roster row goes, its room memberships with it, and its waits end. Used by
+/// `spawn stop` (MAR-30), since Claude's plugin has no SessionEnd hook. Returns
+/// whether the daemon answered.
+pub(crate) fn end_session(base: &str, session_id: &str) -> bool {
+    let body = serde_json::json!({ "session_id": session_id }).to_string();
+    http_post(base, "/hook/session-end", &body, TIMEOUT).is_some()
+}
+
 /// Tell the daemon whether the Codex bridge can wake `session_id`, so the
 /// roster shows its wake path (MAR-12). Goes to the hook listener at `base`,
 /// as the bridge's registrations do. Returns whether the daemon now records it

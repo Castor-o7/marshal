@@ -254,6 +254,10 @@ pub(crate) fn harness_env(
 }
 
 pub(crate) fn run(rest: &[String]) -> Result<()> {
+    // `spawn list | attach | stop` manage what spawn started (MAR-30).
+    if let Some(sub @ ("list" | "attach" | "stop")) = rest.first().map(String::as_str) {
+        return crate::spawn_manage::run(sub, &rest[1..]);
+    }
     let args = parse_args(rest)?;
     let cwd = match &args.cwd {
         Some(dir) => dir.clone(),
