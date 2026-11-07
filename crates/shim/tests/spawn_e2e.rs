@@ -228,9 +228,14 @@ impl Rig {
 
     /// Run `marshal-shim <args>` with this rig's tmux, harness and home.
     fn shim(&self, address: &str, args: &[&str]) -> std::process::Child {
+        self.shim_env(address, args, &[])
+    }
+
+    fn shim_env(&self, address: &str, args: &[&str], env: &[(&str, &Path)]) -> std::process::Child {
         let home = self.dir.path().join("home");
         Command::new(SHIM)
             .args(args)
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
             .env_remove("TMUX")
             .env("TMUX_TMPDIR", self.dir.path().join("tmux"))
             .env(
@@ -630,4 +635,136 @@ fn a_team_with_a_taken_tmux_name_starts_no_one() {
     );
     assert!(!rig.has_session("e2e-one"));
     assert!(!member_marker(&rig, "one-dir").exists());
+}
+
+/// A stand-in desktop terminal: records its arguments, then runs what follows
+/// `-e` under script(1), so `tmux attach` gets the pty a window would give it.
+/// Like a real terminal, it sets TERM: with TERM unset or `dumb`, as on a CI
+/// runner, `tmux attach` fails with "open terminal failed: terminal does not
+/// support clear". It also keeps script's stdin open, as a precaution only,
+/// since spawn starts the terminal with stdin at /dev/null. That was never
+/// shown to matter. script's output goes to `terminal-out`, for the failure
+/// message.
+fn fake_terminal(rig: &Rig) -> PathBuf {
+    let path = rig.dir.path().join("fake-terminal");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {args}\n[ \"$1\" = -e ] || exit 9\nshift\nexport TERM=xterm-256color\nsleep 300 | script -qfc \"$(printf '%q ' \"$@\")\" /dev/null > {out} 2>&1\n",
+            args = rig.dir.path().join("terminal-args").display(),
+            out = rig.dir.path().join("terminal-out").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn window_opens_a_terminal_attached_to_the_tmux_session() {
+    if !have_tmux() {
+        return;
+    }
+    if Command::new("script").arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI needs script(1) for the window test"
+        );
+        eprintln!("script(1) isn't installed: skipping the window test");
+        return;
+    }
+    let cell = Cell::spawn();
+    let rig = Rig::new(RECORDING_HARNESS);
+    let terminal = fake_terminal(&rig);
+    let work = rig.work();
+    let child = rig.shim_env(
+        &cell.address,
+        &[
+            "spawn",
+            "claude",
+            "--cwd",
+            work.to_str().unwrap(),
+            "--name",
+            "e2e-window",
+            "--window",
+            "--timeout",
+            "20",
+        ],
+        &[("TERMINAL", terminal.as_path())],
+    );
+    let got = seen(&rig.marker());
+    cell.register("spawn-e2e-window", &got.cwd, Some(&got.agent_id));
+    let out = finish(child);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("opened a "),
+        "{}",
+        text(&out)
+    );
+
+    let args_file = rig.dir.path().join("terminal-args");
+    let deadline = Instant::now() + WAIT;
+    let clients = || {
+        rig.tmux()
+            .args(["list-clients", "-t", "=e2e-window"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+            .unwrap_or(0)
+    };
+    while clients() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        clients(),
+        1,
+        "the window isn't attached to the tmux session; the terminal said: {:?}",
+        std::fs::read_to_string(rig.dir.path().join("terminal-out")).unwrap_or_default()
+    );
+    let args = std::fs::read_to_string(&args_file).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[0], "-e");
+    assert!(args[1].ends_with("tmux"), "{args:?}");
+    assert_eq!(args[2..], ["attach-session", "-t", "=e2e-window"]);
+
+    // Closing the window leaves the session running.
+    let detached = rig
+        .tmux()
+        .args(["detach-client", "-s", "=e2e-window"])
+        .output()
+        .unwrap();
+    assert!(detached.status.success(), "{}", text(&detached));
+    thread::sleep(Duration::from_millis(500));
+    assert!(rig.has_session("e2e-window"));
+}
+
+#[test]
+fn window_with_no_terminal_starts_nothing() {
+    if !have_tmux() {
+        return;
+    }
+    let cell = Cell::spawn();
+    let rig = Rig::new(RECORDING_HARNESS);
+    let work = rig.work();
+    let missing = rig.dir.path().join("no-such-terminal");
+    let out = finish(rig.shim_env(
+        &cell.address,
+        &[
+            "spawn",
+            "claude",
+            "--cwd",
+            work.to_str().unwrap(),
+            "--name",
+            "e2e-nowindow",
+            "--window",
+        ],
+        &[("TERMINAL", missing.as_path())],
+    ));
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nothing was started"),
+        "{}",
+        text(&out)
+    );
+    assert!(!rig.has_session("e2e-nowindow"));
+    assert!(!rig.marker().exists());
 }

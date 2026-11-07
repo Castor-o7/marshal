@@ -30,6 +30,11 @@
 //! joined session's full id. Direct mail wakes an idle session through its
 //! hooks, so it acts on the task in whatever permission mode it started in.
 //!
+//! With `--window`, spawn also opens a desktop terminal on the tmux session
+//! (MAR-29): `$TERMINAL` if it's set, otherwise konsole, running `tmux attach`.
+//! The session still lives in tmux, so closing the window leaves it running and
+//! `spawn list | attach | stop` still work. A missing terminal starts nothing.
+//!
 //! Apart from that send, spawn only reads the roster and registers no session.
 
 use std::path::{Path, PathBuf};
@@ -42,7 +47,7 @@ use hyphae::Gettable;
 use marshal_entities::{GetAllSessionNicknames, GetAllSessions, Session, SessionNickname};
 use myko::client::{ConnectionStatus, MykoClient};
 
-const USAGE: &str = "usage: marshal-shim spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>] [--task <text>]";
+const USAGE: &str = "usage: marshal-shim spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>] [--task <text>] [--window]";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const POLL: Duration = Duration::from_millis(200);
@@ -79,6 +84,8 @@ pub(crate) struct Args {
     pub timeout: Duration,
     /// Sent to the new session as a direct message once it joins (MAR-28).
     pub task: Option<String>,
+    /// Also show the tmux session in a desktop terminal window (MAR-29).
+    pub window: bool,
 }
 
 pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
@@ -90,6 +97,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
         name: None,
         timeout: DEFAULT_TIMEOUT,
         task: None,
+        window: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -106,6 +114,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
                 ensure!(secs > 0, "--timeout must be at least 1 second");
                 parsed.timeout = Duration::from_secs(secs);
             }
+            "--window" => parsed.window = true,
             "--task" => {
                 let task = value()?;
                 ensure!(!task.trim().is_empty(), "--task needs some text\n{USAGE}");
@@ -217,6 +226,72 @@ pub(crate) fn tmux() -> Command {
     Command::new(std::env::var("MARSHAL_TMUX_BIN").unwrap_or_else(|_| "tmux".into()))
 }
 
+/// The desktop terminal for `--window` (MAR-29): `$TERMINAL` if it's set,
+/// otherwise konsole. Josh chose these two for the first cut (2026-11-06);
+/// both take `-e <program> <args>`. macOS is MAR-35.
+pub(crate) fn terminal_program(
+    terminal_env: Option<String>,
+    found: impl Fn(&str) -> bool,
+) -> Result<String> {
+    if let Some(t) = terminal_env
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        ensure!(
+            found(&t),
+            "$TERMINAL is {t:?}, which isn't a program on PATH, so nothing was started"
+        );
+        return Ok(t);
+    }
+    ensure!(
+        found("konsole"),
+        "--window needs a desktop terminal: set $TERMINAL, or install konsole. Nothing was started"
+    );
+    Ok("konsole".into())
+}
+
+/// Whether `program` names a file to run: a path, or a name on `PATH`.
+fn on_path(program: &str, path: Option<std::ffi::OsString>) -> bool {
+    let p = Path::new(program);
+    if p.components().count() > 1 {
+        return p.is_file();
+    }
+    path.is_some_and(|dirs| std::env::split_paths(&dirs).any(|d| d.join(program).is_file()))
+}
+
+/// The window's command line: the terminal running `tmux attach` to the
+/// session, with no shell in between. The session lives in tmux, so closing
+/// the window leaves it running, and `spawn list | attach | stop` still work.
+pub(crate) fn window_args(terminal: &str, tmux: &str, name: &str) -> Vec<String> {
+    vec![
+        terminal.into(),
+        "-e".into(),
+        tmux.into(),
+        "attach-session".into(),
+        "-t".into(),
+        format!("={name}"),
+    ]
+}
+
+fn open_window(terminal: &str, name: &str) -> Result<()> {
+    let tmux = std::env::var("MARSHAL_TMUX_BIN").unwrap_or_else(|_| "tmux".into());
+    let argv = window_args(terminal, &tmux, name);
+    Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "tmux session {name} started, but its window didn't open ({terminal}); \
+                 attach with `marshal-shim spawn attach {name}`"
+            )
+        })?;
+    eprintln!("opened a {terminal} window on tmux session {name}");
+    Ok(())
+}
+
 /// `=name` matches that session exactly, not as a prefix of a longer name.
 pub(crate) fn tmux_has_session(name: &str) -> Result<bool> {
     let status = tmux()
@@ -280,13 +355,22 @@ pub(crate) fn run(rest: &[String]) -> Result<()> {
     );
     let shim = std::env::current_exe().context("finding marshal-shim's own path")?;
     let command = harness_command(args.harness, &shim);
+    // Found before anything starts, so a missing terminal starts nothing.
+    let window = if args.window {
+        Some(terminal_program(std::env::var("TERMINAL").ok(), |p| {
+            on_path(p, std::env::var_os("PATH"))
+        })?)
+    } else {
+        None
+    };
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?
         .block_on(async {
-            let session = launch_and_wait(&name, &cwd, &command, args.timeout).await?;
+            let session =
+                launch_and_wait(&name, &cwd, &command, args.timeout, window.as_deref()).await?;
             match args.task {
                 Some(task) => send_task(&name, &session, task).await,
                 None => Ok(()),
@@ -316,6 +400,7 @@ async fn launch_and_wait(
     cwd: &Path,
     command: &[String],
     timeout: Duration,
+    window: Option<&str>,
 ) -> Result<String> {
     marshal_entities::link();
     let client = MykoClient::new();
@@ -361,6 +446,10 @@ async fn launch_and_wait(
         cwd.display(),
         timeout.as_secs()
     );
+    // Opened before the wait, so a first-run prompt is there to be seen.
+    if let Some(terminal) = window {
+        open_window(terminal, name)?;
+    }
 
     let launched = Instant::now();
     loop {
@@ -451,6 +540,31 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_window_terminal_is_terminal_then_konsole_and_must_exist() {
+        let only = |names: &'static [&'static str]| move |p: &str| names.contains(&p);
+        assert_eq!(
+            terminal_program(Some("kitty".into()), only(&["kitty", "konsole"])).unwrap(),
+            "kitty"
+        );
+        assert_eq!(
+            terminal_program(None, only(&["konsole"])).unwrap(),
+            "konsole"
+        );
+        assert_eq!(
+            terminal_program(Some("  ".into()), only(&["konsole"])).unwrap(),
+            "konsole"
+        );
+        assert!(terminal_program(Some("kitty".into()), only(&["konsole"])).is_err());
+        assert!(terminal_program(None, only(&[])).is_err());
+        assert_eq!(
+            window_args("konsole", "tmux", "dev"),
+            ["konsole", "-e", "tmux", "attach-session", "-t", "=dev"]
+        );
+        assert!(parse_args(&args(&["claude", "--window"])).unwrap().window);
+        assert!(!parse_args(&args(&["claude"])).unwrap().window);
     }
 
     #[test]

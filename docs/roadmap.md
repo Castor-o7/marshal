@@ -89,9 +89,13 @@ launcher.
 - [ ] **MAR-30: Goal 2: Launcher: list, reattach and stop launched sessions.** Depends on MAR-27.
   Done when: the launcher lists the sessions it started, reattaches to one, and stops one so its roster
   row and rooms are cleared.
-- [ ] **MAR-29: Goal 2: Launcher: desktop terminal backends.** Depends on MAR-26. Done when: the
-  launcher opens a visible window on Linux (`$TERMINAL`, konsole, gnome-terminal or kitty) and on macOS
-  (Terminal or iTerm), with the same handshake as tmux.
+- [ ] **MAR-29: Goal 2: Launcher: desktop terminal backends.** Depends on MAR-26. Josh chose
+  (2026-11-06): `$TERMINAL`, then konsole, on Linux; the window attaches to the session's tmux, so
+  closing it leaves the session running; macOS is MAR-35. Done when: `spawn --window` opens a visible
+  window on Murph attached to the session, with the same handshake as tmux.
+- [ ] **MAR-35: Goal 2: Launcher: macOS terminal windows (Terminal, iTerm).** Depends on MAR-29.
+  Done when: `spawn --window` opens a Terminal or iTerm window attached to the session on a Mac, tested
+  on one.
 
 ## Goal 3: Message an agent from a terminal
 
