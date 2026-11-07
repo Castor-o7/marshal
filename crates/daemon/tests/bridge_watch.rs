@@ -132,3 +132,51 @@ fn a_bridge_watched_thread_shows_its_wake_path_until_the_bridge_stops() {
     assert_eq!(watch(&ctx, "thread-1", true), "watching");
     assert!(watched(&ctx, "thread-1"));
 }
+
+fn raw(ctx: &Arc<MykoServerContext>, body: &str) -> String {
+    daemon::hooks::dispatch("/hook/bridge-watch", "harness=codex", body.as_bytes(), ctx)
+        .expect("a known route")
+        .body
+}
+
+fn hold_wait(ctx: &MykoServerContext, sid: &str) {
+    set(
+        ctx,
+        &WakeWatcher {
+            id: marshal_entities::WakeWatcherId(Arc::from(sid)),
+            until: chrono::Utc::now().timestamp_millis() + 120_000,
+        },
+    );
+}
+
+#[test]
+fn a_body_without_an_explicit_watching_bool_changes_nothing() {
+    let ctx = setup();
+    set(&ctx, &session("thread-2", None));
+    hold_wait(&ctx, "thread-2");
+    for body in [
+        r#"{"session_id":"thread-2"}"#,
+        r#"{"session_id":"thread-2","watching":"false"}"#,
+        r#"{"session_id":"thread-2","watching":0}"#,
+        r#"{"session_id":"thread-2","watching":null}"#,
+        "not json",
+    ] {
+        assert_eq!(raw(&ctx, body), "ignored", "{body}");
+        assert!(watched(&ctx, "thread-2"), "{body} must not end the record");
+    }
+}
+
+#[test]
+fn a_claude_sessions_record_is_left_to_its_own_waiter() {
+    // A Claude session's row is bound to its shim's connection; its
+    // WakeWatcher is its hook waiter's, which a bridge must not touch.
+    let ctx = setup();
+    set(&ctx, &session("claude-1", Some("c-claude")));
+    hold_wait(&ctx, "claude-1");
+    assert_eq!(watch(&ctx, "claude-1", false), "not watching");
+    assert!(watched(&ctx, "claude-1"), "the waiter's record stays");
+
+    set(&ctx, &session("claude-2", Some("c-claude-2")));
+    assert_eq!(watch(&ctx, "claude-2", true), "not watching");
+    assert!(!watched(&ctx, "claude-2"), "no record is made for it");
+}

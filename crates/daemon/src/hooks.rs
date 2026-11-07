@@ -222,9 +222,15 @@ fn handle_ack(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
 /// `wake: none`, and a send to it says `unobserved`, though its bridge will
 /// start a turn. Body: `{"session_id": …, "watching": true|false}`. `true`
 /// refreshes the session's `WakeWatcher` (written only when due, as a held
-/// wait's is); `false` ends it. A session that isn't on the roster gets no
-/// record. Like the other hook routes, this trusts the session id it's given:
-/// keep the hook listener on loopback or a trusted network.
+/// wait's is); `false` ends it.
+///
+/// It touches only what a bridge registered: a hook-owned row on the roster
+/// (no client binding), as Codex's are, since Codex's MCP shim registers no
+/// session. A Claude session's row is bound to its shim's connection, and
+/// its record belongs to its own waiter, so it's left alone. So is anything
+/// when `watching` isn't an explicit bool: a malformed body changes nothing.
+/// Like the other hook routes, this trusts the session id it's given: keep
+/// the hook listener on loopback or a trusted network.
 fn handle_bridge_watch(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
     let parsed = parse_body(body);
     let Some(sid) = parsed
@@ -232,19 +238,21 @@ fn handle_bridge_watch(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome
         .and_then(|b| b.get("session_id")?.as_str())
         .filter(|s| !s.is_empty())
     else {
-        return HookOutcome::text(String::new());
+        return HookOutcome::text("ignored".to_string());
     };
-    let watching = parsed
-        .as_ref()
-        .and_then(|b| b.get("watching")?.as_bool())
-        .unwrap_or(false);
+    let Some(watching) = parsed.as_ref().and_then(|b| b.get("watching")?.as_bool()) else {
+        return HookOutcome::text("ignored".to_string());
+    };
     let cmd_ctx = internal_cmd_ctx(ctx);
-    let on_roster = cmd_ctx
+    let bridge_owned = cmd_ctx
         .exec_query(GetAllSessions {})
         .unwrap_or_default()
         .iter()
-        .any(|s| s.id.0.as_ref() == sid);
-    if watching && on_roster {
+        .any(|s| s.id.0.as_ref() == sid && s.client_id.is_none());
+    if !bridge_owned {
+        return HookOutcome::text("not watching".to_string());
+    }
+    if watching {
         mark_waiting(&cmd_ctx, sid, chrono::Utc::now().timestamp_millis());
         HookOutcome::text("watching".to_string())
     } else {
