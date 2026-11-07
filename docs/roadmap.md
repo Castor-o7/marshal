@@ -106,7 +106,14 @@ launcher.
   Murph, and the branch is merged on the fork.
 - [ ] **MAR-17: Goal 3: Terminal send and roster beyond upstream #168.** Done when: whatever of
   muster's terminal commands #168 doesn't cover is listed, and each item is ported or dropped with a
-  reason.
+  reason. The list and Josh's choices (2026-11-06) are in `docs/muster-terminal-gap.md`: `doctor` is
+  ported as MAR-36, and the rest is dropped or already covered.
+- [ ] **MAR-36: Goal 3: `marshal-shim doctor`, a read-only health check.** From muster's `doctor`
+  (MUS-15), without its credential check. Done when: `marshal-shim doctor` reports, one line per
+  check with a fix for each problem, whether the shim on `PATH` is this binary, whether the daemon
+  accepts a connection, and whether Claude Code has the MCP server and every hook in
+  `plugins/marshal-shim/hooks/hooks.json` once each; it changes nothing, and exits non-zero on any
+  failure.
 
 ## Supporting: Claude delivery
 
