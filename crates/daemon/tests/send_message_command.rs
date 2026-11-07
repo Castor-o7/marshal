@@ -155,6 +155,7 @@ fn set_waiter(ctx: &MykoServerContext, id: &str) {
     let watcher = WakeWatcher {
         id: WakeWatcherId(Arc::from(id)),
         until: chrono::Utc::now().timestamp_millis() + 60_000,
+        session_id: None,
     };
     let ev = MEvent::from_item(&watcher, MEventType::SET, &Uuid::new_v4().to_string());
     ctx.apply_event_batch(vec![ev])
@@ -216,6 +217,7 @@ fn a_pull_recipient_with_a_waiter_expects_a_wake() {
     let watcher = WakeWatcher {
         id: WakeWatcherId(Arc::from("recipient")),
         until: chrono::Utc::now().timestamp_millis() + 60_000,
+        session_id: None,
     };
     let ev = MEvent::from_item(&watcher, MEventType::SET, &Uuid::new_v4().to_string());
     ctx.apply_event_batch(vec![ev])

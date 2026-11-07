@@ -171,9 +171,12 @@ async fn handle_hook_request(mut stream: TcpStream, ctx: Arc<MykoServerContext>)
     {
         // As the daemon does: a watched session gets a WakeWatcher, which is
         // what the roster's `wake` and a send's `expected` read (MAR-12).
+        // One record per bridge, naming its session (MAR-4).
+        let bridge = body["bridge"].as_str().unwrap_or("bridge");
         let watcher = WakeWatcher {
-            id: WakeWatcherId(Arc::from(session_id)),
+            id: WakeWatcherId(Arc::from(WakeWatcher::bridge_id(session_id, bridge))),
             until: chrono::Utc::now().timestamp_millis() + 120_000,
+            session_id: Some(SessionId(Arc::from(session_id))),
         };
         if body["watching"] == true {
             internal_context(&ctx)
@@ -721,7 +724,7 @@ fn wake_watched(ctx: &Arc<MykoServerContext>, session_id: &str) -> bool {
         .exec_query(GetAllWakeWatchers {})
         .unwrap_or_default()
         .iter()
-        .any(|w| w.id.0.as_ref() == session_id)
+        .any(|w| w.session() == session_id)
 }
 
 #[cfg(unix)]

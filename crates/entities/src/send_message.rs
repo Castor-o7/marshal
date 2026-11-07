@@ -341,9 +341,7 @@ impl CommandHandler for SendMessage {
             ctx.exec_query(GetAllWakeWatchers {})
                 .unwrap_or_default()
                 .iter()
-                .any(|w: &Arc<WakeWatcher>| {
-                    w.id.0.as_ref() == recipient.id.0.as_ref() && w.until > now
-                })
+                .any(|w: &Arc<WakeWatcher>| w.session() == recipient.id.0.as_ref() && w.until > now)
         };
         let wake = match live_push {
             LivePushStatus::Delivered => WakeStatus::NotNeeded,
