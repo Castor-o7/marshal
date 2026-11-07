@@ -19,6 +19,7 @@ mod mcp;
 mod roster_read;
 mod session_discovery;
 mod spawn;
+mod spawn_team;
 mod statusline;
 mod terminal_send;
 mod tools;
@@ -172,6 +173,11 @@ fn main() -> Result<()> {
             let rest: Vec<String> = argv.collect();
             return spawn::run(&rest);
         }
+        // Start a team of sessions from a TOML file. See `spawn_team`.
+        Some("spawn-team") => {
+            let rest: Vec<String> = argv.collect();
+            return spawn_team::run(&rest);
+        }
         // One-shot cross-platform setup: wire marshal into a Codex install
         // (CLI / IDE / desktop app) by writing the config.toml + AGENTS.md
         // managed blocks. For laptops / the desktop app where there's no
@@ -244,6 +250,8 @@ Commands:
   spawn         Start a session in tmux and wait for it to join:
                 spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]
                       [--task <text>]
+  spawn-team    Start a team from a TOML file and give each member its task:
+                spawn-team <team.toml> [--timeout <secs>]
 
 Options:
   --check        Print \"ok\" and exit (install smoke test)

@@ -44,9 +44,9 @@ use myko::client::{ConnectionStatus, MykoClient};
 
 const USAGE: &str = "usage: marshal-shim spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>] [--task <text>]";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL: Duration = Duration::from_millis(200);
-const MAX_NAME: usize = 64;
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const POLL: Duration = Duration::from_millis(200);
+pub(crate) const MAX_NAME: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Harness {
@@ -55,7 +55,7 @@ pub(crate) enum Harness {
 }
 
 impl Harness {
-    fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         match s {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
@@ -119,7 +119,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
 
 /// tmux takes `.` and `:` in a target as window and pane separators, so a name
 /// is kept to letters, digits, `-` and `_`.
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME
         && name
@@ -153,7 +153,7 @@ fn default_name(harness: Harness, cwd: &Path) -> String {
 ///
 /// `claude` alone would be one argument, which tmux runs through `sh -c`, so
 /// it goes through `env --` to make it two and keep the shell out.
-fn harness_command(harness: Harness, shim: &Path) -> Vec<String> {
+pub(crate) fn harness_command(harness: Harness, shim: &Path) -> Vec<String> {
     match harness {
         Harness::Claude => vec![
             "env".into(),
@@ -188,7 +188,7 @@ fn passed_env(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
         .collect()
 }
 
-fn tmux_new_session_args(
+pub(crate) fn tmux_new_session_args(
     name: &str,
     cwd: &Path,
     env: &[(String, String)],
@@ -213,12 +213,12 @@ fn tmux_new_session_args(
     args
 }
 
-fn tmux() -> Command {
+pub(crate) fn tmux() -> Command {
     Command::new(std::env::var("MARSHAL_TMUX_BIN").unwrap_or_else(|_| "tmux".into()))
 }
 
 /// `=name` matches that session exactly, not as a prefix of a longer name.
-fn tmux_has_session(name: &str) -> Result<bool> {
+pub(crate) fn tmux_has_session(name: &str) -> Result<bool> {
     let status = tmux()
         .args(["has-session", "-t", &format!("={name}")])
         .stdout(std::process::Stdio::null())
@@ -229,7 +229,7 @@ fn tmux_has_session(name: &str) -> Result<bool> {
 }
 
 /// A token for one launch. Fresh each time, so no earlier row can carry it.
-fn new_token() -> String {
+pub(crate) fn new_token() -> String {
     format!("spawn-{}", uuid::Uuid::new_v4().simple())
 }
 
@@ -244,7 +244,10 @@ pub(crate) fn joined<'a>(sessions: &'a [Arc<Session>], token: &str) -> Option<&'
 /// What the harness is given: the listed settings from spawn's environment,
 /// and this launch's token as its `MARSHAL_AGENT_ID`, in place of any the
 /// spawner has.
-fn harness_env(get: impl Fn(&str) -> Option<String>, token: &str) -> Vec<(String, String)> {
+pub(crate) fn harness_env(
+    get: impl Fn(&str) -> Option<String>,
+    token: &str,
+) -> Vec<(String, String)> {
     let mut env = passed_env(get);
     env.push(("MARSHAL_AGENT_ID".into(), token.into()));
     env
@@ -290,7 +293,7 @@ pub(crate) fn run(rest: &[String]) -> Result<()> {
 /// Send the first task as a direct message, the way `tell` does from a
 /// terminal, to the joined session's full id, so it reaches that session and
 /// no other. Direct mail wakes an idle session through its hooks.
-async fn send_task(name: &str, session_id: &str, task: String) -> Result<()> {
+pub(crate) async fn send_task(name: &str, session_id: &str, task: String) -> Result<()> {
     crate::terminal_send::run(
         crate::terminal_send::Target::Named(session_id.to_string()),
         task,
@@ -384,7 +387,7 @@ async fn launch_and_wait(
     }
 }
 
-fn nickname_of(nicknames: &[Arc<SessionNickname>], s: &Session) -> String {
+pub(crate) fn nickname_of(nicknames: &[Arc<SessionNickname>], s: &Session) -> String {
     nicknames
         .iter()
         .find(|n| n.id.0 == s.id.0)
