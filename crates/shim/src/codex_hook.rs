@@ -494,13 +494,44 @@ pub(crate) fn register_session(base: &str, session_id: &str, cwd: &str) -> Optio
 /// as the bridge's registrations do. Returns whether the daemon now records it
 /// as watched.
 pub(crate) fn bridge_watch(base: &str, session_id: &str, watching: bool) -> bool {
-    let body = serde_json::json!({ "session_id": session_id, "watching": watching }).to_string();
+    // The daemon keeps one record per bridge process, named by
+    // `bridge_instance`, so ending this bridge's watch leaves another's (MAR-4).
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "watching": watching,
+        "bridge": bridge_instance(),
+    })
+    .to_string();
     let path = format!(
         "/hook/bridge-watch?host={}&operator={}&harness=codex",
         url_q(&short_host()),
         url_q(&operator())
     );
     http_post(base, &path, &body, TIMEOUT).is_some_and(|reply| reply == "watching")
+}
+
+/// This bridge process's name for its wake-path records (MAR-4): its host,
+/// pid and start time, so a later bridge with a reused pid gets a name of its
+/// own. Always one the daemon accepts: 1 to 64 of `[A-Za-z0-9:._-]`.
+pub(crate) fn bridge_instance() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let host: String = short_host()
+            .chars()
+            .take(32)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{host}-{}-{started}", std::process::id())
+    })
 }
 
 /// Resolve the hook listener used by a bridge that already resolved its daemon
@@ -682,6 +713,17 @@ fn registration_body(session_id: &str, cwd: &str, agent_id: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bridge_name_is_one_the_daemon_accepts() {
+        let name = bridge_instance();
+        assert!((1..=64).contains(&name.len()), "{name}");
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-')),
+            "{name}"
+        );
+    }
 
     #[test]
     fn takeover_budget_outlasts_the_full_old_poll_and_error_backoff() {

@@ -86,7 +86,7 @@ fn watched(ctx: &MykoServerContext, sid: &str) -> bool {
         .exec_query(GetAllWakeWatchers {})
         .unwrap_or_default()
         .iter()
-        .any(|w: &Arc<WakeWatcher>| w.id.0.as_ref() == sid && w.until > now)
+        .any(|w: &Arc<WakeWatcher>| w.session() == sid && w.until > now)
 }
 
 fn send_wake(ctx: &MykoServerContext, to: &str) -> WakeStatus {
@@ -145,6 +145,7 @@ fn hold_wait(ctx: &MykoServerContext, sid: &str) {
         &WakeWatcher {
             id: marshal_entities::WakeWatcherId(Arc::from(sid)),
             until: chrono::Utc::now().timestamp_millis() + 120_000,
+            session_id: None,
         },
     );
 }
@@ -179,4 +180,102 @@ fn a_claude_sessions_record_is_left_to_its_own_waiter() {
     set(&ctx, &session("claude-2", Some("c-claude-2")));
     assert_eq!(watch(&ctx, "claude-2", true), "not watching");
     assert!(!watched(&ctx, "claude-2"), "no record is made for it");
+}
+
+fn bridge(ctx: &Arc<MykoServerContext>, sid: &str, name: &str, watching: bool) -> String {
+    raw(
+        ctx,
+        &format!(r#"{{"session_id":"{sid}","watching":{watching},"bridge":"{name}"}}"#),
+    )
+}
+
+fn records_for(ctx: &MykoServerContext, sid: &str) -> Vec<String> {
+    let mut ids: Vec<String> = cmd_ctx(ctx, "c-sender")
+        .exec_query(GetAllWakeWatchers {})
+        .unwrap_or_default()
+        .iter()
+        .filter(|w| w.session() == sid)
+        .map(|w| w.id.0.to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn a_bridge_that_handed_over_leadership_ends_only_its_own_record() {
+    // MAR-4: the old leader's `false` arrives after the new leader's `true`.
+    let ctx = setup();
+    set(&ctx, &session("thread-3", None));
+    assert_eq!(bridge(&ctx, "thread-3", "new-leader", true), "watching");
+    assert_eq!(
+        bridge(&ctx, "thread-3", "old-leader", false),
+        "not watching"
+    );
+    assert!(watched(&ctx, "thread-3"), "the new leader's record stays");
+    assert_eq!(
+        records_for(&ctx, "thread-3"),
+        ["thread-3#bridge:new-leader"]
+    );
+}
+
+#[test]
+fn a_bridge_ending_its_watch_leaves_a_held_waits_record() {
+    let ctx = setup();
+    set(&ctx, &session("thread-4", None));
+    hold_wait(&ctx, "thread-4");
+    assert_eq!(bridge(&ctx, "thread-4", "b1", true), "watching");
+    assert_eq!(
+        records_for(&ctx, "thread-4").len(),
+        2,
+        "one record per path"
+    );
+    assert_eq!(bridge(&ctx, "thread-4", "b1", false), "not watching");
+    assert_eq!(
+        records_for(&ctx, "thread-4"),
+        ["thread-4"],
+        "the wait's stays"
+    );
+}
+
+#[test]
+fn a_session_that_ends_loses_every_wake_path() {
+    let ctx = setup();
+    set(&ctx, &session("thread-5", None));
+    hold_wait(&ctx, "thread-5");
+    assert_eq!(bridge(&ctx, "thread-5", "b1", true), "watching");
+    daemon::hooks::dispatch(
+        "/hook/session-end",
+        "",
+        br#"{"session_id":"thread-5"}"#,
+        &ctx,
+    )
+    .expect("a known route");
+    assert!(records_for(&ctx, "thread-5").is_empty());
+}
+
+#[test]
+fn an_invalid_bridge_name_shares_the_plain_bridge_record() {
+    let ctx = setup();
+    set(&ctx, &session("thread-6", None));
+    let long = "x".repeat(65);
+    for name in [long.as_str(), "has space", "a#b"] {
+        assert_eq!(bridge(&ctx, "thread-6", name, true), "watching", "{name}");
+    }
+    assert_eq!(records_for(&ctx, "thread-6"), ["thread-6#bridge:bridge"]);
+}
+
+#[test]
+fn a_session_id_with_a_hash_is_not_registered() {
+    // `#` names a bridge's wake-path record, so it's no session's id.
+    let ctx = setup();
+    daemon::hooks::dispatch(
+        "/hook/session-register",
+        "harness=codex",
+        br#"{"session_id":"thread-7#bridge:b1","cwd":"/repo"}"#,
+        &ctx,
+    );
+    let sessions = cmd_ctx(&ctx, "c-sender")
+        .exec_query(marshal_entities::GetAllSessions {})
+        .unwrap_or_default();
+    assert!(!sessions.iter().any(|s| s.id.0.contains('#')));
 }

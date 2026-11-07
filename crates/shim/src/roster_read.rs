@@ -50,7 +50,7 @@ fn view(
                 .unwrap_or_else(|| marshal_entities::nickname(id));
             let waiting_until = watchers
                 .iter()
-                .find(|w| w.id.0.as_ref() == id && w.until > now_ms)
+                .find(|w| w.session() == id && w.until > now_ms)
                 .map(|w| w.until);
             json!({
                 "session_id": id,
@@ -173,6 +173,7 @@ mod tests {
             Arc::new(WakeWatcher {
                 id: WakeWatcherId(Arc::from("a")),
                 until,
+                session_id: None,
             })
         };
         let v = view(&[session()], &[], &[watcher(101)], 100);
