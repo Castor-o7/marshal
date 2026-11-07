@@ -240,6 +240,8 @@ async fn send_all(
             response_required: false,
             body: body.clone(),
             as_session: Some(from.clone()),
+            // A terminal sends once per recipient and never retries.
+            idempotency_key: None,
         });
         let result = crate::tools::await_command(cell, SEND_TIMEOUT).await;
         if result.is_err() {
