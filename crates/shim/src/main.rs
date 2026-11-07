@@ -18,6 +18,7 @@ mod link;
 mod mcp;
 mod roster_read;
 mod session_discovery;
+mod spawn;
 mod statusline;
 mod terminal_send;
 mod tools;
@@ -165,6 +166,12 @@ fn main() -> Result<()> {
                 .context("building tokio runtime")?
                 .block_on(roster_read::run());
         }
+        // Start a Claude Code or Codex session in tmux and wait for it to join
+        // the roster. See `spawn`.
+        Some("spawn") => {
+            let rest: Vec<String> = argv.collect();
+            return spawn::run(&rest);
+        }
         // One-shot cross-platform setup: wire marshal into a Codex install
         // (CLI / IDE / desktop app) by writing the config.toml + AGENTS.md
         // managed blocks. For laptops / the desktop app where there's no
@@ -234,6 +241,8 @@ Commands:
                 tell <team, nickname or session id> <message>
   all           Message every session from a terminal: all <message>
   roster        Print the roster as JSON
+  spawn         Start a session in tmux and wait for it to join:
+                spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]
 
 Options:
   --check        Print \"ok\" and exit (install smoke test)

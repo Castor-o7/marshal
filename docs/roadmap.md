@@ -72,9 +72,9 @@ waiter or the bridge wakes it, and `tell` (Goal 3) can hand it work, so the miss
 launcher.
 
 - [ ] **MAR-26: Goal 2: Launcher: spawn a session in tmux.** `marshal-shim spawn <harness> --cwd <dir>
-  [--name <role>]` starts Claude Code or Codex in a detached tmux session. Waits on the operator's
-  answers: which terminals and systems, who launches, which harnesses, which machines, and which
-  permission mode. Done when: one command on Murph starts a session in tmux that appears on the roster
+  [--name <role>]` starts Claude Code or Codex in a detached tmux session. Operator's answers
+  (2026-11-06): both harnesses (Codex through `codex-run`); the harness's default permission mode;
+  Murph and tmux only for now; you or an agent may run it. Done when: one command on Murph starts a session in tmux that appears on the roster
   within 30 seconds, with no permission-bypass or channels flags.
 - [ ] **MAR-27: Goal 2: Launcher: join handshake with a spawn token.** Depends on MAR-26. Done when:
   the launcher passes a one-time token, waits with a timeout for a roster row carrying it, and prints
