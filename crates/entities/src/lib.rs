@@ -75,6 +75,7 @@ myko::register_typegen_type!(
     AckMessagesResult,
     ReadMessagesResult,
     MessageView,
+    RecipientStatus,
     RoomKind,
     AutoSource,
     LivePushStatus,
