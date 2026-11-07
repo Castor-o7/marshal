@@ -6,10 +6,12 @@
 //! There's also no way to pass flags through to the harness, so an agent can't
 //! use spawn to start a session with more permissions than the defaults.
 //!
-//! A session is taken to have joined when a session id that wasn't on the
-//! roster before the launch appears with the launch directory as its cwd. That
-//! can be fooled by another session starting in the same directory at the same
-//! time. MAR-27 replaces it with a one-time token.
+//! Each launch gets a fresh token, `spawn-<uuid>`, passed to the harness as
+//! `MARSHAL_AGENT_ID` (MAR-27). Both harnesses' hooks report that as the
+//! session's `agent_id`, so the session that joined is the roster row carrying
+//! the token, and no other session, in that directory or anywhere, can be
+//! taken for it. The token is a correlation id, not a credential: it's visible
+//! on the roster and on tmux's command line, and grants nothing.
 //!
 //! tmux runs the harness with no shell in between: it hands a lone command
 //! argument to `sh -c`, so the harness always goes as two or more arguments.
@@ -18,13 +20,12 @@
 //! environment, not spawn's. So spawn passes the settings that decide which
 //! daemon the harness joins and as whom ([`PASSED_ENV`]) with `new-session -e`.
 //! None of them are secrets, which matters because `-e` puts them on tmux's
-//! command line. A session's own identity (`MARSHAL_AGENT_ID`, the Codex
-//! app-server endpoint) is never passed, so the new session can't take the
-//! spawner's.
+//! command line. The spawner's own identity is never passed: the new session
+//! gets its own token as `MARSHAL_AGENT_ID`, never the spawner's, and the Codex
+//! app-server endpoint isn't passed at all.
 //!
 //! Like `roster`, spawn only reads the roster and registers no session itself.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -38,13 +39,8 @@ use myko::client::{ConnectionStatus, MykoClient};
 const USAGE: &str = "usage: marshal-shim spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to let the roster arrive before taking the snapshot. It may really
-/// be empty, so this can't wait for rows to appear.
-const ROSTER_SETTLE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(200);
 const MAX_NAME: usize = 64;
-/// How far the daemon's clock may run behind this one.
-const CLOCK_SLACK_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Harness {
@@ -218,24 +214,26 @@ fn tmux_has_session(name: &str) -> Result<bool> {
     Ok(status.success())
 }
 
-fn same_dir(a: &str, b: &Path) -> bool {
-    let a = Path::new(a);
-    a == b || std::fs::canonicalize(a).is_ok_and(|a| a == b)
+/// A token for one launch. Fresh each time, so no earlier row can carry it.
+fn new_token() -> String {
+    format!("spawn-{}", uuid::Uuid::new_v4().simple())
 }
 
-/// The first session that wasn't on the roster before the launch, registered
-/// no earlier than `not_before_ms`, and is working in the launch directory.
-pub(crate) fn joined<'a>(
-    before: &HashSet<String>,
-    not_before_ms: i64,
-    sessions: &'a [Arc<Session>],
-    cwd: &Path,
-) -> Option<&'a Session> {
-    sessions.iter().map(|s| s.as_ref()).find(|s| {
-        !before.contains(s.id.0.as_ref())
-            && s.connected_at >= not_before_ms
-            && same_dir(&s.cwd, cwd)
-    })
+/// The session carrying this launch's token.
+pub(crate) fn joined<'a>(sessions: &'a [Arc<Session>], token: &str) -> Option<&'a Session> {
+    sessions
+        .iter()
+        .map(|s| s.as_ref())
+        .find(|s| s.agent_id.as_deref() == Some(token))
+}
+
+/// What the harness is given: the listed settings from spawn's environment,
+/// and this launch's token as its `MARSHAL_AGENT_ID`, in place of any the
+/// spawner has.
+fn harness_env(get: impl Fn(&str) -> Option<String>, token: &str) -> Vec<(String, String)> {
+    let mut env = passed_env(get);
+    env.push(("MARSHAL_AGENT_ID".into(), token.into()));
+    env
 }
 
 pub(crate) fn run(rest: &[String]) -> Result<()> {
@@ -282,9 +280,8 @@ async fn launch_and_wait(
     let address = crate::daemon_address();
     client.set_address(Some(address.clone()));
 
-    // The snapshot has to come from a connected roster, or every session on it
-    // would look new. An empty roster can't be told from one that hasn't
-    // arrived, so once connected, give the rows a moment to come.
+    // Start nothing unless the daemon can be reached, so a failure to reach it
+    // is said plainly rather than as a session that never joined.
     let started = Instant::now();
     while !matches!(
         client.connection_status_sync(),
@@ -297,20 +294,13 @@ async fn launch_and_wait(
         }
         tokio::time::sleep(POLL).await;
     }
-    let connected = Instant::now();
-    while sessions.get().is_empty() && connected.elapsed() < ROSTER_SETTLE {
-        tokio::time::sleep(POLL).await;
-    }
-    let before: HashSet<String> = sessions.get().iter().map(|s| s.id.0.to_string()).collect();
-    // A row that arrived late wouldn't be in the snapshot, so a joined session
-    // must also have registered after this, give or take clock skew.
-    let not_before_ms = chrono::Utc::now().timestamp_millis() - CLOCK_SLACK_MS;
+    let token = new_token();
 
     let out = tmux()
         .args(tmux_new_session_args(
             name,
             cwd,
-            &passed_env(|k| std::env::var(k).ok()),
+            &harness_env(|k| std::env::var(k).ok(), &token),
             command,
         ))
         .output()
@@ -330,7 +320,7 @@ async fn launch_and_wait(
 
     let launched = Instant::now();
     loop {
-        if let Some(s) = joined(&before, not_before_ms, &sessions.get(), cwd) {
+        if let Some(s) = joined(&sessions.get(), &token) {
             let nickname = nickname_of(&nicknames.get(), s);
             println!(
                 "{nickname} ({}) joined from tmux session {name}. Attach: tmux attach -t ={name}",
@@ -346,7 +336,7 @@ async fn launch_and_wait(
         }
         if launched.elapsed() > timeout {
             bail!(
-                "nothing joined the roster from {} within {}s. The tmux session {name} is left running: \
+                "no session carrying this launch's token joined the roster from {} within {}s. The tmux session {name} is left running: \
                  `tmux attach -t ={name}` to see it (a first-run prompt such as trusting the folder \
                  holds a session back until it's answered), or `tmux kill-session -t ={name}`",
                 cwd.display(),
@@ -482,15 +472,30 @@ mod tests {
         );
     }
 
-    fn row(id: &str, cwd: &str) -> Arc<Session> {
-        row_at(id, cwd, 100)
+    #[test]
+    fn the_harness_gets_this_launchs_token_and_never_the_spawners() {
+        let env = |k: &str| match k {
+            "MARSHAL_AGENT_ID" => Some("the-spawner".to_string()),
+            "MARSHAL_DAEMON_ADDRESS" => Some("ws://h:1".to_string()),
+            _ => None,
+        };
+        let token = new_token();
+        let given = harness_env(env, &token);
+        let ids: Vec<&str> = given
+            .iter()
+            .filter(|(k, _)| k == "MARSHAL_AGENT_ID")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(ids, [token.as_str()]);
+        assert!(token.starts_with("spawn-") && token.len() == "spawn-".len() + 32);
+        assert_ne!(new_token(), token, "a token is fresh for each launch");
     }
 
-    fn row_at(id: &str, cwd: &str, connected_at: i64) -> Arc<Session> {
+    fn row(id: &str, cwd: &str, agent_id: Option<&str>) -> Arc<Session> {
         Arc::new(Session {
             id: SessionId(Arc::from(id)),
             client_id: None,
-            agent_id: None,
+            agent_id: agent_id.map(String::from),
             pid: 0,
             cwd: cwd.into(),
             git_branch: None,
@@ -498,7 +503,7 @@ mod tests {
             session_name: None,
             activity: None,
             kind: None,
-            connected_at,
+            connected_at: 100,
             last_activity_at: None,
             last_tool: None,
             last_tool_at: None,
@@ -511,21 +516,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_new_session_in_the_launch_directory_counts_as_joined() {
-        let before: HashSet<String> = ["old".to_string()].into();
-        let dir = Path::new("/nonexistent/w");
+    fn only_the_session_carrying_the_token_has_joined() {
+        // Another new session in the same directory, with no token or another's.
         let rows = [
-            row("old", "/nonexistent/w"),
-            row("elsewhere", "/nonexistent/x"),
+            row("same-dir", "/w", None),
+            row("other-launch", "/w", Some("spawn-other")),
         ];
-        assert!(joined(&before, 50, &rows, dir).is_none());
-        let rows = [row("old", "/nonexistent/w"), row("new", "/nonexistent/w")];
-        assert_eq!(
-            joined(&before, 50, &rows, dir).unwrap().id.0.as_ref(),
-            "new"
-        );
-        // One the snapshot missed, but which registered long before the launch.
-        let rows = [row_at("late", "/nonexistent/w", 10)];
-        assert!(joined(&before, 50, &rows, dir).is_none());
+        assert!(joined(&rows, "spawn-mine").is_none());
+        let rows = [
+            row("same-dir", "/w", None),
+            row("mine", "/elsewhere", Some("spawn-mine")),
+        ];
+        assert_eq!(joined(&rows, "spawn-mine").unwrap().id.0.as_ref(), "mine");
     }
 }

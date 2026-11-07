@@ -1,12 +1,13 @@
-//! `marshal-shim spawn` end to end (MAR-26): the real binary starts a harness
-//! in a real, private tmux server, and reports it once its session joins a real
-//! in-process Myko cell.
+//! `marshal-shim spawn` end to end (MAR-26, MAR-27): the real binary starts a
+//! harness in a real, private tmux server, and reports it once its session
+//! joins a real in-process Myko cell.
 //!
 //! The harness is a script standing in for `claude` (`MARSHAL_CLAUDE_BIN`). It
-//! writes its working directory to a file, and the test registers the session
-//! the way the daemon's hook listener would, so what's checked is spawn: that
-//! tmux ran the harness in the right directory, and that spawn told the new
-//! session from the ones already there.
+//! writes down where it ran and what it was given, and the test registers the
+//! session the way the daemon's hook listener would, with the `agent_id` the
+//! harness got as `MARSHAL_AGENT_ID`. So what's checked is spawn: that tmux ran
+//! the harness in the right directory with this launch's token, and that spawn
+//! reports the session carrying it and no other.
 //!
 //! It needs tmux. Without it the tests say so and pass, except under CI, where
 //! they fail.
@@ -34,6 +35,28 @@ use myko_server::{BlackholePersister, MykoServer};
 
 const SHIM: &str = env!("CARGO_BIN_EXE_marshal-shim");
 const WAIT: Duration = Duration::from_secs(10);
+const SPAWNER_ID: &str = "the-spawner";
+/// A harness that records its directory, its `MARSHAL_AGENT_ID` and its daemon
+/// address, one per line, then stays up.
+const RECORDING_HARNESS: &str = r#"printf '%s\n%s\n%s\n' "$(pwd)" "$MARSHAL_AGENT_ID" "$MARSHAL_DAEMON_ADDRESS" > "$SPAWN_E2E_MARKER.tmp"; mv "$SPAWN_E2E_MARKER.tmp" "$SPAWN_E2E_MARKER"; exec sleep 120"#;
+
+/// What the recording harness wrote down.
+struct Seen {
+    cwd: String,
+    agent_id: String,
+    daemon: String,
+}
+
+fn seen(marker: &Path) -> Seen {
+    let all = wait_for_file(marker);
+    let mut lines = all.lines().map(String::from);
+    let mut next = || lines.next().unwrap_or_default();
+    Seen {
+        cwd: next(),
+        agent_id: next(),
+        daemon: next(),
+    }
+}
 
 fn have_tmux() -> bool {
     let ok = Command::new("tmux")
@@ -97,7 +120,7 @@ impl Cell {
     }
 
     /// Register a session as the hook listener does for a new one.
-    fn register(&self, id: &str, cwd: &str, connected_at: i64) {
+    fn register(&self, id: &str, cwd: &str, agent_id: Option<&str>) {
         let request = RequestContext::internal(
             uuid::Uuid::new_v4().to_string().into(),
             self.ctx.host_id,
@@ -111,7 +134,7 @@ impl Cell {
         .emit_set(&Session {
             id: SessionId(Arc::from(id)),
             client_id: None,
-            agent_id: None,
+            agent_id: agent_id.map(String::from),
             pid: 0,
             cwd: cwd.into(),
             git_branch: None,
@@ -119,7 +142,7 @@ impl Cell {
             session_name: None,
             activity: None,
             kind: None,
-            connected_at,
+            connected_at: chrono::Utc::now().timestamp_millis(),
             last_activity_at: None,
             last_tool: None,
             last_tool_at: None,
@@ -199,6 +222,8 @@ impl Rig {
             .env("XDG_CONFIG_HOME", home.join("config"))
             .env("MARSHAL_DAEMON_ADDRESS", address)
             .env_remove("MYKO_ADDRESS")
+            // The spawner's own identity, which the harness must not get.
+            .env("MARSHAL_AGENT_ID", SPAWNER_ID)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -246,26 +271,37 @@ fn wait_for_file(path: &Path) -> String {
 }
 
 #[test]
-fn spawn_reports_the_new_session_and_not_one_already_in_that_directory() {
+fn spawn_reports_the_session_carrying_its_token_and_no_other_in_that_directory() {
     if !have_tmux() {
         return;
     }
     let cell = Cell::spawn();
-    let rig = Rig::new(r#"pwd > "$SPAWN_E2E_MARKER"; exec sleep 120"#);
+    let rig = Rig::new(RECORDING_HARNESS);
     let work = rig.work();
-    let now = chrono::Utc::now().timestamp_millis();
-    // Already working in that directory before the launch: not the new one.
-    cell.register("spawn-e2e-old", work.to_str().unwrap(), now - 10 * 60_000);
+    let work_s = work.to_str().unwrap();
+    // Already working in that directory before the launch.
+    cell.register("spawn-e2e-old", work_s, None);
 
     let child = rig.spawn(&cell.address, &["--name", "e2e-spawn", "--timeout", "20"]);
-    let ran_in = wait_for_file(&rig.marker());
-    assert_eq!(Path::new(&ran_in), work, "tmux ran the harness elsewhere");
-    assert!(rig.has_session("e2e-spawn"));
-    cell.register(
-        "spawn-e2e-new",
-        &ran_in,
-        chrono::Utc::now().timestamp_millis(),
+    let got = seen(&rig.marker());
+    assert_eq!(Path::new(&got.cwd), work, "tmux ran the harness elsewhere");
+    assert!(
+        got.agent_id.starts_with("spawn-"),
+        "token: {:?}",
+        got.agent_id
     );
+    assert_ne!(
+        got.agent_id, SPAWNER_ID,
+        "the harness got the spawner's identity"
+    );
+    assert!(rig.has_session("e2e-spawn"));
+
+    // Other sessions start in the same directory after the launch, before the
+    // spawned one joins. MAR-26's directory rule would have taken the first.
+    cell.register("spawn-e2e-decoy", work_s, None);
+    cell.register("spawn-e2e-other-launch", work_s, Some("spawn-someone-else"));
+    thread::sleep(Duration::from_millis(800));
+    cell.register("spawn-e2e-new", &got.cwd, Some(&got.agent_id));
 
     let out = finish(child);
     assert!(out.status.success(), "{}", text(&out));
@@ -275,7 +311,9 @@ fn spawn_reports_the_new_session_and_not_one_already_in_that_directory() {
         "{}",
         text(&out)
     );
-    assert!(!stdout.contains("spawn-e2e-old"), "{}", text(&out));
+    for other in ["spawn-e2e-old", "spawn-e2e-decoy", "spawn-e2e-other-launch"] {
+        assert!(!stdout.contains(other), "{}", text(&out));
+    }
     // Spawn returns, and the session stays up for someone to attach to.
     assert!(rig.has_session("e2e-spawn"));
 
@@ -286,6 +324,25 @@ fn spawn_reports_the_new_session_and_not_one_already_in_that_directory() {
         String::from_utf8_lossy(&again.stderr).contains("already exists"),
         "{}",
         text(&again)
+    );
+}
+
+#[test]
+fn a_session_in_the_launch_directory_without_the_token_never_counts() {
+    if !have_tmux() {
+        return;
+    }
+    let cell = Cell::spawn();
+    let rig = Rig::new(RECORDING_HARNESS);
+    let child = rig.spawn(&cell.address, &["--name", "e2e-decoy", "--timeout", "3"]);
+    let got = seen(&rig.marker());
+    cell.register("spawn-e2e-decoy-only", &got.cwd, None);
+    let out = finish(child);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no session carrying this launch's token"),
+        "{}",
+        text(&out)
     );
 }
 
@@ -320,7 +377,7 @@ fn a_session_that_never_joins_times_out_and_is_left_running() {
     let out = finish(rig.spawn(&cell.address, &["--name", "e2e-quiet", "--timeout", "2"]));
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("nothing joined the roster"),
+        String::from_utf8_lossy(&out.stderr).contains("no session carrying this launch's token"),
         "{}",
         text(&out)
     );
@@ -340,7 +397,7 @@ fn nothing_is_started_when_the_daemon_cant_be_reached() {
         .local_addr()
         .unwrap()
         .port();
-    let rig = Rig::new(r#"pwd > "$SPAWN_E2E_MARKER"; exec sleep 120"#);
+    let rig = Rig::new(RECORDING_HARNESS);
     let out = finish(rig.spawn(
         &format!("ws://127.0.0.1:{port}"),
         &["--name", "e2e-nodaemon"],
@@ -361,30 +418,30 @@ fn a_running_tmux_server_doesnt_give_the_harness_its_own_daemon_address() {
         return;
     }
     let cell = Cell::spawn();
-    // The harness records the daemon address it was given, then joins.
-    let rig =
-        Rig::new(r#"printf '%s' "$MARSHAL_DAEMON_ADDRESS" > "$SPAWN_E2E_MARKER"; exec sleep 120"#);
+    let rig = Rig::new(RECORDING_HARNESS);
     // A server already up, started with another daemon's address.
     let up = rig
         .tmux()
         .args(["new-session", "-d", "-s", "already-running", "sleep", "120"])
         .env("MARSHAL_DAEMON_ADDRESS", "ws://127.0.0.1:1")
+        .env("MARSHAL_AGENT_ID", "the-servers-identity")
         .env("SPAWN_E2E_MARKER", rig.marker())
         .output()
         .unwrap();
     assert!(up.status.success(), "{}", text(&up));
 
     let child = rig.spawn(&cell.address, &["--name", "e2e-env", "--timeout", "20"]);
-    let seen = wait_for_file(&rig.marker());
+    let got = seen(&rig.marker());
     assert_eq!(
-        seen, cell.address,
+        got.daemon, cell.address,
         "the harness got the server's address, not spawn's"
     );
-    cell.register(
-        "spawn-e2e-env",
-        rig.work().to_str().unwrap(),
-        chrono::Utc::now().timestamp_millis(),
+    assert!(
+        got.agent_id.starts_with("spawn-"),
+        "token: {:?}",
+        got.agent_id
     );
+    cell.register("spawn-e2e-env", &got.cwd, Some(&got.agent_id));
     let out = finish(child);
     assert!(out.status.success(), "{}", text(&out));
 }
