@@ -59,9 +59,28 @@ fn resolve_targets(
                 .is_some_and(|p| p.eq_ignore_ascii_case(token))
         })
         .collect();
-    let single = agents
-        .iter()
-        .find(|s| s.id.0.as_ref() == token || handle(nicknames, s) == *token);
+    // An exact id is one session. A nickname can repeat: a ghost row and the
+    // live session can carry the same handle, so a name held by more than one
+    // session is refused rather than sent to whichever comes first.
+    let by_id = agents.iter().find(|s| s.id.0.as_ref() == token);
+    let single = match by_id {
+        Some(session) => Some(session),
+        None => {
+            let by_nickname: Vec<_> = agents
+                .iter()
+                .filter(|s| handle(nicknames, s) == *token)
+                .collect();
+            if by_nickname.len() > 1 {
+                let ids: Vec<&str> = by_nickname.iter().map(|s| s.id.0.as_ref()).collect();
+                return Err(format!(
+                    "`{token}` names {} sessions ({}); use the session's id",
+                    by_nickname.len(),
+                    ids.join(", ")
+                ));
+            }
+            by_nickname.into_iter().next()
+        }
+    };
     match (team.is_empty(), single) {
         (false, Some(_)) => {
             return Err(format!(
@@ -238,6 +257,7 @@ async fn send_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use marshal_entities::SessionNicknameId;
 
     fn session(id: &str, project: Option<&str>, kind: Option<&str>) -> Arc<Session> {
         Arc::new(Session {
@@ -320,6 +340,37 @@ mod tests {
         let mut sessions = roster();
         sessions.push(session("catapp", Some("other"), None));
         assert!(resolve_targets(&sessions, &[], &named("catapp")).is_err());
+    }
+
+    #[test]
+    fn a_nickname_two_sessions_share_is_refused_with_their_ids() {
+        // A ghost row and the live session can carry the same handle.
+        let nick = |id: &str| {
+            Arc::new(SessionNickname {
+                id: SessionNicknameId(Arc::from(id)),
+                nickname: "mellow-weevil".into(),
+            })
+        };
+        let nicknames = [nick("aaaaaaaa-1"), nick("bbbbbbbb-1")];
+        let err = resolve_targets(&roster(), &nicknames, &named("mellow-weevil"))
+            .expect_err("an ambiguous nickname must be refused");
+        assert!(
+            err.contains("aaaaaaaa-1") && err.contains("bbbbbbbb-1"),
+            "{err}"
+        );
+        // A unique nickname, or the full id, still reaches one session.
+        assert_eq!(
+            ids(resolve_targets(
+                &roster(),
+                &nicknames[..1],
+                &named("mellow-weevil")
+            )),
+            ["aaaaaaaa-1"]
+        );
+        assert_eq!(
+            ids(resolve_targets(&roster(), &nicknames, &named("bbbbbbbb-1"))),
+            ["bbbbbbbb-1"]
+        );
     }
 
     #[test]
