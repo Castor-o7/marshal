@@ -144,6 +144,7 @@ impl Drop for HookHarness {
 
 async fn handle_hook_request(mut stream: TcpStream, ctx: Arc<MykoServerContext>) -> io::Result<()> {
     let (target, body) = read_http_request(&mut stream).await?;
+    let mut reply = String::new();
     if target.starts_with("/hook/session-register")
         && let Ok(body) = serde_json::from_slice::<Value>(&body)
         && let Some(session_id) = body.get("session_id").and_then(Value::as_str)
@@ -157,10 +158,18 @@ async fn handle_hook_request(mut stream: TcpStream, ctx: Arc<MykoServerContext>)
         internal_context(&ctx)
             .emit_set(&hook_session(session_id, cwd))
             .expect("register hook-owned session");
+        // Answer as the daemon does, with the session's identity. Without it
+        // the bridge counts every registration as failed and retries forever,
+        // which re-registers a dropped row by accident and hides MAR-7's gap.
+        reply = json!({"session_id": session_id, "nickname": format!("canary-{session_id}")})
+            .to_string();
     }
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .await?;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reply.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(reply.as_bytes()).await?;
     stream.flush().await
 }
 
@@ -215,6 +224,7 @@ struct FakeAppServer {
     endpoint: String,
     accepted: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl FakeAppServer {
@@ -231,23 +241,44 @@ impl FakeAppServer {
         );
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let accepted_for_task = Arc::clone(&accepted);
+        let connections: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
+        let connections_for_task = Arc::clone(&connections);
         let task = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept app-server client");
                 let owned = Arc::clone(&owned);
                 let accepted = Arc::clone(&accepted_for_task);
-                tokio::spawn(async move {
+                let connection = tokio::spawn(async move {
                     // Tests terminate bridge processes abruptly; a reset
                     // without a WebSocket close handshake is expected cleanup,
                     // not a failed canary assertion.
                     let _ = serve_app_server_connection(stream, owned, accepted).await;
                 });
+                connections_for_task
+                    .lock()
+                    .expect("app-server connections mutex")
+                    .push(connection);
             }
         });
         Self {
             endpoint: format!("ws://{address}"),
             accepted,
             task,
+            connections,
+        }
+    }
+
+    /// The app-server goes away, as when Codex exits or crashes: it stops
+    /// listening and drops every open connection, with no `thread/closed`.
+    fn stop(&self) {
+        self.task.abort();
+        for connection in self
+            .connections
+            .lock()
+            .expect("app-server connections mutex")
+            .drain(..)
+        {
+            connection.abort();
         }
     }
 
@@ -579,6 +610,87 @@ async fn unix_multi_process_bridge_elects_one_wake_leader_and_fails_over() {
     );
     mark_read(&cell.ctx, "unix-message-2", "unix-thread");
     follower.stop();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_thread_dropped_from_the_roster_is_registered_again_and_still_wakes() {
+    // A daemon restart without Postgres comes back with an empty roster. The
+    // bridge only learned of the thread from `thread/started`, which won't
+    // come again for an idle session, so it has to put the row back itself,
+    // or mail to the session can't be addressed and never wakes it.
+    let temp = tempfile::tempdir().expect("test tempdir");
+    let cell = CellHarness::spawn();
+    let hooks = HookHarness::spawn(Arc::clone(&cell.ctx)).await;
+    let app_server = FakeAppServer::spawn(&["idle-thread"]).await;
+
+    let mut bridge = BridgeProcess::spawn(&app_server, &cell, &hooks, &temp, "reregister");
+    bridge.wait_ready().await;
+    wait_for_sessions(&cell.ctx, &["idle-thread"]).await;
+
+    internal_context(&cell.ctx)
+        .emit_del(&hook_session("idle-thread", "/"))
+        .expect("drop the session from the roster");
+    wait_until("the session to leave the roster", WAIT, || {
+        !internal_context(&cell.ctx)
+            .exec_query(GetAllSessions {})
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.id.0.as_ref() == "idle-thread")
+    })
+    .await;
+
+    // Registered again after the bridge's per-thread cooldown (5 s).
+    wait_until("the bridge to register the thread again", WAIT * 2, || {
+        internal_context(&cell.ctx)
+            .exec_query(GetAllSessions {})
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.id.0.as_ref() == "idle-thread" && s.client_id.is_none())
+    })
+    .await;
+
+    emit_message(&cell.ctx, "reregister-message", "idle-thread");
+    app_server.wait_for_count(1).await;
+    assert_eq!(app_server.accepted(), vec!["idle-thread"]);
+    mark_read(&cell.ctx, "reregister-message", "idle-thread");
+    bridge.stop();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thread_whose_app_server_went_away_is_not_registered_again() {
+    // A thread only says it closed while its app-server is up. When the
+    // app-server dies, its threads must be forgotten, not re-registered every
+    // cooldown for the bridge's whole life as ghost rows.
+    let temp = tempfile::tempdir().expect("test tempdir");
+    let cell = CellHarness::spawn();
+    let hooks = HookHarness::spawn(Arc::clone(&cell.ctx)).await;
+    let app_server = FakeAppServer::spawn(&["gone-thread"]).await;
+
+    let mut bridge = BridgeProcess::spawn(&app_server, &cell, &hooks, &temp, "gone");
+    bridge.wait_ready().await;
+    wait_for_sessions(&cell.ctx, &["gone-thread"]).await;
+
+    app_server.stop();
+    // Let the bridge see its lifecycle connection end.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    internal_context(&cell.ctx)
+        .emit_del(&hook_session("gone-thread", "/"))
+        .expect("drop the session from the roster");
+
+    // Well past the re-registration cooldown (5 s): the row stays gone.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let back = internal_context(&cell.ctx)
+        .exec_query(GetAllSessions {})
+        .unwrap_or_default()
+        .iter()
+        .any(|s| s.id.0.as_ref() == "gone-thread");
+    assert!(
+        !back,
+        "a thread whose app-server went away came back as a ghost row"
+    );
+    bridge.stop();
 }
 
 #[cfg(windows)]

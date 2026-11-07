@@ -11,10 +11,14 @@ env:
 
 jobs:
   check:
-    runs-on: ["self-hosted", "Linux", "X64", "ram-ge-16g", "disk-ge-100g"]
+    # Castor fork only: the fork has no self-hosted runners, so its Linux jobs
+    # run GitHub-hosted. Upstream uses ["self-hosted", "Linux", "X64",
+    # "ram-ge-16g", "disk-ge-100g"]; never send this hunk upstream.
+    runs-on: ubuntu-latest
     # Backstop so a stuck step (e.g. a flaky apt mirror, a hung runner) fails
-    # in minutes instead of burning to GitHub's 6-hour default.
-    timeout-minutes: 30
+    # in minutes instead of burning to GitHub's 6-hour default. Longer than
+    # upstream's 30: a hosted runner has fewer cores and a colder cache.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -91,8 +95,9 @@ jobs:
   # every PR, so a Windows-only break fails the check instead of the next
   # manual cross-build.
   windows-cross-check:
-    runs-on: ["self-hosted", "Linux", "X64", "ram-ge-16g", "disk-ge-100g"]
-    timeout-minutes: 20
+    # Castor fork only: GitHub-hosted, as for `check` above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Report runner resources

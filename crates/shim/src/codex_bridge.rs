@@ -87,6 +87,9 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(8);
 const BRIDGE_START_TIMEOUT: Duration = Duration::from_secs(10);
 const TUI_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRATION_RETRY: Duration = Duration::from_secs(2);
+/// How long the bridge waits before registering a thread again that's still
+/// missing from the roster (MUS-76).
+const REREGISTER_COOLDOWN: Duration = Duration::from_secs(5);
 const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const WAKE_PROMPT: &str = "Marshal delivery wakeup, not a new user assignment. Read the injected \
 <marshal_inbox>; if absent, check unread direct Marshal messages once. If none remain, stop. \
@@ -1154,12 +1157,15 @@ pub async fn run(args: &[String]) -> Result<()> {
         launcher.clone(),
     )
     .await?;
+    let registered: RegisteredThreads = Arc::default();
     let mut registration_task = tokio::spawn(watch_app_server_registrations(
         args.app_server.clone(),
-        hook_base,
+        hook_base.clone(),
         args.ready_file.clone(),
         launcher,
+        registered.clone(),
     ));
+    let mut reregistered_at: HashMap<String, Instant> = HashMap::new();
     let client = Arc::new(MykoClient::new());
     let sessions = client.watch_query::<GetAllSessions>(GetAllSessions {});
     let messages = client.watch_query::<GetAllMessages>(GetAllMessages {});
@@ -1198,6 +1204,40 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
 
         let now = Instant::now();
+        // A registered thread whose session left the roster, as after a daemon
+        // restart without Postgres, is registered again, so it can be woken
+        // before its next hook (MUS-76). Every bridge does this for its own
+        // threads, leader or not.
+        let missing = {
+            let registered = registered.lock().unwrap();
+            missing_registrations(&registered, &sessions.get(), &reregistered_at, now)
+        };
+        for registration in missing {
+            reregistered_at.insert(registration.session_id.clone(), now);
+            let base = hook_base.clone();
+            let session_id = registration.session_id.clone();
+            let registered_again = tokio::task::spawn_blocking(move || {
+                crate::codex_hook::register_session(
+                    &base,
+                    &registration.session_id,
+                    &registration.cwd,
+                )
+            })
+            .await
+            .unwrap_or(None)
+            .is_some();
+            if registered_again {
+                log::info!(
+                    "[codex-bridge] thread={session_id} was off the roster; registered it again"
+                );
+            } else {
+                log::debug!(
+                    "[codex-bridge] registering thread={session_id} again failed; will retry"
+                );
+            }
+        }
+        reregistered_at.retain(|id, _| registered.lock().unwrap().contains_key(id));
+
         match wake_leadership.ready(now) {
             Ok(true) => {}
             Ok(false) => continue,
@@ -1471,6 +1511,32 @@ struct ThreadRegistration {
     name: Option<String>,
 }
 
+/// The threads this bridge has registered, by session id, until they close.
+/// The main loop registers one again when its session is missing from the
+/// roster, as after a daemon restart without Postgres (MUS-76).
+type RegisteredThreads = Arc<std::sync::Mutex<HashMap<String, ThreadRegistration>>>;
+
+/// Registered threads whose session isn't on the roster, and that weren't
+/// registered again within the last `REREGISTER_COOLDOWN`.
+fn missing_registrations(
+    registered: &HashMap<String, ThreadRegistration>,
+    sessions: &[Arc<Session>],
+    last_attempt: &HashMap<String, Instant>,
+    now: Instant,
+) -> Vec<ThreadRegistration> {
+    let on_roster: HashSet<&str> = sessions.iter().map(|s| s.id.0.as_ref()).collect();
+    registered
+        .values()
+        .filter(|r| !on_roster.contains(r.session_id.as_str()))
+        .filter(|r| {
+            last_attempt
+                .get(&r.session_id)
+                .is_none_or(|at| now.duration_since(*at) >= REREGISTER_COOLDOWN)
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ThreadNameDecoration {
     thread_id: String,
@@ -1497,6 +1563,7 @@ async fn watch_app_server_registrations(
     hook_base: String,
     mut ready_file: Option<PathBuf>,
     launcher: Option<SharedLauncherState>,
+    registered: RegisteredThreads,
 ) -> Result<()> {
     let mut pending = HashMap::new();
     let mut decorations = HashMap::new();
@@ -1521,6 +1588,7 @@ async fn watch_app_server_registrations(
                             &mut pending,
                             &mut decorations,
                             &launcher,
+                            &registered,
                         )
                         .await
                     }
@@ -1538,12 +1606,25 @@ async fn watch_app_server_registrations(
                     &mut pending,
                     &mut decorations,
                     &launcher,
+                    &registered,
                 )
                 .await
             }
         };
         if let Err(error) = result {
             log::debug!("[codex-bridge] app-server lifecycle connection unavailable: {error:#}");
+        }
+        // A thread says it closed only while its app-server is up. Once the
+        // connection ends (Codex exited or crashed, or the app-server
+        // restarted), forget what it registered, or those threads would be
+        // registered again every cooldown as ghost rows. The snapshot on
+        // reconnect registers the threads the app-server still has.
+        let forgotten = std::mem::take(&mut *registered.lock().unwrap());
+        if !forgotten.is_empty() {
+            log::info!(
+                "[codex-bridge] app-server connection ended; forgot {} registered thread(s)",
+                forgotten.len()
+            );
         }
         if let Some(launcher) = launcher.as_ref()
             && let Err(error) = launcher.lock().await.disconnected()
@@ -1562,6 +1643,7 @@ async fn monitor_registrations_over_unix(
     pending: &mut HashMap<String, ThreadRegistration>,
     decorations: &mut HashMap<String, ThreadNameDecoration>,
     launcher: &Option<SharedLauncherState>,
+    registered: &RegisteredThreads,
 ) -> Result<()> {
     use tokio::net::UnixStream;
 
@@ -1586,6 +1668,7 @@ async fn monitor_registrations_over_unix(
         pending,
         decorations,
         launcher,
+        registered,
     )
     .await
 }
@@ -1598,6 +1681,7 @@ async fn monitor_registrations_over_unix(
     _pending: &mut HashMap<String, ThreadRegistration>,
     _decorations: &mut HashMap<String, ThreadNameDecoration>,
     _launcher: &Option<SharedLauncherState>,
+    _registered: &RegisteredThreads,
 ) -> Result<()> {
     anyhow::bail!("Unix-domain-socket app-server endpoints are unavailable on this platform")
 }
@@ -1609,6 +1693,7 @@ async fn monitor_registration_connection<S>(
     pending: &mut HashMap<String, ThreadRegistration>,
     decorations: &mut HashMap<String, ThreadNameDecoration>,
     launcher: &Option<SharedLauncherState>,
+    registered: &RegisteredThreads,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1634,7 +1719,7 @@ where
         }
         let session_ids: Vec<String> = pending.keys().cloned().collect();
         for session_id in session_ids {
-            try_pending_registration(
+            if let Some(registration) = try_pending_registration(
                 websocket,
                 hook_base,
                 pending,
@@ -1643,7 +1728,13 @@ where
                 &mut request_id,
                 launcher,
             )
-            .await;
+            .await
+            {
+                registered
+                    .lock()
+                    .unwrap()
+                    .insert(registration.session_id.clone(), registration);
+            }
         }
     }
 
@@ -1678,7 +1769,7 @@ where
                 if let Some(registration) = thread_registration(&message) {
                     let session_id = registration.session_id.clone();
                     pending.insert(session_id.clone(), registration);
-                    try_pending_registration(
+                    if let Some(registration) = try_pending_registration(
                         websocket,
                         hook_base,
                         pending,
@@ -1687,10 +1778,20 @@ where
                         &mut request_id,
                         launcher,
                     )
-                    .await;
+                    .await
+                    {
+                        registered
+                            .lock()
+                            .unwrap()
+                            .insert(registration.session_id.clone(), registration);
+                    }
                 } else if let Some(thread_id) = closed_thread_id(&message) {
                     pending.retain(|_, registration| registration.thread_id != thread_id);
                     decorations.remove(thread_id);
+                    registered
+                        .lock()
+                        .unwrap()
+                        .retain(|_, registration| registration.thread_id != thread_id);
                 } else if let Some(update) = thread_name_update(&message) {
                     update_pending_thread_name(pending, &update);
                     if let Some(mut decoration) = decorations.get(&update.thread_id).cloned() {
@@ -1737,7 +1838,7 @@ where
                 }
                 let session_ids: Vec<String> = pending.keys().cloned().collect();
                 for session_id in session_ids {
-                    try_pending_registration(
+                    if let Some(registration) = try_pending_registration(
                         websocket,
                         hook_base,
                         pending,
@@ -1746,7 +1847,13 @@ where
                         &mut request_id,
                         launcher,
                     )
-                    .await;
+                    .await
+                    {
+                        registered
+                            .lock()
+                            .unwrap()
+                            .insert(registration.session_id.clone(), registration);
+                    }
                 }
                 if let Some(thread_id) = selected
                     && let Some(mut decoration) = decorations.get(&thread_id).cloned()
@@ -1935,18 +2042,17 @@ async fn try_pending_registration<S>(
     session_id: &str,
     request_id: &mut i64,
     launcher: &Option<SharedLauncherState>,
-) where
+) -> Option<ThreadRegistration>
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let Some(registration) = pending.get(session_id).cloned() else {
-        return;
-    };
+    let registration = pending.get(session_id).cloned()?;
     let base = hook_base.to_string();
-    let nickname = tokio::task::spawn_blocking(move || {
-        crate::codex_hook::register_session(&base, &registration.session_id, &registration.cwd)
-    })
-    .await
-    .unwrap_or(None);
+    let (sid, cwd) = (registration.session_id.clone(), registration.cwd.clone());
+    let nickname =
+        tokio::task::spawn_blocking(move || crate::codex_hook::register_session(&base, &sid, &cwd))
+            .await
+            .unwrap_or(None);
     if let Some(nickname) = nickname {
         let decoration = ThreadNameDecoration {
             thread_id: registration.thread_id.clone(),
@@ -1971,8 +2077,10 @@ async fn try_pending_registration<S>(
         decorations.insert(registration.thread_id.clone(), decoration);
         log::info!("[codex-bridge] registered thread={session_id} before first prompt");
         pending.remove(session_id);
+        Some(registration)
     } else {
         log::debug!("[codex-bridge] eager registration for thread={session_id} failed; will retry");
+        None
     }
 }
 
@@ -2580,6 +2688,41 @@ mod tests {
         );
     }
 
+    fn registration(session_id: &str) -> ThreadRegistration {
+        ThreadRegistration {
+            thread_id: format!("thread-{session_id}"),
+            session_id: session_id.into(),
+            cwd: "/repo".into(),
+            name: None,
+        }
+    }
+
+    #[test]
+    fn a_registered_thread_off_the_roster_is_registered_again_after_a_cooldown() {
+        let registered: HashMap<String, ThreadRegistration> = ["kept", "lost"]
+            .into_iter()
+            .map(|id| (id.to_string(), registration(id)))
+            .collect();
+        let roster = [
+            session("kept", "host", true),
+            session("other", "host", true),
+        ];
+        let now = Instant::now();
+        let mut attempts = HashMap::new();
+
+        let missing = missing_registrations(&registered, &roster, &attempts, now);
+        assert_eq!(missing, vec![registration("lost")]);
+
+        attempts.insert("lost".to_string(), now);
+        let soon = now + REREGISTER_COOLDOWN / 2;
+        assert!(missing_registrations(&registered, &roster, &attempts, soon).is_empty());
+        let later = now + REREGISTER_COOLDOWN;
+        assert_eq!(
+            missing_registrations(&registered, &roster, &attempts, later),
+            vec![registration("lost")]
+        );
+    }
+
     fn session(id: &str, host: &str, hook_owned: bool) -> Arc<Session> {
         Arc::new(Session {
             id: SessionId(Arc::from(id)),
@@ -3135,6 +3278,7 @@ mod tests {
             format!("http://{hook_address}"),
             Some(ready_file.clone()),
             Some(launcher),
+            RegisteredThreads::default(),
         ));
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -3248,6 +3392,7 @@ mod tests {
             format!("http://{hook_address}"),
             None,
             None,
+            RegisteredThreads::default(),
         ));
 
         let request = tokio::time::timeout(Duration::from_secs(2), hook_server)
