@@ -156,7 +156,10 @@ impl Rig {
         std::fs::create_dir_all(dir.path().join("tmux")).unwrap();
         std::fs::create_dir_all(dir.path().join("home/config")).unwrap();
         std::fs::create_dir_all(dir.path().join("work dir")).unwrap();
-        let script = dir.path().join("fake-claude");
+        // A space and a `;` in its path: run through `sh -c`, it would never start.
+        let bin = dir.path().join("bin dir;x");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("fake-claude");
         std::fs::write(&script, format!("#!/bin/sh\n{harness_body}\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         Self { dir }
@@ -187,7 +190,10 @@ impl Rig {
             .args(extra)
             .env_remove("TMUX")
             .env("TMUX_TMPDIR", self.dir.path().join("tmux"))
-            .env("MARSHAL_CLAUDE_BIN", self.dir.path().join("fake-claude"))
+            .env(
+                "MARSHAL_CLAUDE_BIN",
+                self.dir.path().join("bin dir;x/fake-claude"),
+            )
             .env("SPAWN_E2E_MARKER", self.marker())
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join("config"))
@@ -347,4 +353,38 @@ fn nothing_is_started_when_the_daemon_cant_be_reached() {
     );
     assert!(!rig.has_session("e2e-nodaemon"));
     assert!(!rig.marker().exists());
+}
+
+#[test]
+fn a_running_tmux_server_doesnt_give_the_harness_its_own_daemon_address() {
+    if !have_tmux() {
+        return;
+    }
+    let cell = Cell::spawn();
+    // The harness records the daemon address it was given, then joins.
+    let rig =
+        Rig::new(r#"printf '%s' "$MARSHAL_DAEMON_ADDRESS" > "$SPAWN_E2E_MARKER"; exec sleep 120"#);
+    // A server already up, started with another daemon's address.
+    let up = rig
+        .tmux()
+        .args(["new-session", "-d", "-s", "already-running", "sleep", "120"])
+        .env("MARSHAL_DAEMON_ADDRESS", "ws://127.0.0.1:1")
+        .env("SPAWN_E2E_MARKER", rig.marker())
+        .output()
+        .unwrap();
+    assert!(up.status.success(), "{}", text(&up));
+
+    let child = rig.spawn(&cell.address, &["--name", "e2e-env", "--timeout", "20"]);
+    let seen = wait_for_file(&rig.marker());
+    assert_eq!(
+        seen, cell.address,
+        "the harness got the server's address, not spawn's"
+    );
+    cell.register(
+        "spawn-e2e-env",
+        rig.work().to_str().unwrap(),
+        chrono::Utc::now().timestamp_millis(),
+    );
+    let out = finish(child);
+    assert!(out.status.success(), "{}", text(&out));
 }

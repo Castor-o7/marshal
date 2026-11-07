@@ -11,6 +11,17 @@
 //! can be fooled by another session starting in the same directory at the same
 //! time. MAR-27 replaces it with a one-time token.
 //!
+//! tmux runs the harness with no shell in between: it hands a lone command
+//! argument to `sh -c`, so the harness always goes as two or more arguments.
+//!
+//! When a tmux server is already running, a new session gets that server's
+//! environment, not spawn's. So spawn passes the settings that decide which
+//! daemon the harness joins and as whom ([`PASSED_ENV`]) with `new-session -e`.
+//! None of them are secrets, which matters because `-e` puts them on tmux's
+//! command line. A session's own identity (`MARSHAL_AGENT_ID`, the Codex
+//! app-server endpoint) is never passed, so the new session can't take the
+//! spawner's.
+//!
 //! Like `roster`, spawn only reads the roster and registers no session itself.
 
 use std::collections::HashSet;
@@ -129,16 +140,50 @@ fn default_name(harness: Harness, cwd: &Path) -> String {
 
 /// The program and arguments tmux runs, with no shell in between. Codex goes
 /// through `codex-run`, which is what gives an idle Codex thread live wakes.
+///
+/// `claude` alone would be one argument, which tmux runs through `sh -c`, so
+/// it goes through `env --` to make it two and keep the shell out.
 fn harness_command(harness: Harness, shim: &Path) -> Vec<String> {
     match harness {
-        Harness::Claude => {
-            vec![std::env::var("MARSHAL_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())]
-        }
+        Harness::Claude => vec![
+            "env".into(),
+            "--".into(),
+            std::env::var("MARSHAL_CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+        ],
         Harness::Codex => vec![shim.display().to_string(), "codex-run".into()],
     }
 }
 
-fn tmux_new_session_args(name: &str, cwd: &Path, command: &[String]) -> Vec<String> {
+/// Settings passed from spawn's environment to the harness's, because a
+/// running tmux server would otherwise give it the server's. Each decides
+/// which daemon the harness joins, or what it reports about itself, and none
+/// is a secret.
+const PASSED_ENV: &[&str] = &[
+    "MARSHAL_DAEMON_ADDRESS",
+    "MYKO_ADDRESS",
+    "MARSHAL_BASE_URL",
+    "MARSHAL_HOST",
+    "MARSHAL_OPERATOR",
+    "MARSHAL_BIN_DIR",
+    "MARSHAL_CODEX_BIN",
+    "MARSHAL_WAITER_LOCK_WAIT_SECS",
+    // Where the daemon-address file is read from.
+    "XDG_CONFIG_HOME",
+];
+
+fn passed_env(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    PASSED_ENV
+        .iter()
+        .filter_map(|k| get(k).map(|v| (k.to_string(), v)))
+        .collect()
+}
+
+fn tmux_new_session_args(
+    name: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    command: &[String],
+) -> Vec<String> {
     let mut args = vec![
         "new-session".to_string(),
         "-d".into(),
@@ -146,10 +191,14 @@ fn tmux_new_session_args(name: &str, cwd: &Path, command: &[String]) -> Vec<Stri
         name.into(),
         "-c".into(),
         cwd.display().to_string(),
-        // Given as separate arguments, tmux runs the command directly rather
-        // than through a shell, so nothing in it is interpreted.
-        "--".into(),
     ];
+    for (k, v) in env {
+        args.push("-e".into());
+        args.push(format!("{k}={v}"));
+    }
+    // Two or more arguments after this, so tmux runs the command directly
+    // rather than through a shell, and nothing in it is interpreted.
+    args.push("--".into());
     args.extend(command.iter().cloned());
     args
 }
@@ -258,7 +307,12 @@ async fn launch_and_wait(
     let not_before_ms = chrono::Utc::now().timestamp_millis() - CLOCK_SLACK_MS;
 
     let out = tmux()
-        .args(tmux_new_session_args(name, cwd, command))
+        .args(tmux_new_session_args(
+            name,
+            cwd,
+            &passed_env(|k| std::env::var(k).ok()),
+            command,
+        ))
         .output()
         .context("running tmux: is it installed?")?;
     ensure!(
@@ -386,10 +440,45 @@ mod tests {
             harness_command(Harness::Codex, shim),
             ["/opt/marshal-shim", "codex-run"]
         );
-        let tmux = tmux_new_session_args("n", Path::new("/w"), &["claude".into()]);
+        // tmux hands a lone argument to `sh -c`, so there are always two or more.
+        let claude = harness_command(Harness::Claude, shim);
+        assert!(claude.len() >= 2, "{claude:?}");
+        assert_eq!(claude[..2], ["env", "--"]);
+        let env = [("MARSHAL_DAEMON_ADDRESS".to_string(), "ws://h:1".to_string())];
+        let tmux = tmux_new_session_args("n", Path::new("/w"), &env, &claude[..]);
         assert_eq!(
-            tmux,
-            ["new-session", "-d", "-s", "n", "-c", "/w", "--", "claude"]
+            tmux[..9],
+            [
+                "new-session",
+                "-d",
+                "-s",
+                "n",
+                "-c",
+                "/w",
+                "-e",
+                "MARSHAL_DAEMON_ADDRESS=ws://h:1",
+                "--"
+            ]
+        );
+        assert_eq!(tmux[9..], claude[..]);
+    }
+
+    #[test]
+    fn only_the_listed_settings_reach_the_harness_and_never_an_identity() {
+        let env = |k: &str| match k {
+            "MARSHAL_DAEMON_ADDRESS"
+            | "MARSHAL_AGENT_ID"
+            | "MARSHAL_CODEX_APP_SERVER_SOCKET"
+            | "XDG_CONFIG_HOME" => Some(format!("{k}-value")),
+            _ => None,
+        };
+        let passed = passed_env(env);
+        let keys: Vec<&str> = passed.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["MARSHAL_DAEMON_ADDRESS", "XDG_CONFIG_HOME"]);
+        assert!(
+            !PASSED_ENV
+                .iter()
+                .any(|k| k.contains("AGENT_ID") || k.contains("APP_SERVER"))
         );
     }
 
