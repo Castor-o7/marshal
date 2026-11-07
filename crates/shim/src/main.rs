@@ -243,6 +243,7 @@ Commands:
   roster        Print the roster as JSON
   spawn         Start a session in tmux and wait for it to join:
                 spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]
+                      [--task <text>]
 
 Options:
   --check        Print \"ok\" and exit (install smoke test)

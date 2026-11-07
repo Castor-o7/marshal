@@ -24,7 +24,13 @@
 //! gets its own token as `MARSHAL_AGENT_ID`, never the spawner's, and the Codex
 //! app-server endpoint isn't passed at all.
 //!
-//! Like `roster`, spawn only reads the roster and registers no session itself.
+//! With `--task`, once the session has joined, spawn sends it the task as a
+//! direct message (MAR-28), the way `tell` does from a terminal: under a
+//! short-lived terminal session, labelled as from a terminal, addressed to the
+//! joined session's full id. Direct mail wakes an idle session through its
+//! hooks, so it acts on the task in whatever permission mode it started in.
+//!
+//! Apart from that send, spawn only reads the roster and registers no session.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,7 +42,7 @@ use hyphae::Gettable;
 use marshal_entities::{GetAllSessionNicknames, GetAllSessions, Session, SessionNickname};
 use myko::client::{ConnectionStatus, MykoClient};
 
-const USAGE: &str = "usage: marshal-shim spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]";
+const USAGE: &str = "usage: marshal-shim spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>] [--task <text>]";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(200);
@@ -71,6 +77,8 @@ pub(crate) struct Args {
     pub cwd: Option<PathBuf>,
     pub name: Option<String>,
     pub timeout: Duration,
+    /// Sent to the new session as a direct message once it joins (MAR-28).
+    pub task: Option<String>,
 }
 
 pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
@@ -81,6 +89,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
         cwd: None,
         name: None,
         timeout: DEFAULT_TIMEOUT,
+        task: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -96,6 +105,11 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
                     .with_context(|| format!("--timeout takes whole seconds\n{USAGE}"))?;
                 ensure!(secs > 0, "--timeout must be at least 1 second");
                 parsed.timeout = Duration::from_secs(secs);
+            }
+            "--task" => {
+                let task = value()?;
+                ensure!(!task.trim().is_empty(), "--task needs some text\n{USAGE}");
+                parsed.task = Some(task.clone());
             }
             other => bail!("unknown argument {other:?}\n{USAGE}"),
         }
@@ -264,7 +278,30 @@ pub(crate) fn run(rest: &[String]) -> Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?
-        .block_on(launch_and_wait(&name, &cwd, &command, args.timeout))
+        .block_on(async {
+            let session = launch_and_wait(&name, &cwd, &command, args.timeout).await?;
+            match args.task {
+                Some(task) => send_task(&name, &session, task).await,
+                None => Ok(()),
+            }
+        })
+}
+
+/// Send the first task as a direct message, the way `tell` does from a
+/// terminal, to the joined session's full id, so it reaches that session and
+/// no other. Direct mail wakes an idle session through its hooks.
+async fn send_task(name: &str, session_id: &str, task: String) -> Result<()> {
+    crate::terminal_send::run(
+        crate::terminal_send::Target::Named(session_id.to_string()),
+        task,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "the session joined, but its first task wasn't sent. It's still running in tmux session {name}; \
+             send the task with `marshal-shim tell {session_id} <task>`"
+        )
+    })
 }
 
 async fn launch_and_wait(
@@ -272,7 +309,7 @@ async fn launch_and_wait(
     cwd: &Path,
     command: &[String],
     timeout: Duration,
-) -> Result<()> {
+) -> Result<String> {
     marshal_entities::link();
     let client = MykoClient::new();
     let sessions = client.watch_query::<GetAllSessions>(GetAllSessions {});
@@ -326,7 +363,7 @@ async fn launch_and_wait(
                 "{nickname} ({}) joined from tmux session {name}. Attach: tmux attach -t ={name}",
                 s.id.0
             );
-            return Ok(());
+            return Ok(s.id.0.to_string());
         }
         if !tmux_has_session(name)? {
             bail!(
@@ -384,6 +421,11 @@ mod tests {
             parse_args(&args(&["claude"])).unwrap().timeout,
             DEFAULT_TIMEOUT
         );
+        assert_eq!(parse_args(&args(&["claude"])).unwrap().task, None);
+        let a = parse_args(&args(&["claude", "--task", "say ready"])).unwrap();
+        assert_eq!(a.task.as_deref(), Some("say ready"));
+        assert!(parse_args(&args(&["claude", "--task", "  "])).is_err());
+        assert!(parse_args(&args(&["claude", "--task"])).is_err());
     }
 
     #[test]
