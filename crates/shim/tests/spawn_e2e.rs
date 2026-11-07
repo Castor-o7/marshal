@@ -220,13 +220,17 @@ impl Rig {
     }
 
     fn spawn(&self, address: &str, extra: &[&str]) -> std::process::Child {
+        let work = self.work();
+        let mut args = vec!["spawn", "claude", "--cwd", work.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        self.shim(address, &args)
+    }
+
+    /// Run `marshal-shim <args>` with this rig's tmux, harness and home.
+    fn shim(&self, address: &str, args: &[&str]) -> std::process::Child {
         let home = self.dir.path().join("home");
         Command::new(SHIM)
-            .arg("spawn")
-            .arg("claude")
-            .arg("--cwd")
-            .arg(self.work())
-            .args(extra)
+            .args(args)
             .env_remove("TMUX")
             .env("TMUX_TMPDIR", self.dir.path().join("tmux"))
             .env(
@@ -516,4 +520,114 @@ fn without_a_task_nothing_is_sent() {
     let out = finish(child);
     assert!(out.status.success(), "{}", text(&out));
     assert!(cell.messages().is_empty(), "{:?}", cell.messages());
+}
+
+/// For a team: each member writes its directory and token to a file named
+/// after its directory, and a member working in `quitter` exits at once.
+const TEAM_HARNESS: &str = r#"d=$(basename "$(pwd)"); [ "$d" = quitter ] && exit 3; printf '%s\n%s\n' "$(pwd)" "$MARSHAL_AGENT_ID" > "$SPAWN_E2E_MARKER-$d.tmp"; mv "$SPAWN_E2E_MARKER-$d.tmp" "$SPAWN_E2E_MARKER-$d"; exec sleep 120"#;
+
+fn team_file(rig: &Rig, members: &[(&str, &str, Option<&str>)]) -> PathBuf {
+    let mut text = String::from("team = \"e2e\"\n");
+    for (role, dir, task) in members {
+        std::fs::create_dir_all(rig.dir.path().join(dir)).unwrap();
+        text.push_str(&format!(
+            "[[member]]\nrole = \"{role}\"\nharness = \"claude\"\ncwd = \"{dir}\"\n"
+        ));
+        if let Some(task) = task {
+            text.push_str(&format!("task = \"{task}\"\n"));
+        }
+    }
+    let file = rig.dir.path().join("team.toml");
+    std::fs::write(&file, text).unwrap();
+    file
+}
+
+fn member_marker(rig: &Rig, dir: &str) -> PathBuf {
+    PathBuf::from(format!("{}-{dir}", rig.marker().display()))
+}
+
+#[test]
+fn a_team_starts_together_each_member_gets_its_own_task_and_failures_are_reported() {
+    if !have_tmux() {
+        return;
+    }
+    let cell = Cell::spawn();
+    let rig = Rig::new(TEAM_HARNESS);
+    let file = team_file(
+        &rig,
+        &[
+            ("backend", "backend-dir", Some("take the next story")),
+            ("reviewer", "reviewer-dir", None),
+            ("quitter", "quitter", Some("never read")),
+        ],
+    );
+    let child = rig.shim(
+        &cell.address,
+        &["spawn-team", file.to_str().unwrap(), "--timeout", "20"],
+    );
+    let backend = seen(&member_marker(&rig, "backend-dir"));
+    let reviewer = seen(&member_marker(&rig, "reviewer-dir"));
+    assert_ne!(backend.agent_id, reviewer.agent_id, "members share a token");
+    for token in [&backend.agent_id, &reviewer.agent_id] {
+        assert!(token.starts_with("spawn-"), "token: {token:?}");
+    }
+    // Registered in the other order from the file's.
+    cell.register("team-e2e-reviewer", &reviewer.cwd, Some(&reviewer.agent_id));
+    cell.register("team-e2e-backend", &backend.cwd, Some(&backend.agent_id));
+
+    let out = finish(child);
+    assert!(
+        !out.status.success(),
+        "the quitter should fail the run: {}",
+        text(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in [
+        "backend: joined as",
+        "(team-e2e-backend) in tmux e2e-backend; task sent",
+        "(team-e2e-reviewer) in tmux e2e-reviewer; no task",
+        "quitter: DIDN'T JOIN: the harness exited",
+        "--- 2 of 3 joined and set up, 1 not",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}: {}", text(&out));
+    }
+    assert!(rig.has_session("e2e-backend") && rig.has_session("e2e-reviewer"));
+
+    let messages = cell.messages();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0]
+            .body
+            .ends_with("You are the backend member of team e2e. take the next story"),
+        "{messages:?}"
+    );
+    assert_eq!(
+        messages[0].to_session_id.as_ref().map(|id| id.0.as_ref()),
+        Some("team-e2e-backend")
+    );
+}
+
+#[test]
+fn a_team_with_a_taken_tmux_name_starts_no_one() {
+    if !have_tmux() {
+        return;
+    }
+    let cell = Cell::spawn();
+    let rig = Rig::new(TEAM_HARNESS);
+    let file = team_file(&rig, &[("one", "one-dir", None), ("two", "two-dir", None)]);
+    let up = rig
+        .tmux()
+        .args(["new-session", "-d", "-s", "e2e-two", "sleep", "120"])
+        .output()
+        .unwrap();
+    assert!(up.status.success(), "{}", text(&up));
+    let out = finish(rig.shim(&cell.address, &["spawn-team", file.to_str().unwrap()]));
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("so no one was started"),
+        "{}",
+        text(&out)
+    );
+    assert!(!rig.has_session("e2e-one"));
+    assert!(!member_marker(&rig, "one-dir").exists());
 }
