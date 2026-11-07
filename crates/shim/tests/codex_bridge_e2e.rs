@@ -22,7 +22,8 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use marshal_entities::{
-    GetAllSessions, HostInfo, Message, MessageId, MessageRead, MessageReadId, Session, SessionId,
+    GetAllSessions, GetAllWakeWatchers, HostInfo, Message, MessageId, MessageRead, MessageReadId,
+    Session, SessionId, WakeWatcher, WakeWatcherId,
 };
 use myko::prelude::EventPublishing as _;
 use myko::{
@@ -163,6 +164,28 @@ async fn handle_hook_request(mut stream: TcpStream, ctx: Arc<MykoServerContext>)
         // which re-registers a dropped row by accident and hides MAR-7's gap.
         reply = json!({"session_id": session_id, "nickname": format!("canary-{session_id}")})
             .to_string();
+    }
+    if target.starts_with("/hook/bridge-watch")
+        && let Ok(body) = serde_json::from_slice::<Value>(&body)
+        && let Some(session_id) = body.get("session_id").and_then(Value::as_str)
+    {
+        // As the daemon does: a watched session gets a WakeWatcher, which is
+        // what the roster's `wake` and a send's `expected` read (MAR-12).
+        let watcher = WakeWatcher {
+            id: WakeWatcherId(Arc::from(session_id)),
+            until: chrono::Utc::now().timestamp_millis() + 120_000,
+        };
+        if body["watching"] == true {
+            internal_context(&ctx)
+                .emit_set(&watcher)
+                .expect("record the wake path");
+            reply = "watching".to_string();
+        } else {
+            internal_context(&ctx)
+                .emit_del(&watcher)
+                .expect("end the wake path");
+            reply = "not watching".to_string();
+        }
     }
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -690,6 +713,41 @@ async fn a_thread_whose_app_server_went_away_is_not_registered_again() {
         !back,
         "a thread whose app-server went away came back as a ghost row"
     );
+    bridge.stop();
+}
+
+fn wake_watched(ctx: &Arc<MykoServerContext>, session_id: &str) -> bool {
+    internal_context(ctx)
+        .exec_query(GetAllWakeWatchers {})
+        .unwrap_or_default()
+        .iter()
+        .any(|w| w.id.0.as_ref() == session_id)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leading_bridge_reports_its_wake_path_until_its_app_server_goes() {
+    // MAR-12: Codex holds no /hook/wait, so the bridge tells the daemon which
+    // threads it can wake. The roster then says `waiting` and a send says
+    // `expected`, until the bridge can't wake the thread any more.
+    let temp = tempfile::tempdir().expect("test tempdir");
+    let cell = CellHarness::spawn();
+    let hooks = HookHarness::spawn(Arc::clone(&cell.ctx)).await;
+    let app_server = FakeAppServer::spawn(&["watched-thread"]).await;
+
+    let mut bridge = BridgeProcess::spawn(&app_server, &cell, &hooks, &temp, "watcher");
+    bridge.wait_ready().await;
+    wait_for_sessions(&cell.ctx, &["watched-thread"]).await;
+    wait_until("the bridge to report its wake path", WAIT, || {
+        wake_watched(&cell.ctx, "watched-thread")
+    })
+    .await;
+
+    app_server.stop();
+    wait_until("the bridge to withdraw its wake path", WAIT, || {
+        !wake_watched(&cell.ctx, "watched-thread")
+    })
+    .await;
     bridge.stop();
 }
 

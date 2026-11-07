@@ -36,8 +36,9 @@ use myko::{
 use serde_json::Value;
 
 use marshal_entities::{
-    AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllWakeWatchers, HostInfo, MessageId, MessageView,
-    ReadMessages, Session, SessionId, WakeWatcher, WakeWatcherId, context_preview, nickname_for,
+    AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllSessions, GetAllWakeWatchers, HostInfo, MessageId,
+    MessageView, ReadMessages, Session, SessionId, WakeWatcher, WakeWatcherId, context_preview,
+    nickname_for,
 };
 
 const AUTO_INBOX_BODY_BUDGET_CHARS: usize = 8_000;
@@ -157,6 +158,7 @@ pub fn dispatch(
         "/hook/prompt-submit" => Some(handle_prompt_submit(query, body, ctx)),
         "/hook/session-end" => Some(handle_session_end(body, ctx)),
         "/hook/ack" => Some(handle_ack(body, ctx)),
+        "/hook/bridge-watch" => Some(handle_bridge_watch(body, ctx)),
         _ => None,
     }
 }
@@ -213,6 +215,50 @@ fn handle_ack(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
         ack_surfaced(ctx, &session, ids);
     }
     HookOutcome::text(String::new())
+}
+
+/// A Codex app-server bridge saying it can wake a thread (MAR-12). Codex holds
+/// no `/hook/wait`, so without this the roster calls a bridge-watched thread
+/// `wake: none`, and a send to it says `unobserved`, though its bridge will
+/// start a turn. Body: `{"session_id": …, "watching": true|false}`. `true`
+/// refreshes the session's `WakeWatcher` (written only when due, as a held
+/// wait's is); `false` ends it.
+///
+/// It touches only what a bridge registered: a hook-owned row on the roster
+/// (no client binding), as Codex's are, since Codex's MCP shim registers no
+/// session. A Claude session's row is bound to its shim's connection, and
+/// its record belongs to its own waiter, so it's left alone. So is anything
+/// when `watching` isn't an explicit bool: a malformed body changes nothing.
+/// Like the other hook routes, this trusts the session id it's given: keep
+/// the hook listener on loopback or a trusted network.
+fn handle_bridge_watch(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
+    let parsed = parse_body(body);
+    let Some(sid) = parsed
+        .as_ref()
+        .and_then(|b| b.get("session_id")?.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return HookOutcome::text("ignored".to_string());
+    };
+    let Some(watching) = parsed.as_ref().and_then(|b| b.get("watching")?.as_bool()) else {
+        return HookOutcome::text("ignored".to_string());
+    };
+    let cmd_ctx = internal_cmd_ctx(ctx);
+    let bridge_owned = cmd_ctx
+        .exec_query(GetAllSessions {})
+        .unwrap_or_default()
+        .iter()
+        .any(|s| s.id.0.as_ref() == sid && s.client_id.is_none());
+    if !bridge_owned {
+        return HookOutcome::text("not watching".to_string());
+    }
+    if watching {
+        mark_waiting(&cmd_ctx, sid, chrono::Utc::now().timestamp_millis());
+        HookOutcome::text("watching".to_string())
+    } else {
+        end_wait(&cmd_ctx, sid);
+        HookOutcome::text("not watching".to_string())
+    }
 }
 
 /// Register or refresh a hook-owned session without surfacing its inbox.
