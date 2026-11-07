@@ -1614,6 +1614,18 @@ async fn watch_app_server_registrations(
         if let Err(error) = result {
             log::debug!("[codex-bridge] app-server lifecycle connection unavailable: {error:#}");
         }
+        // A thread says it closed only while its app-server is up. Once the
+        // connection ends (Codex exited or crashed, or the app-server
+        // restarted), forget what it registered, or those threads would be
+        // registered again every cooldown as ghost rows. The snapshot on
+        // reconnect registers the threads the app-server still has.
+        let forgotten = std::mem::take(&mut *registered.lock().unwrap());
+        if !forgotten.is_empty() {
+            log::info!(
+                "[codex-bridge] app-server connection ended; forgot {} registered thread(s)",
+                forgotten.len()
+            );
+        }
         if let Some(launcher) = launcher.as_ref()
             && let Err(error) = launcher.lock().await.disconnected()
         {
