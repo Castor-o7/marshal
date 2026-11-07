@@ -639,16 +639,20 @@ fn a_team_with_a_taken_tmux_name_starts_no_one() {
 
 /// A stand-in desktop terminal: records its arguments, then runs what follows
 /// `-e` under script(1), so `tmux attach` gets the pty a window would give it.
-/// spawn starts the terminal with stdin at /dev/null, and an older script(1)
-/// (util-linux 2.39, on the CI runner) ends its session when stdin ends, so the
-/// fake keeps a stdin open. A real terminal doesn't read its stdin.
+/// Like a real terminal, it sets TERM: with TERM unset or `dumb`, as on a CI
+/// runner, `tmux attach` fails with "open terminal failed: terminal does not
+/// support clear". It also keeps script's stdin open, as a precaution only,
+/// since spawn starts the terminal with stdin at /dev/null. That was never
+/// shown to matter. script's output goes to `terminal-out`, for the failure
+/// message.
 fn fake_terminal(rig: &Rig) -> PathBuf {
     let path = rig.dir.path().join("fake-terminal");
     std::fs::write(
         &path,
         format!(
-            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {args}\n[ \"$1\" = -e ] || exit 9\nshift\nsleep 300 | script -qfc \"$(printf '%q ' \"$@\")\" /dev/null > /dev/null 2>&1\n",
-            args = rig.dir.path().join("terminal-args").display()
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {args}\n[ \"$1\" = -e ] || exit 9\nshift\nexport TERM=xterm-256color\nsleep 300 | script -qfc \"$(printf '%q ' \"$@\")\" /dev/null > {out} 2>&1\n",
+            args = rig.dir.path().join("terminal-args").display(),
+            out = rig.dir.path().join("terminal-out").display()
         ),
     )
     .unwrap();
@@ -713,7 +717,8 @@ fn window_opens_a_terminal_attached_to_the_tmux_session() {
     assert_eq!(
         clients(),
         1,
-        "the window isn't attached to the tmux session"
+        "the window isn't attached to the tmux session; the terminal said: {:?}",
+        std::fs::read_to_string(rig.dir.path().join("terminal-out")).unwrap_or_default()
     );
     let args = std::fs::read_to_string(&args_file).unwrap();
     let args: Vec<&str> = args.lines().collect();
