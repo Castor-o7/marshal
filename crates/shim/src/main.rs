@@ -250,7 +250,7 @@ Commands:
   roster        Print the roster as JSON
   spawn         Start a session in tmux and wait for it to join:
                 spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]
-                      [--task <text>]
+                      [--task <text>] [--window]
                 spawn list | attach <name> | stop <name>   (sessions spawn started)
   spawn-team    Start a team from a TOML file and give each member its task:
                 spawn-team <team.toml> [--timeout <secs>]
