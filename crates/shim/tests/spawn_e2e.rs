@@ -639,12 +639,15 @@ fn a_team_with_a_taken_tmux_name_starts_no_one() {
 
 /// A stand-in desktop terminal: records its arguments, then runs what follows
 /// `-e` under script(1), so `tmux attach` gets the pty a window would give it.
+/// spawn starts the terminal with stdin at /dev/null, and an older script(1)
+/// (util-linux 2.39, on the CI runner) ends its session when stdin ends, so the
+/// fake keeps a stdin open. A real terminal doesn't read its stdin.
 fn fake_terminal(rig: &Rig) -> PathBuf {
     let path = rig.dir.path().join("fake-terminal");
     std::fs::write(
         &path,
         format!(
-            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {args}\n[ \"$1\" = -e ] || exit 9\nshift\nexec script -qfc \"$(printf '%q ' \"$@\")\" /dev/null > /dev/null 2>&1\n",
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {args}\n[ \"$1\" = -e ] || exit 9\nshift\nsleep 300 | script -qfc \"$(printf '%q ' \"$@\")\" /dev/null > /dev/null 2>&1\n",
             args = rig.dir.path().join("terminal-args").display()
         ),
     )
