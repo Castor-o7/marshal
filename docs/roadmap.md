@@ -122,6 +122,13 @@ launcher.
   `/hook/wait` survives its WS dropping past the grace, a test shows it, and the change is listed in
   MAR-15.
 
+- [ ] **MAR-33: Supporting: claude_push_ack_e2e agent_id read races the shim's roster view.** Found
+  on Castor #2's hosted CI (2026-11-07): `ordinary_shim_preserves_hook_metadata_and_exposes_it_in_resources`
+  read `marshal://whoami` once, right after the daemon's row showed the shim registered, and got a
+  null `agent_id` because the shim's own subscribed view hadn't caught up. Passes 15 of 15 locally.
+  Done when: the test reads again until the view catches up, within its bound, and passes on the
+  fork's hosted CI.
+
 ## Later: other harnesses
 
 - [ ] **MAR-10: Later: Plugins ack a push only after the harness takes it.** From MUS-81. Pi, opencode
