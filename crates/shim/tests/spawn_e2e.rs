@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use marshal_entities::{Session, SessionId};
+use marshal_entities::{GetAllMessages, Message, Session, SessionId};
 use myko::prelude::EventPublishing as _;
 use myko::{
     command::CommandContext,
@@ -117,6 +117,22 @@ impl Cell {
             shutdown: Some(shutdown_tx),
             join: Some(join),
         }
+    }
+
+    /// Every message the cell holds.
+    fn messages(&self) -> Vec<Arc<Message>> {
+        let request = RequestContext::internal(
+            uuid::Uuid::new_v4().to_string().into(),
+            self.ctx.host_id,
+            "spawn-e2e",
+        );
+        CommandContext::new(
+            Arc::from("spawn-e2e"),
+            Arc::new(request),
+            Arc::clone(&self.ctx),
+        )
+        .exec_query(GetAllMessages {})
+        .expect("read messages")
     }
 
     /// Register a session as the hook listener does for a new one.
@@ -444,4 +460,60 @@ fn a_running_tmux_server_doesnt_give_the_harness_its_own_daemon_address() {
     cell.register("spawn-e2e-env", &got.cwd, Some(&got.agent_id));
     let out = finish(child);
     assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn the_first_task_goes_to_the_joined_session_alone_as_a_direct_message() {
+    if !have_tmux() {
+        return;
+    }
+    let cell = Cell::spawn();
+    let rig = Rig::new(RECORDING_HARNESS);
+    let task = "MAR-28 first task: reply with the word ready";
+    let child = rig.spawn(
+        &cell.address,
+        &["--name", "e2e-task", "--timeout", "20", "--task", task],
+    );
+    let got = seen(&rig.marker());
+    // Another session in the same directory, which mustn't get the task.
+    cell.register("spawn-e2e-task-decoy", &got.cwd, None);
+    cell.register("spawn-e2e-task-new", &got.cwd, Some(&got.agent_id));
+
+    let out = finish(child);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("(spawn-e2e-task-new) joined"),
+        "{}",
+        text(&out)
+    );
+    assert!(stdout.contains("1 sent, 0 not sent"), "{}", text(&out));
+
+    let messages = cell.messages();
+    let with_task: Vec<&Message> = messages
+        .iter()
+        .map(|m| m.as_ref())
+        .filter(|m| m.body.ends_with(task))
+        .collect();
+    assert_eq!(with_task.len(), 1, "{messages:?}");
+    assert_eq!(
+        with_task[0].to_session_id.as_ref().map(|id| id.0.as_ref()),
+        Some("spawn-e2e-task-new"),
+        "the task went to another session"
+    );
+}
+
+#[test]
+fn without_a_task_nothing_is_sent() {
+    if !have_tmux() {
+        return;
+    }
+    let cell = Cell::spawn();
+    let rig = Rig::new(RECORDING_HARNESS);
+    let child = rig.spawn(&cell.address, &["--name", "e2e-notask", "--timeout", "20"]);
+    let got = seen(&rig.marker());
+    cell.register("spawn-e2e-notask", &got.cwd, Some(&got.agent_id));
+    let out = finish(child);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(cell.messages().is_empty(), "{:?}", cell.messages());
 }
