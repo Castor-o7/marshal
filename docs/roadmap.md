@@ -196,7 +196,7 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
 
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
-  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6), and
+  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), and
   optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
@@ -214,8 +214,23 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   leaves every room it was in, and `everyone` lists only live sessions, with a test.
 - [ ] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
   branch unless the session set its own, with a test.
-- [ ] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: no test binds a port
-  picked by asking the OS and releasing it, and the e2e suites pass run in parallel.
+- [x] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: every in-process
+  hook listener in the tests takes a socket the test bound to port 0; every port a test's myko
+  server or daemon still picks is retried on a lost bind instead of failing; and the e2e and
+  conformance suites pass with two copies running at once. The rest, myko servers binding a listener
+  they're given, is MAR-40. Done (#28). Hook listeners take the bound socket through
+  `http_listener::serve_until`, so there's no window. A test's myko server reports a lost bind
+  (`run()`'s error) and is started on a new port; a port another socket holds is refused, not
+  mistaken for the server's own (`a_port_another_process_holds_is_reported`). The daemon subprocess
+  suites start it again when it exits on a lost WebSocket bind, or logs `[hook] listener exited` for
+  a lost hook bind, which it does without exiting.
+- [ ] **MAR-40: Later: myko servers in tests bind a listener they're given.** Split from MAR-21.
+  myko-server 6.11.5 binds its own port and takes no listener, so a test's myko server and the
+  daemon subprocesses still bind a picked port and retry when they lose it. One weakness: when
+  another test's myko server holds the port, a connect succeeds, and detection rests on the bind
+  error arriving within 200 ms, a timing assumption. Waits on the operator and upstream: an additive
+  ask that myko-server accept a pre-bound listener, which Josh sends. Done when: myko-server accepts
+  a pre-bound listener, and the remaining port-0 picks in the tests use it.
 - [ ] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
 - [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
