@@ -262,7 +262,8 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
 
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
-  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), and
+  write until it's registered (MUS-72, 78, 79; built on the fork as MAR-43), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
+  predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), and
   optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
   (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
   resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. Done when: the draft is agreed with the
@@ -281,6 +282,13 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   them by name. Waits on the operator: licensing is Josh's to raise with upstream. Done when: the
   four crates carry a licence upstream, or the UI drops or replaces them, and the exclusion comes
   out of `deny.toml`.
+- [ ] **MAR-43: Later: Hold a shim's first write until it's registered, and retry one refused as
+  unregistered.** From MUS-72, MUS-78 and MUS-79. A default change, so it's in MAR-15 for upstream and
+  built on the fork first. An agent's first write can beat the shim's registration, or land on a row
+  still bound to a dead connection, and the daemon refuses it as unregistered. Done when: a write waits
+  up to 5 s for this session's bound row, sends the session again once after 1 s, and a write the
+  daemon refuses as unregistered is retried once after sending the session again, with tests. MAR-18
+  then gives that refusal a stable code.
 - [ ] **MAR-18: Later: Stable error code for the unregistered refusal.** From MUS-80. The shim matches
   the refusal's text. Done when: the refusal carries a code, the shim matches the code, and a test
   covers both.

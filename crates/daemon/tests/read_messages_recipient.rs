@@ -49,6 +49,8 @@ fn session(id: &str, client: &str) -> Session {
         channels_enabled: None,
         agent_id: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
