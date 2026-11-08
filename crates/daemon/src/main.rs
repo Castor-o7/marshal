@@ -44,6 +44,18 @@ async fn main() -> Result<()> {
             println!("marshal-daemon {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Some("forget") => {
+            let target = match args.get(1).and_then(|a| a.to_str()) {
+                Some(t) if args.len() == 2 && !t.trim().is_empty() => t.trim().to_string(),
+                _ => {
+                    eprintln!(
+                        "usage: marshal-daemon forget <session id | 8+ char id prefix | nickname>"
+                    );
+                    std::process::exit(2);
+                }
+            };
+            std::process::exit(forget(&target));
+        }
         _ => {}
     }
     // The daemon always runs in the foreground. `--foreground` stays accepted,
@@ -125,8 +137,12 @@ async fn main() -> Result<()> {
             builder.with_postgres(pg)
         }
         (PersistMode::File, _) => {
-            let dir = daemon::file_persister::state_dir()
-                .map_err(|e| anyhow::anyhow!("marshal-daemon: the state directory: {e}"))?;
+            // The one state directory, shared with the operator's controls (MAR-46).
+            let dir = daemon::controls::state_dir().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "marshal-daemon: the state directory: HOME is not set; set MARSHAL_STATE_DIR"
+                )
+            })?;
             let opened = FilePersister::open(&dir)
                 .map_err(|e| anyhow::anyhow!("marshal-daemon: the store file: {e}"))?;
             let persister: Arc<dyn myko::server::Persister> = opened.persister.clone();
@@ -181,6 +197,24 @@ async fn main() -> Result<()> {
 
     // The periodic sweeper starts below, once myko has caught up with Postgres
     // (MAR-19).
+
+    // The operator's control files (MAR-46): `marshal-daemon forget` writes
+    // them in the state directory, and this applies them every 2 s.
+    match daemon::controls::state_dir() {
+        Some(dir) => match daemon::controls::ensure_state_dir(&dir) {
+            Ok(()) => {
+                log::info!("[controls] state directory {}", dir.display());
+                tokio::spawn(daemon::controls::run(dir, server.ctx()));
+            }
+            Err(e) => log::warn!(
+                "[controls] can't use state directory {}: {e}; `marshal-daemon forget` won't work",
+                dir.display()
+            ),
+        },
+        None => log::warn!(
+            "[controls] no state directory (set MARSHAL_STATE_DIR); `marshal-daemon forget` won't work"
+        ),
+    }
 
     // Spawn marshal's own plain-HTTP listener for the Claude Code `/hook/*`
     // endpoints. Shares the server ctx (same registry + event log); stock
@@ -286,6 +320,12 @@ Marshal coordination daemon: serves the session roster, rooms and messages
 to marshal-shim, marshal-tui and the agent plugins.
 
 Usage: marshal-daemon [OPTIONS]
+       marshal-daemon forget <SESSION>
+
+Commands:
+  forget SESSION  Ask the running daemon to remove a session from the roster
+                  (its id, an 8+ char id prefix, or its nickname) and refuse its
+                  hooks for a while, so a stale waiter can't put it back
 
 Options:
   -h, --help     Print this help and exit
@@ -298,8 +338,11 @@ Environment:
                      runs ephemeral and keeps nothing across a restart
   MARSHAL_PERSIST    Set to `file`, with no Postgres, to keep messages, read
                      state and rooms in the state directory across a restart
-  MARSHAL_STATE_DIR  The state directory for MARSHAL_PERSIST=file (default
+  MARSHAL_STATE_DIR  The daemon's state directory, for the operator's control
+                     files and MARSHAL_PERSIST=file's store (default
                      $XDG_STATE_HOME/marshal, else ~/.local/state/marshal)
+  MARSHAL_FORGET_HOLD_SECS  How long `forget` refuses a session's hooks
+                     (default 600)
   RUST_LOG           Log filter (default info)
 ",
         version = env!("CARGO_PKG_VERSION"),
@@ -375,4 +418,43 @@ fn init_logging() {
         b.filter_level(log::LevelFilter::Info);
     }
     b.init();
+}
+
+/// `marshal-daemon forget <target>`: ask the running daemon to forget a session
+/// (MAR-46), wait for its answer, and say what it did. The exit status is 0
+/// when it forgot one, 1 when it refused, and 3 when no daemon answered.
+fn forget(target: &str) -> i32 {
+    use daemon::controls;
+    let Some(dir) = controls::state_dir() else {
+        eprintln!(
+            "marshal-daemon forget: no state directory: set MARSHAL_STATE_DIR, as the daemon has it"
+        );
+        return 2;
+    };
+    let token = match controls::request_forget(&dir, target) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "marshal-daemon forget: couldn't write to {}: {e}",
+                dir.display()
+            );
+            return 2;
+        }
+    };
+    let deadline = std::time::Instant::now() + controls::REFRESH * 3;
+    while std::time::Instant::now() < deadline {
+        if let Some((ok, text)) = controls::forget_result(&dir, &token) {
+            println!("{text}");
+            return if ok { 0 } else { 1 };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    eprintln!(
+        "marshal-daemon forget: no daemon answered within {} s. Is it running, with state directory {}? \
+         The request stays there, and a daemon that starts within {} min applies it.",
+        (controls::REFRESH * 3).as_secs(),
+        dir.display(),
+        controls::forget_hold().as_secs() / 60
+    );
+    3
 }

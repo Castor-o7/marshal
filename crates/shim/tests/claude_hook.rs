@@ -4,14 +4,15 @@
 //! that every hook the plugin ships answers for the event it is registered
 //! under.
 
+mod support;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SHIM: &str = env!("CARGO_BIN_EXE_marshal-shim");
 const HOOK_INPUT: &str = r#"{"session_id":"itest-claude","cwd":"/tmp/proj"}"#;
 const HOOKS_JSON: &str = include_str!("../../../plugins/marshal-shim/hooks/hooks.json");
 
@@ -70,7 +71,7 @@ fn run_hook(args: &[&str], base: &str) -> String {
 }
 
 fn run_hook_with_agent(args: &[&str], base: &str, agent: Option<&str>) -> String {
-    let mut command = Command::new(SHIM);
+    let mut command = support::shim(support::shared_home());
     command.env_remove("MARSHAL_AGENT_ID");
     if let Some(agent) = agent {
         command.env("MARSHAL_AGENT_ID", agent);
@@ -220,7 +221,7 @@ fn temp_config(name: &str) -> std::path::PathBuf {
 }
 
 fn spawn_waiter(base: &str, config: &std::path::Path) -> std::process::Child {
-    let mut child = Command::new(SHIM)
+    let mut child = support::shim(support::shared_home())
         .args(["claude-hook", "wait"])
         .env("MARSHAL_AGENT_ID", " waiter/\"agent\nopaque ")
         .env("MARSHAL_BASE_URL", base)
@@ -301,7 +302,7 @@ fn a_refused_waiter_tells_the_session_once_per_cause() {
 fn a_refused_watch_says_so_on_stdout_where_monitor_sees_it() {
     let base = refusing_listener(1);
     let config = temp_config("watch-refused");
-    let mut child = Command::new(SHIM)
+    let mut child = support::shim(support::shared_home())
         .args(["watch", "11111111-1111-4111-8111-111111111111", &base])
         .env("XDG_CONFIG_HOME", &config)
         .env("APPDATA", &config)
@@ -390,7 +391,7 @@ fn a_trickled_reply_cannot_extend_the_whole_hook_deadline() {
 fn a_closed_monitor_pipe_leaves_delivered_mail_unacknowledged() {
     let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Marshal-Ack-V1: [\"m1\"]\r\n\r\nhello";
     let (base, requests) = boundary_listener(raw.to_vec(), Duration::ZERO);
-    let mut child = Command::new(SHIM)
+    let mut child = support::shim(support::shared_home())
         .args(["watch", "boundary-test", &base, "--once"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -416,7 +417,7 @@ fn a_replacement_waiter_takes_over_after_the_old_process_releases_its_lock() {
     let config = temp_config("waiter-takeover");
     let mut old = spawn_waiter(&base, &config);
     let (held, _) = listener.accept().unwrap();
-    let mut replacement = Command::new(SHIM)
+    let mut replacement = support::shim(support::shared_home())
         .args(["claude-hook", "wait"])
         .env("MARSHAL_BASE_URL", &base)
         .env("XDG_CONFIG_HOME", &config)
