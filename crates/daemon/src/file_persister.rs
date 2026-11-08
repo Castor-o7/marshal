@@ -63,18 +63,23 @@ const WARN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The daemon's state directory, where the store file goes:
 /// `MARSHAL_STATE_DIR`, else `$XDG_STATE_HOME/marshal`, else
-/// `~/.local/state/marshal`. Read only with `MARSHAL_PERSIST=file`.
+/// `.local/state/marshal` under `HOME` (or `USERPROFILE`, on Windows). Not
+/// created here. Read only with `MARSHAL_PERSIST=file`.
 pub fn state_dir() -> io::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("MARSHAL_STATE_DIR").filter(|v| !v.is_empty()) {
+    let nonempty = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    if let Some(dir) = nonempty("MARSHAL_STATE_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+    if let Some(dir) = nonempty("XDG_STATE_HOME") {
         return Ok(PathBuf::from(dir).join("marshal"));
     }
-    let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
+    let home = nonempty("HOME")
+        .or_else(|| nonempty("USERPROFILE"))
         .ok_or_else(|| io::Error::other("HOME is not set; set MARSHAL_STATE_DIR"))?;
-    Ok(PathBuf::from(home).join(".local/state/marshal"))
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("marshal"))
 }
 
 /// How the daemon keeps its store.
