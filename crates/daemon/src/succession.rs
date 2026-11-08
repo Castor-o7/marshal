@@ -273,6 +273,34 @@ pub fn observe(rows: &[(Arc<str>, Option<Arc<str>>)], live_clients: &HashSet<Arc
     o.known_rows = current;
 }
 
+/// The sessions off the roster that a later session may still take over:
+/// this daemon saw each one's row go within `REMEMBER_REMOVED_MS`, it still
+/// has an identity, and no succession names it yet. The sweeper keeps their
+/// adhoc room memberships, which `take_over` moves to the successor (MAR-19).
+pub fn awaiting_successor(ctx: &CommandContext, now: i64) -> HashSet<Arc<str>> {
+    let removed: Vec<Arc<str>> = {
+        let o = OBSERVED.lock().unwrap_or_else(|e| e.into_inner());
+        o.removed_at
+            .iter()
+            .filter(|(_, at)| now - **at < REMEMBER_REMOVED_MS)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    if removed.is_empty() {
+        return HashSet::new();
+    }
+    let identities = ctx
+        .exec_query(GetAllSessionIdentitys {})
+        .unwrap_or_default();
+    let successions = ctx.exec_query(GetAllSuccessions {}).unwrap_or_default();
+    removed
+        .into_iter()
+        .filter(|id| {
+            identities.iter().any(|i| i.id.0 == *id) && !successions.iter().any(|s| s.id.0 == *id)
+        })
+        .collect()
+}
+
 /// A session's row was removed by its own session end (Codex's SessionEnd
 /// hook). Recorded at once, since the row may not have lasted a sweeper tick.
 pub fn record_removed(session_id: &str, now: i64) {

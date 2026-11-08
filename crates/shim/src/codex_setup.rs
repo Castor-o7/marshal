@@ -52,9 +52,12 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     }
 
     let ws = daemon
-        .or_else(|| std::env::var(crate::ADDRESS_ENV).ok())
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| crate::address_env(crate::ADDRESS_ENV))
         .or_else(crate::read_address_from_config_file)
-        .unwrap_or_else(|| "ws://localhost:6155".to_string());
+        // Under test this refuses, so a test can't write a Codex config that
+        // points at a live daemon (MAR-56).
+        .unwrap_or_else(crate::fallback_daemon_address);
     let host = ws
         .strip_prefix("ws://")
         .or_else(|| ws.strip_prefix("wss://"))

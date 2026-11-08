@@ -8,6 +8,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -180,7 +182,7 @@ impl Rig {
     }
 
     fn shim(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(SHIM);
+        let mut c = support::shim(support::shared_home());
         c.args(args);
         self.env(&mut c);
         c.output().unwrap()
