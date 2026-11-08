@@ -6,7 +6,9 @@
 //!   is in the live `Client` store. When the client drops, a `STALE_AFTER`
 //!   grace covers reconnect blips, then the session is DEL'd. Tracking is
 //!   in-memory (`disconnected_since`); daemon restart resets it, giving
-//!   every reloaded session a fresh grace window.
+//!   every reloaded session a fresh grace window. A session holding
+//!   `/hook/wait` (a current `WakeWatcher`) isn't reaped while it waits, and
+//!   its grace starts again when the wait ends (MAR-6).
 //!
 //! - **Pull/hook sessions** (`client_id: None`): an HTTP-MCP agent that
 //!   registered via `/hook/session-register` or `/hook/session-start` has no
@@ -40,6 +42,13 @@ use myko::{core::item::Eventable, server::MykoServerContext, utils::downcast_ite
 /// dead session just lingers that long (and the roster's liveness fields show
 /// it going stale).
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// The furthest ahead a `WakeWatcher`'s `until` may lie and still keep a
+/// disconnected session (MAR-6). The hook listener writes `until` at most
+/// `hooks::WAKE_WATCHER_TTL_MS` ahead. Any connected client can write a
+/// watcher, so a record further out than that isn't the listener's, and it
+/// mustn't keep a dead session forever.
+const HELD_WAIT_HORIZON_MS: i64 = crate::hooks::WAKE_WATCHER_TTL_MS;
 
 /// Activity backstop for pull/hook sessions (`client_id: None`). They have no
 /// WS client whose loss marks them dead, and `SessionEnd` only fires on a
@@ -319,6 +328,8 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
         .collect();
 
     let now = Instant::now();
+    let now_ms = Utc::now().timestamp_millis();
+    let held = held_waits(ctx, now_ms);
     let mut to_delete: Vec<Arc<str>> = Vec::new();
     let mut still_disconnected: HashSet<Arc<str>> = HashSet::new();
 
@@ -347,13 +358,18 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
                 .flatten()
                 .max()
                 .unwrap_or(0);
-                let now_ms = Utc::now().timestamp_millis();
                 if now_ms.saturating_sub(last_signal_ms) >= PULL_STALE_AFTER.as_millis() as i64 {
                     to_delete.push(id);
                 }
             }
             // WS shim session bound to a live client: healthy.
             Some(cid) if live_client_ids.contains(&cid.0) => {
+                disconnected_since.remove(&id);
+            }
+            // WS shim session whose client has gone, but which is holding
+            // `/hook/wait`: the harness is alive and waiting for mail, so
+            // keep it (MAR-6). Its grace starts again when the wait ends.
+            Some(_) if held.contains(&id) => {
                 disconnected_since.remove(&id);
             }
             // WS shim session whose client has gone: reconnect grace.
@@ -379,6 +395,25 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
         }
         disconnected_since.remove(&id);
     }
+}
+
+/// Sessions with a held wait that counts now: a `WakeWatcher` whose `until`
+/// is in the future but within `HELD_WAIT_HORIZON_MS`.
+fn held_waits(ctx: &MykoServerContext, now_ms: i64) -> HashSet<Arc<str>> {
+    let Some(store) = ctx.registry.get(WakeWatcher::ENTITY_NAME_STATIC) else {
+        return HashSet::new();
+    };
+    store
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .filter_map(|(_, item)| {
+            let w = downcast_item::<WakeWatcher>(&item)?;
+            let ahead = w.until.saturating_sub(now_ms);
+            (ahead > 0 && ahead <= HELD_WAIT_HORIZON_MS).then(|| Arc::from(w.session()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -473,6 +508,109 @@ mod tests {
         };
         let ev = MEvent::from_item(&client, MEventType::SET, &Uuid::new_v4().to_string());
         ctx.apply_event_batch(vec![ev]).expect("apply Client SET");
+    }
+
+    fn set_ws_session(ctx: &MykoServerContext, id: &str, client: &str) {
+        let session = Session {
+            id: SessionId(Arc::from(id)),
+            client_id: Some(myko::entities::client::ClientId(Arc::from(client))),
+            agent_id: None,
+            pid: 0,
+            cwd: "/repo".into(),
+            git_branch: None,
+            current_task: None,
+            session_name: None,
+            activity: None,
+            kind: None,
+            connected_at: 0,
+            last_activity_at: None,
+            last_tool: None,
+            last_tool_at: None,
+            operator: None,
+            host: None,
+            project: None,
+            channels_enabled: None,
+            acks_pushes: None,
+        };
+        let event = MEvent::from_item(&session, MEventType::SET, &Uuid::new_v4().to_string());
+        ctx.apply_event_batch(vec![event])
+            .expect("apply WS Session SET");
+    }
+
+    /// A held `/hook/wait`'s record: keyed by the session id, as the hook
+    /// listener writes it.
+    fn set_held_wait(ctx: &MykoServerContext, session: &str, until: i64) {
+        let watcher = WakeWatcher {
+            id: marshal_entities::WakeWatcherId(Arc::from(session)),
+            until,
+            session_id: None,
+        };
+        let event = MEvent::from_item(&watcher, MEventType::SET, &Uuid::new_v4().to_string());
+        ctx.apply_event_batch(vec![event])
+            .expect("apply WakeWatcher SET");
+    }
+
+    /// Sweep `id` as a WS session whose client dropped longer ago than the
+    /// grace, and say whether it survived.
+    fn survives_a_drop_past_the_grace(ctx: &MykoServerContext, id: &str) -> bool {
+        let dropped = Instant::now()
+            .checked_sub(STALE_AFTER + Duration::from_secs(1))
+            .expect("monotonic clock is past the grace");
+        let mut disconnected_since = HashMap::from([(Arc::<str>::from(id), dropped)]);
+        sweep_once(ctx, &mut disconnected_since);
+        session_ids(ctx).contains(id)
+    }
+
+    #[test]
+    fn sweep_keeps_a_dropped_session_holding_its_wait() {
+        let ctx = setup();
+        set_client(&ctx, "other-client");
+        set_ws_session(&ctx, "waiting", "gone-client");
+        set_held_wait(&ctx, "waiting", Utc::now().timestamp_millis() + 60_000);
+
+        let dropped = Instant::now()
+            .checked_sub(STALE_AFTER + Duration::from_secs(1))
+            .unwrap();
+        let mut disconnected_since = HashMap::from([(Arc::<str>::from("waiting"), dropped)]);
+        sweep_once(&ctx, &mut disconnected_since);
+
+        assert!(
+            session_ids(&ctx).contains("waiting"),
+            "a session holding /hook/wait must survive its WS dropping past the grace (MAR-6)"
+        );
+        assert!(
+            disconnected_since.is_empty(),
+            "the grace starts again once the wait ends"
+        );
+    }
+
+    #[test]
+    fn sweep_reaps_a_dropped_session_with_no_current_wait() {
+        let ctx = setup();
+        set_client(&ctx, "other-client");
+        set_ws_session(&ctx, "no-wait", "gone-client");
+        set_ws_session(&ctx, "lapsed", "gone-client");
+        set_held_wait(&ctx, "lapsed", Utc::now().timestamp_millis() - 1);
+
+        assert!(!survives_a_drop_past_the_grace(&ctx, "no-wait"));
+        assert!(
+            !survives_a_drop_past_the_grace(&ctx, "lapsed"),
+            "a wait that has stopped counting keeps nothing"
+        );
+    }
+
+    #[test]
+    fn sweep_ignores_a_wait_record_further_out_than_the_listener_writes() {
+        let ctx = setup();
+        set_client(&ctx, "other-client");
+        set_ws_session(&ctx, "forged", "gone-client");
+        let far = Utc::now().timestamp_millis() + HELD_WAIT_HORIZON_MS + 60_000;
+        set_held_wait(&ctx, "forged", far);
+
+        assert!(
+            !survives_a_drop_past_the_grace(&ctx, "forged"),
+            "a client-written record can't keep a dead session forever"
+        );
     }
 
     #[test]
