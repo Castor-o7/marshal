@@ -191,6 +191,13 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   [upstream-auth-issue-draft.md](upstream-auth-issue-draft.md). Needs the operator: Josh files it.
   Done when: the issue is filed on ignition-is-go/marshal, and the gate stories are revised to
   match the maintainers' answers.
+- [ ] **MAR-39: Docs: README says the daemon binds 0.0.0.0, but it binds 127.0.0.1.** Found while
+  reading myko#129 for MAR-37: `DEFAULT_BIND` in `crates/daemon/src/main.rs` is `127.0.0.1:6155`,
+  and the README says `0.0.0.0:6155` in two places. Additive and docs-only, so it can go upstream as
+  it stands. Done when: the README matches the code, merged on the fork, and Josh has the branch to
+  send upstream.
+
+MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
 
 ## Later: strengthen Marshal
 
