@@ -10,11 +10,13 @@
 //! - Windows: two isolated app-server endpoints each wake only the thread they
 //!   own, matching native `codex-run`'s per-TUI topology.
 
+mod support;
+
 use std::{
     collections::HashSet,
     io,
     net::SocketAddr,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -44,7 +46,6 @@ use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
 const TEST_HOST: &str = "marshal-wake-canary";
 const POLL: Duration = Duration::from_millis(25);
 const WAIT: Duration = Duration::from_secs(8);
-const SHIM: &str = env!("CARGO_BIN_EXE_marshal-shim");
 
 struct CellHarness {
     address: String,
@@ -473,7 +474,7 @@ impl BridgeProcess {
         name: &str,
     ) -> Self {
         let ready_file = temp.path().join(format!("{name}.ready"));
-        let mut command = Command::new(SHIM);
+        let mut command = support::shim(support::shared_home());
         command
             .args([
                 "codex-bridge",

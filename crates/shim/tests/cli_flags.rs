@@ -4,13 +4,15 @@
 //! Each run has a deadline, so a shim that starts serving when it should have
 //! exited fails the test instead of hanging it.
 
-use std::process::{Command, Output, Stdio};
+mod support;
+
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(20);
 
 fn shim(args: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_marshal-shim"))
+    let mut child = support::shim(support::shared_home())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

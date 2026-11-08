@@ -13,11 +13,12 @@
 //! address (unreachable) — no parent-process / spawn-path assumptions, which
 //! is what made the previous test give false confidence.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
-const SHIM: &str = env!("CARGO_BIN_EXE_marshal-shim");
 const PAYLOAD: &str = r#"{"session_id":"itest-session","workspace":{"current_dir":"/tmp"}}"#;
 const WARNING: &str = "marshal UNREACHABLE";
 
@@ -26,7 +27,7 @@ const WARNING: &str = "marshal UNREACHABLE";
 /// priority address source, so this exercises the real reachability probe
 /// without touching any on-disk config.
 fn statusline_with_daemon(daemon_addr: &str) -> String {
-    let mut child = Command::new(SHIM)
+    let mut child = support::shim(support::shared_home())
         .arg("statusline")
         .env("MARSHAL_DAEMON_ADDRESS", daemon_addr)
         .stdin(Stdio::piped())

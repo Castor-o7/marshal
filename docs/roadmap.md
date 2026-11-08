@@ -200,13 +200,73 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
 
 MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
 
+## Parity with muster (gap survey, 2026-11-08)
+
+Toward the operator's goal of bringing Marshal up to muster's capabilities. A survey of the 62 finished
+muster stories no other entry here names found 23 already in Marshal, 11 portable, 8 default changes
+(added to MAR-15), 11 held behind the gate stories, 6 about muster itself and 3 the operator dropped
+([muster-terminal-gap.md](muster-terminal-gap.md)). The portable ones are below, ordered by what a
+no-interruption cutover from muster's daemon needs first (rally#195's docs/cutover.md). MUS-92 is in
+MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
+
+- [ ] **MAR-44: Parity: A Claude waiter stands down when its session's id changes.** From MUS-104
+  (muster `d96d678`). A `/clear` or compaction re-mints a Claude session's id, but a wait hook started
+  before it keeps polling under the old id, so its row never ages out and mail to the old id still finds
+  a waiter. Done when: each poll checks Claude's live manifest (`canonical_session_id`, as the shim's
+  drift check does), a waiter whose id is no longer the session's exits, nothing changes with no
+  manifest, and a test shows it.
+- [ ] **MAR-45: Parity: Trust a Claude session manifest only if it's live.** From MUS-107 (muster
+  `183179e`, `3f42b7a`, `a089b57`). Claude leaves `~/.claude/sessions/<pid>.json` behind when it dies,
+  so after the pid is reused another process's shim or waiter takes a dead session's id. Done when:
+  discovery and `canonical_session_id` trust a manifest only if it names a live process that started
+  when it says (Linux: `procStart` against `/proc/<pid>/stat`; elsewhere `startedAt` with 2 s slack),
+  what can't be read is trusted as today, with tests.
+- [ ] **MAR-46: Parity: The operator can forget a session.** From MUS-105 (muster `69f6e53`, `073bec9`,
+  `3c84895`). A ghost row has no way off the roster but the sweeper. Done when: `marshal-daemon forget
+  <id | 8+ char prefix | nickname>` makes the running daemon delete that session's row and refuse its
+  hooks for 10 minutes, a target naming no session or several removes nothing, a nickname is resolved
+  once to its id, and tests cover each.
+- [ ] **MAR-47: Parity: Say what a send with no live channel means.** From MUS-99 (muster `9c1a0ca`).
+  Under hook delivery every send says `live_push: unavailable`, and nothing tells the sender a reply
+  will come at the recipient's next turn. Done when: the first such send in a shim carries a `note`
+  saying the message waits in the inbox, shows at the recipient's next tool call or prompt, and wakes
+  an idle recipient only when `wake` is `expected`; it's said once per shim, with a test.
+- [ ] **MAR-48: Parity: Push plugins get mail that waited out a reconnect.** From MUS-90 (muster
+  `d839b97`, `10686af`). Pi, OpenCode and Prime Agent re-register on reconnect but don't pick up direct
+  mail sent while they were away, which waits for the next user turn. Done when: after a reconnect each
+  plugin shows mail that arrived while it was down, without a new message to trigger it, and a test per
+  plugin shows it. After MAR-10, which touches the same files.
+- [ ] **MAR-49: Parity: One error names every missing tool argument.** From MUS-100 (muster `ca3d6f9`,
+  `2d997b3`). Write tools fail one missing field at a time. Done when: one error names every missing or
+  mistyped field (Codex's `asSession` too) and the keys given, the common aliases muster accepts stand
+  in, the canonical name wins over an alias, the advertised schemas are unchanged, with tests.
+- [ ] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
+  (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the old
+  one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is only in
+  its current `op:` room, with a test.
+- [ ] **MAR-51: Parity: A future lastActivityAt doesn't win operator mail.** The plain-mode part of
+  MUS-33 (muster `9a0b61c`). Mail to an operator goes to their most active session, and a session can
+  claim a far-future `lastActivityAt`. Done when: a `lastActivityAt` later than now doesn't outrank a
+  real one when routing operator mail, with a test.
+- [ ] **MAR-52: Parity: Run CI on macOS.** From MUS-13 (muster #163). Held until the official swap to
+  Marshal, by the operator (2026-11-08: "we'll get macos tests ready when we perform the official swap");
+  as for MAR-35, Rally hold 1418. Done when: a `macos-15` job runs the workspace tests on the fork's CI
+  and passes. Keep the change to ci.yml small: every story edits it.
+- [ ] **MAR-53: Parity: Keep messages across a daemon restart without Postgres (opt-in).** From MUS-17
+  (muster `8b4b4c2`, `3dd12aa`, `d6b6cdf`; design in muster's local-persistence-design.md). Without
+  Postgres a restart loses every message. Done when: with `MARSHAL_PERSIST=file` an unread message, read
+  state and rooms survive a restart with no Postgres, the default is unchanged, and the conformance
+  suite's file-restart cells pass.
+
 ## Later: strengthen Marshal
 
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
-  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
+  write until it's registered (MUS-72, 78, 79; built on the fork as MAR-43), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
   predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), and
-  optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
+  optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
+  (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
+  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
@@ -222,6 +282,13 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   them by name. Waits on the operator: licensing is Josh's to raise with upstream. Done when: the
   four crates carry a licence upstream, or the UI drops or replaces them, and the exclusion comes
   out of `deny.toml`.
+- [ ] **MAR-43: Later: Hold a shim's first write until it's registered, and retry one refused as
+  unregistered.** From MUS-72, MUS-78 and MUS-79. A default change, so it's in MAR-15 for upstream and
+  built on the fork first. An agent's first write can beat the shim's registration, or land on a row
+  still bound to a dead connection, and the daemon refuses it as unregistered. Done when: a write waits
+  up to 5 s for this session's bound row, sends the session again once after 1 s, and a write the
+  daemon refuses as unregistered is retried once after sending the session again, with tests. MAR-18
+  then gives that refusal a stable code.
 - [ ] **MAR-18: Later: Stable error code for the unregistered refusal.** From MUS-80. The shim matches
   the refusal's text. Done when: the refusal carries a code, the shim matches the code, and a test
   covers both.
