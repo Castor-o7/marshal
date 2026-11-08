@@ -210,6 +210,14 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   branch unless the session set its own, with a test.
 - [ ] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: no test binds a port
   picked by asking the OS and releasing it, and the e2e suites pass run in parallel.
+  Partly done (#PR), by where the listener lives. Every in-process hook listener is bound to port 0
+  by the test and handed over (`http_listener::serve_until`), so there's no window. myko-server
+  6.11.5 binds its own port and takes no listener, so a test's myko server, and a daemon subprocess,
+  still get a picked port; they now report a lost bind and are started again on a new one, instead
+  of failing or, worse, talking to whatever took the port. A port another socket holds is refused,
+  not mistaken for the server's own (`a_port_another_process_holds_is_reported`). The daemon logs a
+  lost hook bind and keeps running, so the subprocess suites read its log for that. Closing the rest
+  needs myko-server to accept a bound listener: an additive upstream ask.
 - [ ] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
 - [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
