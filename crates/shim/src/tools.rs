@@ -1014,9 +1014,16 @@ const UNBOUND_RETRY_AFTER: Duration = Duration::from_millis(750);
 
 /// Whether the daemon refused a write because this connection has no session
 /// bound to it (`resolve_caller`'s refusal), which re-sending the session fixes.
+/// Matched by the daemon's stable code (MAR-18). A daemon from before the code
+/// sends only the text, so that is accepted until every daemon carries the
+/// code; the code is what keeps a later rewording from stopping the retry.
 fn is_unbound_refusal(message: &str) -> bool {
-    message.contains("has no session on the roster")
+    marshal_entities::is_unregistered_refusal(message) || message.contains(LEGACY_UNREGISTERED_TEXT)
 }
+
+/// What a daemon before MAR-18 says instead of the code. Remove once no daemon
+/// runs a build older than MAR-18.
+const LEGACY_UNREGISTERED_TEXT: &str = "has no session on the roster";
 
 /// Run `call`; if the daemon refused it as unbound, `resend` the session, wait
 /// `settle`, and run it once more. Any other outcome is returned as it is.
@@ -1333,6 +1340,16 @@ mod tests {
 
     #[test]
     fn only_the_unbound_refusal_is_retried() {
+        // The daemon's own refusal, built by the function it uses (MAR-18).
+        assert!(is_unbound_refusal(&marshal_entities::unregistered_refusal(
+            "abc"
+        )));
+        // The code alone is enough, whatever the wording after it.
+        assert!(is_unbound_refusal(&format!(
+            "{} reworded in some later release",
+            marshal_entities::UNREGISTERED_CODE
+        )));
+        // A daemon from before the code.
         assert!(is_unbound_refusal(
             "caller (client abc) has no session on the roster — re-SET your Session and retry"
         ));
@@ -1411,14 +1428,13 @@ mod tests {
         }
     }
 
-    // MAR-43: the daemon's own refusal is what the retry matches. MAR-18 will
-    // give it a stable code; until then the text is pinned here.
+    // MAR-43 pinned the daemon's wording here until the refusal had a code.
+    // MAR-18 gave it one: the daemon builds its refusal with
+    // `unregistered_refusal`, and the retry matches the code that starts it.
     #[test]
     fn the_daemons_unbound_refusal_is_the_one_retried() {
-        let source = include_str!("../../entities/src/session.rs");
-        assert!(
-            source.contains("has no session on the roster — re-SET your Session and retry"),
-            "resolve_caller's refusal changed wording; update is_unbound_refusal"
-        );
+        let refusal = marshal_entities::unregistered_refusal("client-1");
+        assert!(refusal.starts_with(marshal_entities::UNREGISTERED_CODE));
+        assert!(is_unbound_refusal(&refusal));
     }
 }
