@@ -26,9 +26,10 @@ message bus with a roster, for many harnesses. Work sits in one of three layers:
 2. **This fork, where changes get tested.** Changes are proven on Murph before they're offered upstream.
 3. **Outside Marshal.** Rally, the watchman and the team process. These never go upstream.
 
-Order after the in-flight work and Goals 1–3: the conformance suite (MAR-14) first, as the most
-useful thing to give upstream, then security (MAR-37, MAR-38, then the gate stories), with
-durability and portability stories filling the gaps.
+Most of Goals 1–3 and the conformance suite (MAR-14) are built and verified, waiting for their
+ticks. Next comes security (MAR-37, MAR-38, then the gate stories), with durability and portability
+stories filling the gaps. MAR-14 is test-only, which makes it the most useful thing to offer
+upstream next.
 
 This file lives on the Castor fork (Castor-o7/marshal) only, for Rally (project MAR); never send it
 upstream. The operator's planning doc is
