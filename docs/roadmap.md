@@ -266,7 +266,8 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), a `MARSHAL_PERSIST` other than `file` stops startup (MAR-53: so a typo can't silently lose mail; before, the variable meant nothing), and
   optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
   (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
-  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. Done when: the draft is agreed with the
+  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
+  [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), unsent. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
