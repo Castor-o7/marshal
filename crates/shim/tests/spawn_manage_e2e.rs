@@ -71,44 +71,72 @@ impl Rig {
         for sub in ["tmux", "home/config", "work", "bin"] {
             std::fs::create_dir_all(dir.path().join(sub)).unwrap();
         }
-        let (ws, hook) = (free_port(), free_port());
         let bin = Path::new(SHIM).with_file_name("marshal-daemon");
         assert!(
             bin.exists(),
             "{} is missing: build the workspace first",
             bin.display()
         );
-        let log = std::fs::File::create(dir.path().join("daemon.log")).unwrap();
         let p = |s: &str| dir.path().join(s);
-        let daemon = Command::new(bin)
-            .env_remove("MARSHAL_BASE_URL")
-            .env_remove("MARSHAL_DAEMON_ADDRESS")
-            .env_remove("MYKO_ADDRESS")
-            .env_remove("MYKO_POSTGRES_URL")
-            .env_remove("MARSHAL_PERSIST")
-            .env("XDG_CONFIG_HOME", p("home/config"))
-            .env("HOME", p("home"))
-            .env("MARSHAL_STATE_DIR", p("state"))
-            .env("MARSHAL_HOST", "spawn-manage")
-            .env("MARSHAL_TLS", "0")
-            .env("MARSHAL_BIND", format!("127.0.0.1:{ws}"))
-            .env("MARSHAL_HOOK_BIND", format!("127.0.0.1:{hook}"))
-            .env("MARSHAL_MYKO_BIND", format!("127.0.0.1:{}", free_port()))
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .expect("start marshal-daemon");
+        let log_path = p("daemon.log");
+        // Its ports are picked by binding port 0 and closing it, so another
+        // process can take one before the daemon binds it. Then it's started
+        // again on new ports (MAR-21).
+        let mut lost = Vec::new();
+        let (ws, hook, daemon) = loop {
+            assert!(
+                lost.len() < 5,
+                "marshal-daemon lost its ports 5 times: {lost:?}; log:\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            let (ws, hook) = (free_port(), free_port());
+            let log = std::fs::File::create(&log_path).unwrap();
+            let mut daemon = Command::new(&bin)
+                .env_remove("MARSHAL_BASE_URL")
+                .env_remove("MARSHAL_DAEMON_ADDRESS")
+                .env_remove("MYKO_ADDRESS")
+                .env_remove("MYKO_POSTGRES_URL")
+                .env_remove("MARSHAL_PERSIST")
+                .env("XDG_CONFIG_HOME", p("home/config"))
+                .env("HOME", p("home"))
+                .env("MARSHAL_STATE_DIR", p("state"))
+                .env("MARSHAL_HOST", "spawn-manage")
+                .env("MARSHAL_TLS", "0")
+                .env("MARSHAL_BIND", format!("127.0.0.1:{ws}"))
+                .env("MARSHAL_HOOK_BIND", format!("127.0.0.1:{hook}"))
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .expect("start marshal-daemon");
+            let up = |port| TcpStream::connect(("127.0.0.1", port)).is_ok();
+            let exited = |c: &mut Child| c.try_wait().ok().flatten().is_some();
+            let listening = wait_until(Duration::from_secs(20), || {
+                exited(&mut daemon) || (up(ws) && up(hook))
+            });
+            // A port another process holds answers too. A daemon that lost
+            // its WebSocket bind exits at once; one that lost its hook bind
+            // logs it and keeps running.
+            if listening && !exited(&mut daemon) {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if !exited(&mut daemon) && listening && !log.contains("[hook] listener exited") {
+                break (ws, hook, daemon);
+            }
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            assert!(
+                log.contains("in use"),
+                "marshal-daemon didn't come up; log:\n{log}"
+            );
+            lost.push(format!("{ws} {hook}"));
+        };
         let rig = Self {
             dir,
             ws,
             hook,
             daemon,
         };
-        let up = |port| TcpStream::connect(("127.0.0.1", port)).is_ok();
-        assert!(
-            wait_until(Duration::from_secs(20), || up(rig.ws) && up(rig.hook)),
-            "marshal-daemon didn't come up"
-        );
         // Joins through the real hook, with whatever MARSHAL_AGENT_ID and hook
         // address tmux gave it, then records its session id and stays up.
         let script = rig.dir.path().join("bin/fake-claude");
