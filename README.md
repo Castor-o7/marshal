@@ -340,7 +340,7 @@ identity when you mean to reach the human through their most-active agent.
 |---|---|
 | `send_message(to, body)` | Interrupt one peer by nickname, session id/prefix, or operator identity. |
 | `broadcast(to_room, body)` | Ambient room update; an `@mention` also directly interrupts that peer. |
-| `join_room(room)` / `leave_room(room)` | Create/join or leave an ad-hoc room. |
+| `join_room(name)` / `leave_room(room)` | Create/join or leave an ad-hoc room. |
 | `set_status(text)` | Update this session's free-form status (the `current_task` field on the roster). |
 | `ack_messages(message_ids)` | Mark message ids read for this session. |
 

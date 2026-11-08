@@ -376,39 +376,32 @@ async fn read_messages(
 // Tool implementations (writes)
 // =============================================================================
 
-/// The session a write command acts AS. Under Codex the shim holds no
-/// connection identity, so the agent names its own session explicitly via
-/// `asSession` (the id the SessionStart hook injected in the `<marshal_session>`
-/// block) and the shim forwards it. Every other harness resolves the caller
-/// from the WS connection, so this is `None`.
-fn caller(host: &ToolHost, args: &Value) -> Result<Option<SessionId>, ToolError> {
-    if !host.is_codex {
-        return Ok(None);
-    }
-    let s = args
-        .get("asSession")
+const AS_SESSION_HINT: &str = "pass your own marshal session id (shown in the \
+     <marshal_session> block at session start) so peers know who sent this";
+
+/// The `asSession` a Codex agent passed: under Codex the shim holds no
+/// connection identity, so the agent names its own session (the id the
+/// SessionStart hook injected in the `<marshal_session>` block).
+fn as_session_arg(args: &Value) -> Option<&str> {
+    args.get("asSession")
         .or_else(|| args.get("as_session"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            ToolError::invalid_params(
-                "missing `asSession`: pass your own marshal session id (shown in the \
-                 <marshal_session> block at session start) so peers know who sent this",
-            )
-        })?;
-    Ok(Some(SessionId(Arc::from(s))))
 }
 
 async fn set_status(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let text = arg_str(args, "text", "set_status: missing `text`")?;
+    let mut req = Required::new("set_status", args);
+    let text = req.string("text", &["current_task", "status"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     let new_task = if text.is_empty() {
         None
     } else {
         Some(Arc::<str>::from(text.as_str()))
     };
     // Codex: target the agent's own session (asSession); else our own row.
-    let id = caller(host, args)?.unwrap_or_else(|| host.session.lock().unwrap().id.clone());
+    let id = as_session.unwrap_or_else(|| host.session.lock().unwrap().id.clone());
     let _ = host
         .client
         .send_command::<SetSessionCurrentTask, ()>(&SetSessionCurrentTask {
@@ -433,12 +426,11 @@ fn response_required(args: &Value) -> Result<bool, ToolError> {
 }
 
 async fn send_message(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let to = arg_str(
-        args,
-        "to",
-        "send_message: missing `to` (session id or nickname)",
-    )?;
-    let body = arg_str(args, "body", "send_message: missing `body`")?;
+    let mut req = Required::new("send_message", args);
+    let to = req.string("to", &["recipient", "to_session"], "session id or nickname");
+    let body = req.string("body", &["message", "text"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     // Pin a visible nickname to the exact id from this shim's roster snapshot.
     // Other tokens stay server-resolved so operator/human routing and id-prefix
     // addressing retain their shared daemon policy.
@@ -451,7 +443,7 @@ async fn send_message(host: &ToolHost, args: &Value) -> Result<ToolOutcome, Tool
         response_required: response_required(args)?,
         to_session_id,
         body,
-        as_session: caller(host, args)?,
+        as_session,
     };
     let cell = host
         .client
@@ -486,13 +478,16 @@ fn send_message_output(result: &SendMessageResult) -> Value {
 }
 
 async fn broadcast(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let to_room = arg_str(args, "to_room", "broadcast: missing `to_room` (room id)")?;
-    let body = arg_str(args, "body", "broadcast: missing `body`")?;
+    let mut req = Required::new("broadcast", args);
+    let to_room = req.string("to_room", &["room", "room_id"], "room id");
+    let body = req.string("body", &["message", "text"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     let cmd = BroadcastMessage {
         response_required: response_required(args)?,
         to_room_id: RoomId(Arc::<str>::from(to_room.as_str())),
         body,
-        as_session: caller(host, args)?,
+        as_session,
     };
     let cell = host
         .client
@@ -545,7 +540,10 @@ fn broadcast_message_output(result: &BroadcastMessageResult) -> Value {
 }
 
 async fn join_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let name = arg_str(args, "name", "join_room: missing `name`")?;
+    let mut req = Required::new("join_room", args);
+    let name = req.string("name", &["room", "room_name"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     let description = args
         .get("description")
         .and_then(|v| v.as_str())
@@ -553,7 +551,7 @@ async fn join_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolErr
     let cmd = JoinRoom {
         name,
         description,
-        as_session: caller(host, args)?,
+        as_session,
     };
     let cell = host.client.send_command::<JoinRoom, JoinRoomResult>(&cmd);
     let result = await_command(cell, REQUEST_TIMEOUT)
@@ -563,11 +561,11 @@ async fn join_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolErr
 }
 
 async fn leave_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let room = arg_str(args, "room", "leave_room: missing `room` (id or name)")?;
-    let cmd = LeaveRoom {
-        room,
-        as_session: caller(host, args)?,
-    };
+    let mut req = Required::new("leave_room", args);
+    let room = req.string("room", &["room_id", "name", "to_room"], "id or name");
+    let as_session = req.caller(host);
+    req.finish()?;
+    let cmd = LeaveRoom { room, as_session };
     let cell = host.client.send_command::<LeaveRoom, LeaveRoomResult>(&cmd);
     let result = await_command(cell, REQUEST_TIMEOUT)
         .await
@@ -576,20 +574,17 @@ async fn leave_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolEr
 }
 
 async fn ack_messages(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let ids = args
-        .get("message_ids")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            ToolError::invalid_params("ack_messages: missing `message_ids` (array of ids)")
-        })?;
-    let message_ids: Vec<MessageId> = ids
-        .iter()
-        .filter_map(|v| v.as_str())
+    let mut req = Required::new("ack_messages", args);
+    let message_ids: Vec<MessageId> = req
+        .string_array("message_ids", &["ids", "message_id"], "array of ids")
+        .into_iter()
         .map(|s| MessageId(Arc::<str>::from(s)))
         .collect();
+    let as_session = req.caller(host);
+    req.finish()?;
     let cmd = AckMessages {
         message_ids,
-        as_session: caller(host, args)?,
+        as_session,
     };
     let cell = host
         .client
@@ -751,11 +746,123 @@ pub fn resources_def(is_codex: bool) -> Vec<ResourceDef> {
 // Helpers
 // =============================================================================
 
-fn arg_str(args: &Value, key: &str, missing_msg: &str) -> Result<String, ToolError> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| ToolError::invalid_params(missing_msg))
+/// A tool's required arguments, read together so that one error names every
+/// field that's missing rather than one per round trip (MUS-100). Each field
+/// also answers to a few common aliases (`room` for `to_room`, `message` for
+/// `body`, `current_task` for `text`), since agents guess those names often.
+struct Required<'a> {
+    tool: &'static str,
+    args: &'a Value,
+    missing: Vec<String>,
+}
+
+impl<'a> Required<'a> {
+    fn new(tool: &'static str, args: &'a Value) -> Self {
+        Self {
+            tool,
+            args,
+            missing: Vec::new(),
+        }
+    }
+
+    /// The first of `key` and its `aliases` that's present. A present
+    /// alias wins over nothing but never over the canonical name.
+    fn lookup(&self, key: &str, aliases: &[&str]) -> Option<&'a Value> {
+        let args = self.args;
+        std::iter::once(key)
+            .chain(aliases.iter().copied())
+            .find_map(|k| args.get(k).filter(|v| !v.is_null()))
+    }
+
+    fn note_missing(&mut self, key: &str, hint: &str, wrong_type: bool) {
+        let mut entry = format!("`{key}`");
+        match (hint.is_empty(), wrong_type) {
+            (_, true) if hint.is_empty() => entry.push_str(" (must be a string)"),
+            (_, true) => entry.push_str(&format!(" ({hint}; must be a string)")),
+            (false, false) => entry.push_str(&format!(" ({hint})")),
+            (true, false) => {}
+        }
+        self.missing.push(entry);
+    }
+
+    /// A required string. Missing or not a string, it's recorded and an
+    /// empty string stands in until [`Self::finish`] reports it.
+    fn string(&mut self, key: &str, aliases: &[&str], hint: &str) -> String {
+        match self.lookup(key, aliases) {
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => {
+                self.note_missing(key, hint, true);
+                String::new()
+            }
+            None => {
+                self.note_missing(key, hint, false);
+                String::new()
+            }
+        }
+    }
+
+    /// A required array of strings. A lone string is taken as a one-item
+    /// array.
+    fn string_array(&mut self, key: &str, aliases: &[&str], hint: &str) -> Vec<String> {
+        match self.lookup(key, aliases) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(_) => {
+                self.missing.push(format!("`{key}` ({hint})"));
+                Vec::new()
+            }
+            None => {
+                self.missing.push(format!("`{key}` ({hint})"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// The session a write command acts AS. Under Codex the shim holds no
+    /// connection identity, so the agent names its own session via
+    /// `asSession` (the id the SessionStart hook injected in the
+    /// `<marshal_session>` block); a missing one is reported with the rest.
+    /// Every other harness resolves the caller from the WS connection, so
+    /// this is `None`.
+    fn caller(&mut self, host: &ToolHost) -> Option<SessionId> {
+        if !host.is_codex {
+            return None;
+        }
+        match as_session_arg(self.args) {
+            Some(s) => Some(SessionId(Arc::from(s))),
+            None => {
+                self.missing
+                    .push(format!("`asSession` ({AS_SESSION_HINT})"));
+                None
+            }
+        }
+    }
+
+    /// One error naming every missing field, plus the keys that were
+    /// given, so a wrong guess at a name is visible at once.
+    fn finish(self) -> Result<(), ToolError> {
+        if self.missing.is_empty() {
+            return Ok(());
+        }
+        let mut msg = format!("{}: missing {}", self.tool, join_and(&self.missing));
+        if let Some(obj) = self.args.as_object().filter(|o| !o.is_empty()) {
+            let given: Vec<String> = obj.keys().map(|k| format!("`{k}`")).collect();
+            msg.push_str(&format!("; got {}", given.join(", ")));
+        }
+        Err(ToolError::invalid_params(msg))
+    }
+}
+
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 fn parse_bool(s: &str) -> bool {
@@ -908,6 +1015,117 @@ mod tests {
             let content: Value = serde_json::from_str(&resource.text).unwrap();
             assert_eq!(content["agent_id"].as_str(), expected);
         }
+    }
+
+    #[test]
+    fn one_error_names_every_missing_field_and_what_was_given() {
+        let args = json!({"room_name": "x"});
+        let mut req = Required::new("broadcast", &args);
+        req.string("to_room", &["room", "room_id"], "room id");
+        req.string("body", &["message", "text"], "");
+        let err = req.finish().unwrap_err();
+        assert_eq!(
+            err.message,
+            "broadcast: missing `to_room` (room id) and `body`; got `room_name`"
+        );
+    }
+
+    #[test]
+    fn common_aliases_stand_in_for_the_field_names() {
+        let args = json!({"room": "everyone", "message": "hi"});
+        let mut req = Required::new("broadcast", &args);
+        assert_eq!(
+            req.string("to_room", &["room", "room_id"], "room id"),
+            "everyone"
+        );
+        assert_eq!(req.string("body", &["message", "text"], ""), "hi");
+        assert!(req.finish().is_ok());
+
+        let args = json!({"current_task": ""});
+        let mut req = Required::new("set_status", &args);
+        assert_eq!(req.string("text", &["current_task", "status"], ""), "");
+        assert!(req.finish().is_ok(), "an empty status still clears");
+    }
+
+    #[test]
+    fn the_canonical_name_wins_over_an_alias() {
+        let args = json!({"body": "real", "message": "alias"});
+        let mut req = Required::new("send_message", &args);
+        assert_eq!(req.string("body", &["message"], ""), "real");
+    }
+
+    #[test]
+    fn a_wrong_type_is_reported_with_the_missing_ones() {
+        let args = json!({"to": 7});
+        let mut req = Required::new("send_message", &args);
+        req.string("to", &[], "session id or nickname");
+        req.string("body", &["message"], "");
+        let err = req.finish().unwrap_err();
+        assert_eq!(
+            err.message,
+            "send_message: missing `to` (session id or nickname; must be a string) and `body`; got `to`"
+        );
+    }
+
+    fn host_for(is_codex: bool) -> ToolHost {
+        ToolHost {
+            client: Arc::new(MykoClient::new()),
+            pid: 1,
+            cwd: "/repo".into(),
+            is_codex,
+            session: Arc::new(Mutex::new((*session("me")).clone())),
+            sessions_cell: Cell::new(vec![]).lock(),
+            rooms_cell: Cell::new(vec![]).lock(),
+            members_cell: Cell::new(vec![]).lock(),
+            nicknames_cell: Cell::new(vec![]).lock(),
+            wake_watchers_cell: Cell::new(vec![]).lock(),
+        }
+    }
+
+    #[test]
+    fn a_codex_call_without_as_session_names_it_with_the_rest() {
+        let args = json!({"to": "peer"});
+        let mut req = Required::new("send_message", &args);
+        req.string("to", &[], "session id or nickname");
+        req.string("body", &["message", "text"], "");
+        assert_eq!(req.caller(&host_for(true)), None);
+        let err = req.finish().unwrap_err();
+        assert_eq!(
+            err.message,
+            format!("send_message: missing `body` and `asSession` ({AS_SESSION_HINT}); got `to`")
+        );
+
+        let args = json!({"to": "peer", "body": "hi", "as_session": "abc"});
+        let mut req = Required::new("send_message", &args);
+        req.string("to", &[], "");
+        req.string("body", &[], "");
+        assert_eq!(
+            req.caller(&host_for(true)),
+            Some(SessionId(Arc::from("abc")))
+        );
+        assert!(req.finish().is_ok());
+    }
+
+    #[test]
+    fn a_call_outside_codex_needs_no_as_session() {
+        let args = json!({"text": "busy"});
+        let mut req = Required::new("set_status", &args);
+        req.string("text", &[], "");
+        assert_eq!(req.caller(&host_for(false)), None);
+        assert!(req.finish().is_ok());
+    }
+
+    #[test]
+    fn ack_ids_take_an_array_or_one_string() {
+        let args = json!({"message_id": "m1"});
+        let mut req = Required::new("ack_messages", &args);
+        assert_eq!(
+            req.string_array("message_ids", &["ids", "message_id"], "array of ids"),
+            vec!["m1"]
+        );
+        assert!(req.finish().is_ok());
+        let err = Required::new("ack_messages", &json!({})).finish();
+        assert!(err.is_ok(), "nothing asked, nothing missing");
     }
 
     #[test]
