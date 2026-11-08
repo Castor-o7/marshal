@@ -185,8 +185,11 @@ suite("marshal-opencode ↔ real marshal-daemon", () => {
     expect(aHandle).toContain("-");
     expect(seen.find((meta) => meta.body === "hello from alice")?.from_nickname).toBe(aHandle);
 
-    // A delivered live push marks the durable copy read, preventing a second
-    // delivery when the next user turn drains the inbox.
+    // The plugin registers with acksPushes (MAR-10), so the daemon leaves a
+    // pushed message unread until the plugin acks it once opencode has taken
+    // it. This bare daemon never prompted it, so the next drain shows it once,
+    // and no drain after that.
+    expect(await daemonB.drainInbox(B)).toContain("hello from alice");
     expect(await daemonB.drainInbox(B)).toBeNull();
   }, 20_000);
 
@@ -199,6 +202,8 @@ suite("marshal-opencode ↔ real marshal-daemon", () => {
     await daemonA.sendMessage(A, B, "ping over the wire");
     const got = await waitFor(() => seen.some((b) => b.includes("ping over the wire")), 5_000);
     expect(got).toBe(true);
+    // Nothing here acks the push (MAR-10), so it's still unread for a drain.
+    expect(await daemonB.drainInbox(B)).toContain("ping over the wire");
   }, 20_000);
 
   test("join_room and broadcast round-trip over the wire", async () => {
