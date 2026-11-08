@@ -634,6 +634,14 @@ fn caller_without_session_errors() {
         "error should name the unbound client id, got: {}",
         err.message,
     );
+    // MAR-18: the shim retries this refusal by its code, so the daemon's
+    // refusal must start with it.
+    assert!(
+        err.message.starts_with(marshal_entities::UNREGISTERED_CODE),
+        "{}",
+        err.message
+    );
+    assert!(marshal_entities::is_unregistered_refusal(&err.message));
     assert_eq!(message_count(&ctx), 0);
 }
 
