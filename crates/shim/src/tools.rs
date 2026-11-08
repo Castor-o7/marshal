@@ -109,19 +109,33 @@ impl Handler for CoordHandler {
         let args = args.clone();
         let name = name.to_string();
         Box::pin(async move {
-            match name.as_str() {
-                "set_status" => set_status(&host, &args).await,
-                "send_message" => send_message(&host, &args).await,
-                "broadcast" => broadcast(&host, &args).await,
-                "join_room" => join_room(&host, &args).await,
-                "leave_room" => leave_room(&host, &args).await,
-                "ack_messages" => ack_messages(&host, &args).await,
-                other => Err(ToolError {
-                    code: METHOD_NOT_FOUND,
-                    message: format!("unknown tool: {other}"),
-                    data: None,
-                }),
+            // Under Codex the caller is named by `asSession`, so there's no
+            // connection binding to wait for or refuse.
+            if host.is_codex {
+                return dispatch_tool(&host, &name, &args).await;
             }
+            // Every tool here writes as this session, which the daemon refuses
+            // until the session's row is on the roster, bound to this
+            // connection. An agent's first call can come before the shim's
+            // registration lands, so hold it briefly rather than fail it
+            // (MAR-43, from muster's MUS-72 and MUS-78).
+            wait_until_registered(&host).await;
+            // The hold can pass on a row still bound to an earlier connection
+            // for this session (one that died and the sweeper hasn't cleared),
+            // and the daemon then refuses the write. A refused write stored
+            // nothing, so send the session again and retry it once (MUS-79).
+            let resend = || {
+                log::warn!(
+                    "[marshal-shim] {name} was refused as unregistered; sending the session again and retrying once"
+                );
+                resend_session(&host);
+            };
+            retry_once_if_unbound(
+                || dispatch_tool(&host, &name, &args),
+                resend,
+                UNBOUND_RETRY_AFTER,
+            )
+            .await
         })
     }
 
@@ -903,6 +917,134 @@ where
     }
 }
 
+/// Run one tool call.
+async fn dispatch_tool(
+    host: &ToolHost,
+    name: &str,
+    args: &Value,
+) -> Result<ToolOutcome, ToolError> {
+    match name {
+        "set_status" => set_status(host, args).await,
+        "send_message" => send_message(host, args).await,
+        "broadcast" => broadcast(host, args).await,
+        "join_room" => join_room(host, args).await,
+        "leave_room" => leave_room(host, args).await,
+        "ack_messages" => ack_messages(host, args).await,
+        other => Err(ToolError {
+            code: METHOD_NOT_FOUND,
+            message: format!("unknown tool: {other}"),
+            data: None,
+        }),
+    }
+}
+
+/// Send this session's row again, from the shim's current copy.
+fn resend_session(host: &ToolHost) {
+    let snapshot = host.session.lock().unwrap().clone();
+    crate::emit_session_set(&host.client, &snapshot, &host.session);
+}
+
+/// How long a write waits for this session to reach the roster.
+const REGISTER_WAIT: Duration = Duration::from_secs(5);
+const REGISTER_POLL: Duration = Duration::from_millis(100);
+/// If the row hasn't landed by then, the session is sent again.
+const REGISTER_RESEND_AFTER: Duration = Duration::from_secs(1);
+
+/// Wait until this session is on the roster, bound to a connection, or
+/// [`REGISTER_WAIT`] passes. Past the wait the write goes ahead anyway, and
+/// the daemon's own refusal reaches the agent.
+async fn wait_until_registered(host: &ToolHost) {
+    let registered = || {
+        let me = host.session.lock().unwrap().id.clone();
+        crate::registered_on_roster(&host.sessions_cell.get(), &me)
+    };
+    let resend = || {
+        log::warn!(
+            "[marshal-shim] session not on the roster {} s after a write began; sending it again",
+            REGISTER_RESEND_AFTER.as_secs()
+        );
+        resend_session(host);
+    };
+    hold_until(
+        registered,
+        resend,
+        REGISTER_RESEND_AFTER,
+        REGISTER_WAIT,
+        REGISTER_POLL,
+    )
+    .await;
+}
+
+/// Poll `ready` until it's true or `limit` passes. Returns whether it became true.
+async fn wait_for(ready: impl Fn() -> bool, limit: Duration, poll: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Wait for `ready` up to `limit`, calling `resend` once if it isn't ready by
+/// `resend_after`. The registration sent on connect is fire-and-forget, and the
+/// background check only re-sends after missing the row on two 5 s ticks, so a
+/// lost first registration would outlast the whole wait without this.
+async fn hold_until(
+    ready: impl Fn() -> bool,
+    resend: impl FnOnce(),
+    resend_after: Duration,
+    limit: Duration,
+    poll: Duration,
+) -> bool {
+    if wait_for(&ready, resend_after, poll).await {
+        return true;
+    }
+    resend();
+    wait_for(&ready, limit.saturating_sub(resend_after), poll).await
+}
+
+/// How long a retried write waits for its re-sent registration to land. The
+/// roster can't tell this connection's binding from an older one, so there's
+/// nothing to poll.
+const UNBOUND_RETRY_AFTER: Duration = Duration::from_millis(750);
+
+/// Whether the daemon refused a write because this connection has no session
+/// bound to it (`resolve_caller`'s refusal), which re-sending the session fixes.
+/// Matched by the daemon's stable code (MAR-18). A daemon from before the code
+/// sends only the text, so that is accepted until every daemon carries the
+/// code; the code is what keeps a later rewording from stopping the retry.
+fn is_unbound_refusal(message: &str) -> bool {
+    marshal_entities::is_unregistered_refusal(message) || message.contains(LEGACY_UNREGISTERED_TEXT)
+}
+
+/// What a daemon before MAR-18 says instead of the code. Remove once no daemon
+/// runs a build older than MAR-18.
+const LEGACY_UNREGISTERED_TEXT: &str = "has no session on the roster";
+
+/// Run `call`; if the daemon refused it as unbound, `resend` the session, wait
+/// `settle`, and run it once more. Any other outcome is returned as it is.
+async fn retry_once_if_unbound<T, Fut>(
+    call: impl Fn() -> Fut,
+    resend: impl FnOnce(),
+    settle: Duration,
+) -> Result<T, ToolError>
+where
+    Fut: std::future::Future<Output = Result<T, ToolError>>,
+{
+    match call().await {
+        Err(e) if is_unbound_refusal(&e.message) => {
+            resend();
+            tokio::time::sleep(settle).await;
+            call().await
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,5 +1252,189 @@ mod tests {
         assert_eq!(output["mentioned"].as_array().unwrap().len(), 10);
         assert_eq!(output["mentioned_omitted"], 5);
         assert!(output.get("delivered").is_none());
+    }
+    #[tokio::test]
+    async fn an_early_write_waits_for_registration_then_goes_ahead() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        // Registered on the third look.
+        let ready = wait_for(
+            || polls.fetch_add(1, Ordering::SeqCst) >= 2,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(ready);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn an_early_write_waits_only_so_long() {
+        let started = std::time::Instant::now();
+        let ready = wait_for(
+            || false,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(
+            !ready,
+            "it gives up, and the daemon's own error reaches the agent"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_session_still_missing_after_a_while_is_sent_again_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let ms = std::time::Duration::from_millis;
+        // The first SET was lost: the row only lands once the session is resent.
+        let resent = AtomicBool::new(false);
+        let resends = AtomicUsize::new(0);
+        let ready = hold_until(
+            || resent.load(Ordering::SeqCst),
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+                resent.store(true, Ordering::SeqCst);
+            },
+            ms(50),
+            ms(2000),
+            ms(10),
+        )
+        .await;
+        assert!(ready);
+        assert_eq!(resends.load(Ordering::SeqCst), 1);
+
+        // Already registered: nothing is resent.
+        let resends = AtomicUsize::new(0);
+        let ready = hold_until(
+            || true,
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            ms(50),
+            ms(2000),
+            ms(10),
+        )
+        .await;
+        assert!(ready);
+        assert_eq!(resends.load(Ordering::SeqCst), 0);
+
+        // Never registered: resent once, then it gives up at the limit.
+        let resends = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let ready = hold_until(
+            || false,
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            ms(50),
+            ms(200),
+            ms(10),
+        )
+        .await;
+        assert!(!ready);
+        assert_eq!(resends.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_the_unbound_refusal_is_retried() {
+        // The daemon's own refusal, built by the function it uses (MAR-18).
+        assert!(is_unbound_refusal(&marshal_entities::unregistered_refusal(
+            "abc"
+        )));
+        // The code alone is enough, whatever the wording after it.
+        assert!(is_unbound_refusal(&format!(
+            "{} reworded in some later release",
+            marshal_entities::UNREGISTERED_CODE
+        )));
+        // A daemon from before the code.
+        assert!(is_unbound_refusal(
+            "caller (client abc) has no session on the roster — re-SET your Session and retry"
+        ));
+        for other in [
+            "no session matches 'x' (by id, nickname, operator, or id-prefix) — check marshal://roster",
+            "no recipient: `to` is empty; name a session by nickname, id or operator email (see marshal://roster)",
+            "command timed out after 15000 ms (daemon unresponsive?)",
+        ] {
+            assert!(!is_unbound_refusal(other), "{other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unbound_refusal_resends_and_retries_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let refused = |m: &str| ToolError::invalid_params(m.to_string());
+        let unbound =
+            "caller (client c) has no session on the roster — re-SET your Session and retry";
+        let settle = std::time::Duration::from_millis(5);
+
+        // Refused as unbound, then fine after the re-SET: one resend, two calls.
+        let (calls, resends) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = retry_once_if_unbound(
+            || async {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(refused(unbound))
+                } else {
+                    Ok(7)
+                }
+            },
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            settle,
+        )
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!((calls.into_inner(), resends.into_inner()), (2, 1));
+
+        // Refused as unbound twice: retried only once, and the second refusal
+        // is what the agent sees.
+        let (calls, resends) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out: Result<(), _> = retry_once_if_unbound(
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(refused(unbound))
+            },
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            settle,
+        )
+        .await;
+        assert!(is_unbound_refusal(&out.unwrap_err().message));
+        assert_eq!((calls.into_inner(), resends.into_inner()), (2, 1));
+
+        // Any other refusal, or success, isn't retried.
+        for succeeds in [false, true] {
+            let (calls, resends) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let _ = retry_once_if_unbound(
+                || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if succeeds {
+                        Ok(1)
+                    } else {
+                        Err(refused("no session matches 'x'"))
+                    }
+                },
+                || {
+                    resends.fetch_add(1, Ordering::SeqCst);
+                },
+                settle,
+            )
+            .await;
+            assert_eq!((calls.into_inner(), resends.into_inner()), (1, 0));
+        }
+    }
+
+    // MAR-43 pinned the daemon's wording here until the refusal had a code.
+    // MAR-18 gave it one: the daemon builds its refusal with
+    // `unregistered_refusal`, and the retry matches the code that starts it.
+    #[test]
+    fn the_daemons_unbound_refusal_is_the_one_retried() {
+        let refusal = marshal_entities::unregistered_refusal("client-1");
+        assert!(refusal.starts_with(marshal_entities::UNREGISTERED_CODE));
+        assert!(is_unbound_refusal(&refusal));
     }
 }

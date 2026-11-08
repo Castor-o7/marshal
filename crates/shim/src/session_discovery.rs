@@ -222,7 +222,7 @@ pub(crate) struct ParentInfo {
 /// valid JSON, doesn't carry a non-empty `sessionId`, or isn't live (MAR-45, from muster MUS-107,
 /// [`manifest_is_live`]): a manifest left by a process that has exited, whose
 /// pid another process now holds, names a session that's gone.
-fn sid_from_claude_sessions_file(
+pub(crate) fn sid_from_claude_sessions_file(
     liveness: &dyn Fn(u32) -> Liveness,
     home: &Path,
     parent_pid: u32,
