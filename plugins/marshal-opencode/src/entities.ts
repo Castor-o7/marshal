@@ -61,6 +61,8 @@ export interface SessionItem {
   operator?: string;
   host?: HostInfo;
   project?: string;
+  /** This client acks each live push itself, once opencode has taken it. */
+  acksPushes?: boolean;
 }
 
 // ── Write commands ───────────────────────────────────────────────────────

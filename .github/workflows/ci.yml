@@ -74,6 +74,8 @@ jobs:
           test -x "$target_dir/debug/marshal-shim"
           MARSHAL_DAEMON_BIN="$target_dir/debug/marshal-daemon" bun test \
             plugins/marshal-opencode/test/embedding-agent.test.ts \
+            plugins/marshal-opencode/test/push-ack.test.ts \
+            plugins/marshal-opencode/test/push.test.ts \
             plugins/marshal-pi/test/embedding-agent.test.ts \
             plugins/marshal-prime-agent/test/embedding-agent.test.ts
       - name: Test simulation fixture and scoring contracts
