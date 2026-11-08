@@ -2212,8 +2212,8 @@ const PUSH_PLUGIN_NOT_APPLICABLE: &[(&str, &str)] = &[
     ),
 ];
 
-/// OpenCode's, which differ from Pi's only in why the roster can't say none: its plugin doesn't
-/// declare its channel yet, so the roster says none though it wakes by the push (MUS-89).
+/// OpenCode's, which differ from Pi's only in the reason given for why the roster can't say
+/// none (MUS-89, fixed for Marshal by MAR-13).
 /// Every push plugin's entry but `wake-none-not-expected` is taken by index, so
 /// `opencode_skips_what_every_push_plugin_skips` checks the two lists agree.
 const OPENCODE_NOT_APPLICABLE: &[(&str, &str)] = &[
@@ -2225,8 +2225,8 @@ const OPENCODE_NOT_APPLICABLE: &[(&str, &str)] = &[
     PUSH_PLUGIN_NOT_APPLICABLE[6],
     (
         "wake-none-not-expected",
-        "it wakes by the live push; its roster row says none only because the plugin doesn't \
-         declare its channel (MUS-89), and once it does it never will",
+        "it wakes by the live push, and its plugin declares that channel when it registers \
+         (MAR-13), so the roster says channel, never none",
     ),
 ];
 
