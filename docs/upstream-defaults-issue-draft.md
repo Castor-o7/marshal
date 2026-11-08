@@ -5,9 +5,14 @@ changed it. Nothing here has been sent upstream, and no PR goes with it: upstrea
 change, and we send code only for the ones it asks for. The commissioner (cobalt-bream) agrees the
 draft first, as MAR-15's "Done when" requires. The title and body follow the line.
 
-Status of each change on the fork as of 2026-11-08: **merged** means on Castor-o7/marshal `main`.
-**In review** means a PR is open and the change isn't on `main` yet; its line says which head was
-read. Update the commits before filing.
+**File only once every listed change has merged on the fork.** The commissioner's rule (2026-11-08):
+upstream shouldn't weigh a moving target. As of 2026-11-08, items 4 and 6 are still **in review**, and
+their lines cite the head that was read. Before filing, replace those with the merge commits, or drop
+those items.
+
+This supersedes muster's `docs/upstream-issue-defaults.md` (2026-11-05, cobalt-bream's first draft).
+Two of that draft's items are handled differently here. Codex threads re-registering after a restart
+(MUS-76) is offered as a bug fix, below. Inbox quoting is dropped, as upstream #141 already covers it.
 
 ---
 
@@ -20,7 +25,8 @@ once, across restarts. Most of what we changed is additive and we'll offer it as
 changes below are different: each one changes what an unchanged install does. That's your call,
 not ours, so here they are in one place before any code: what changes, why, how to opt out where
 there's a way, and the risk we see for your users. Take any subset, or none. For each one you want,
-we'll send a PR cut from upstream `main`.
+we'll send a PR cut from upstream `main`. It joins the queue we already keep of one small PR at a
+time, after #168, so nothing here lands as a batch.
 
 ## The changes
 
@@ -28,16 +34,15 @@ we'll send a PR cut from upstream `main`.
 |---|---|---|---|
 | 1 | A shim's first write waits until its session is registered, and one refused as unregistered is retried once | merged | none |
 | 2 | A session holding a `/hook/wait` isn't reaped when its WebSocket drops | merged | none |
-| 3 | A restarted session in the same harness and directory takes over its predecessor's nickname | merged | `MARSHAL_IDENTITY=none` |
-| 4 | A restarted session also takes over its predecessor's unread mail | in review | `MARSHAL_IDENTITY=none` |
+| 3 | A restarted session in the same harness and directory takes over its predecessor's nickname | merged | `MARSHAL_IDENTITY=none`; could be opt-in instead |
+| 4 | A restarted session also takes over its predecessor's unread mail | not final (in review) | as for 3 |
 | 5 | Ended sessions are removed from rooms, and broadcasts count only members on the roster | merged | none |
-| 6 | `current_task` follows a checkout while it still holds the branch's default | in review | set your own with `set_status` |
-| 7 | A blank `MARSHAL_DAEMON_ADDRESS` or `MYKO_ADDRESS` counts as unset | merged | none needed |
-| 8 | An unknown `MARSHAL_PERSIST` value stops startup | in review | don't set it |
+| 6 | `current_task` follows a checkout while it still holds the branch's default | not final (in review) | set your own with `set_status` |
 
-Proposed and not built on the fork yet: a refused empty `to`, a per-session send rate limit,
-keeping a session while its hooks fire, a larger hook body, and a resource read that waits for
-registration (listed at the end).
+Two bug fixes and one piece of an additive feature aren't default changes, so they're offered as
+small PRs, listed after the six. Proposed and not built on the fork yet: a refused empty `to`, a
+per-session send rate limit, keeping a session while its hooks fire, a larger hook body, and a
+resource read that waits for registration (listed at the end).
 
 ### 1. Hold a first write until the session is registered, and retry an unregistered refusal once
 
@@ -56,9 +61,13 @@ registration (listed at the end).
   A follow-up, MAR-18 (#53, in review), gives the refusal a stable code, `[unregistered]`, so the
   retry doesn't depend on the message's wording.
 - **Opt-out:** none.
-- **Risk for upstream users:** a write to a daemon that's genuinely unreachable now takes up to 5 s
-  longer to fail. The retry can't duplicate a message, because the daemon stores nothing for a
-  write it refuses as unregistered.
+- **Risk for upstream users:** the wait is per write, not just the first. A session that never
+  registers (misconfigured, or its registration refused) pays it on **every** write: up to 5 s
+  waiting for its row (with one resend at 1 s), then, if the daemon refuses the write as
+  unregistered, 750 ms and a second attempt. That's up to about 6 s per write before the agent sees
+  the error. A daemon that's unreachable fails the same way, up to 5 s later than today. The retry
+  can't duplicate a message, because the daemon stores nothing for a write it refuses as
+  unregistered.
 
 ### 2. Keep a session through a dropped connection while its waiter is held
 
@@ -72,10 +81,12 @@ registration (listed at the end).
   that would wake it. Reaping it lost its nickname and rooms, and the next wake found no session.
 - **Fork:** MAR-6, Castor-o7/marshal#27, merged at `1272636b4bc84ba417268952c8d90fa4fc46a8dc`.
 - **Opt-out:** none.
-- **Risk:** a session whose wait is held but whose agent is gone stays on the roster until the wait
-  ends (the hook listener's horizon), rather than 60 s after its connection drops. Without auth, a
-  connected client can keep refreshing a wake record within that horizon. That's no worse than
-  today, where any client can already write a session row.
+- **Risk:** a session whose wait is held but whose agent is gone stays on the roster while the
+  wait is held, plus up to 2 minutes, rather than 60 s after its connection drops. A wake record
+  lasts at most 2 minutes past its last refresh (`WAKE_WATCHER_TTL_MS` = 120 000 ms; the listener
+  refreshes it every 60 s while the wait holds), and then the usual 60 s grace runs. Without auth, a
+  connected client can keep refreshing a record within those 2 minutes. That's no worse than today,
+  where any client can already write a session row.
 
 ### 3. A restarted session keeps its nickname
 
@@ -92,9 +103,15 @@ registration (listed at the end).
 - **Fork:** MAR-9 (and the quick-restart fix from muster's MUS-92), Castor-o7/marshal#31, merged at
   `83f52026ab93b43c664a49d0377f329cc6fb9905`. Design in `docs/stable-identity.md`.
 - **Opt-out:** `MARSHAL_IDENTITY=none` for a session that should never take over or be taken over.
-- **Risk:** two sessions run deliberately in the same harness and directory share an identity, so
-  only one at a time holds the nickname, and the second gets a fresh one while the first is alive.
-  A send by role to a role two sessions claim is refused rather than guessed.
+  **We'd happily make this opt-in instead**, off by default and turned on with something like
+  `MARSHAL_IDENTITY=auto` (or a role), if you'd rather an unchanged install kept today's behaviour.
+  Together with 4, this is the largest change in meaning here.
+- **Risk:** this changes who receives mail. A new, unrelated session started in the same harness
+  and directory after the old one died silently takes its nickname, so mail addressed to that
+  nickname, or to the old id, now reaches an agent that may not share the old one's context. Two
+  sessions run deliberately in the same harness and directory share an identity, so only one at a
+  time holds the nickname, and the second gets a fresh one while the first is alive. A send by role
+  to a role two sessions claim is refused rather than guessed.
 
 ### 4. A restarted session takes over its predecessor's unread mail
 
@@ -106,9 +123,13 @@ registration (listed at the end).
 - **Why:** without it, a restart silently strands whatever arrived while the old session was dying.
 - **Fork:** MAR-42 (from muster's MUS-47), Castor-o7/marshal#43, in review at head
   `17dd317f114c84f269a122d35b1bfa91ee3dbe04`. It depends on 3.
-- **Opt-out:** `MARSHAL_IDENTITY=none`, since there's no takeover without an identity.
-- **Risk:** at-least-once, not exactly-once. If the old session's waiter showed a message, lost the
-  ack and then died, the successor shows it again.
+- **Opt-out:** `MARSHAL_IDENTITY=none`, since there's no takeover without an identity. As with 3,
+  we'd make this opt-in if you prefer.
+- **Risk:** the largest of the six, with 3. The successor gets the predecessor's unread mail as its
+  own, including mail written for context it doesn't have: a new, unrelated agent started in the
+  same directory inherits instructions meant for the one that died. It's also at-least-once, not
+  exactly-once: if the old session's waiter showed a message, lost the ack and then died, the
+  successor shows it again.
 
 ### 5. Drop ended sessions from rooms, and count only live members in a broadcast
 
@@ -125,8 +146,8 @@ registration (listed at the end).
 - **Fork:** MAR-19 (from muster's MUS-58), Castor-o7/marshal#30, merged at
   `db884b2efcf08a8b2cbb3e2cfbc1b6d8cad014ff`.
 - **Opt-out:** none.
-- **Risk:** this is the one users would notice most. A session that's reaped and comes back without
-  a takeover is no longer in the ad hoc rooms it joined. Until a takeover or a day passes, a reaped
+- **Risk:** the one users would notice first, though 3 and 4 change more. A session that's reaped
+  and comes back without a takeover is no longer in the ad hoc rooms it joined. Until a takeover or a day passes, a reaped
   predecessor can still be listed in an ad hoc room in `marshal://rooms`, though broadcasts skip it.
 
 ### 6. `current_task` follows the branch while it holds the default
@@ -143,33 +164,24 @@ registration (listed at the end).
 - **Risk:** low. Text that happens to equal the old branch's default is taken for the default and
   changed.
 
-### 7. A blank daemon address counts as unset
+## Bug fixes and additive pieces, offered as small PRs
 
-- **Before:** `MARSHAL_DAEMON_ADDRESS=` (set but empty), or the same for `MYKO_ADDRESS`, beat the
-  fallback, and the hook URL then fell to `localhost:6156`.
-- **After:** a blank value is treated as unset, so the address order carries on to the next source.
-- **Why:** a plugin's `.mcp.json` substitution of an unset variable can produce an empty string.
-- **Fork:** part of MAR-56, Castor-o7/marshal#50, merged at
-  `d789b44679396c5e3aa6e6a2601fd45f8e6fb8b9`. The rest of that PR (a test-only guard against
-  reaching a live daemon) is additive.
-- **Opt-out:** none needed.
-- **Risk:** none we can see, unless someone relied on an empty address meaning something.
+These aren't default changes, so they don't need your decision here. They're listed so the issue is
+complete:
 
-### 8. An unknown `MARSHAL_PERSIST` stops startup
-
-- **Before:** `MARSHAL_PERSIST` meant nothing.
-- **After:** with the fork's opt-in file store (MAR-53, additive), `MARSHAL_PERSIST=file` keeps
-  messages, read state and rooms across a restart without Postgres. Any other value stops startup
-  with an error, so a typo can't silently run ephemeral and lose mail. With Postgres configured,
-  the setting is ignored and the startup line says so.
-- **Why:** the store is opt-in, and someone who misspells the opt-in would otherwise believe their
-  mail survives a restart.
-- **Fork:** MAR-53 (from muster's MUS-17), Castor-o7/marshal#55, in review at head
-  `20367301e305b43b94c8770cfa7157c57c627db5`. Only the refusal is a default change. The file store
-  itself is additive, and we'd offer it separately.
-- **Opt-out:** don't set the variable.
-- **Risk:** a user who already sets `MARSHAL_PERSIST` to some other value for their own reasons gets
-  a daemon that won't start until they remove it.
+- **A blank `MARSHAL_DAEMON_ADDRESS` or `MYKO_ADDRESS` counts as unset.** Today an empty string beats
+  the fallback, and the hook URL drops to `localhost:6156`. A plugin's `.mcp.json` substitution of an
+  unset variable can produce one. Fork: part of MAR-56, Castor-o7/marshal#50, merged at
+  `d789b44679396c5e3aa6e6a2601fd45f8e6fb8b9`.
+- **Codex threads re-register after a daemon restart.** Upstream's bridge registers a thread once,
+  on `thread/started`. After a restart without Postgres the roster is empty, and an idle Codex
+  session never sends `thread/started` again, so it stays off the roster until its next hook. The
+  fork's bridge keeps the threads it registered and re-registers any missing from the roster, with a
+  5 s cooldown. Fork: MAR-7 (from muster's MUS-76), Castor-o7/marshal#5, merged at
+  `4ebcf08222f08500fac3c62db37cf5fa41ccf8fd`.
+- **An unknown `MARSHAL_PERSIST` value stops startup.** This only means something alongside the
+  fork's opt-in file store (MAR-53, Castor-o7/marshal#55, in review), so it's part of that additive
+  PR's contract, not a default change here.
 
 ## Proposed, not built on the fork yet
 
@@ -195,4 +207,5 @@ For each change you want, a PR cut from upstream `main` with its tests, and our 
 cell for it if there is one. If you'd rather have any of these behind a setting, off by default,
 say so, and we'll do it that way.
 
-Inbox quoting (also on our list) is left out here, since we don't have a concrete proposal yet.
+Inbox quoting, from our first list, is dropped as covered by #141: upstream's hook path already
+escapes peer mail and frames it as untrusted.
