@@ -325,7 +325,11 @@ fn handle_session_start(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     // who it is. Authoritative (assigned handle, else the computed candidate the
     // assigner would use), matching what peers see in marshal://roster.
     let q = parse_query(query);
-    let nick = nickname_for(&cmd_ctx, &sid).unwrap_or_else(|_| marshal_entities::nickname(&sid));
+    // Named here rather than left to the saga, so a session that takes over a
+    // predecessor's nickname (MUS-3) shows that one in its session block.
+    let nick = crate::nickname_assign::ensure_assigned(&cmd_ctx, &sid)
+        .or_else(|_| nickname_for(&cmd_ctx, &sid))
+        .unwrap_or_else(|_| marshal_entities::nickname(&sid));
     // Assigned handles are wordlist pairs, but the nickname store takes any SET.
     let nick = peer_attr(&nick);
     let mut out = if q.get("harness").map(String::as_str) == Some("codex") {
@@ -341,6 +345,9 @@ fn handle_session_start(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
              identity.</marshal_session>\n"
         )
     };
+    // The session block above already names it, so a late swap's notice
+    // isn't needed this time.
+    let _ = crate::succession::take_notice(&cmd_ctx, &sid);
     let (inbox, ids) = surface_unread(&cmd_ctx, &sid);
     out.push_str(&inbox);
     HookOutcome {
@@ -376,6 +383,12 @@ fn register_hook_session(
         log::warn!("[hook] not registering session id {sid:?}: it contains '#'");
         return None;
     }
+    // The operator forgot it (MAR-46): a waiter still polling under its id
+    // mustn't put the row back while the forget holds.
+    if crate::controls::is_forgotten(sid) {
+        log::debug!("[hook] not registering {sid}: the operator forgot it");
+        return None;
+    }
     let sid = sid.to_string();
     let agent_id = body
         .get("agent_id")
@@ -408,6 +421,9 @@ fn register_hook_session(
         os: q.get("os").cloned().unwrap_or_default(),
         arch: q.get("arch").cloned().unwrap_or_default(),
     });
+    // MUS-3: what the session is matched on after a restart. Both declared.
+    let harness = q.get("harness").filter(|s| !s.is_empty()).cloned();
+    let identity = q.get("identity").filter(|s| !s.is_empty()).cloned();
     let project = if dir == "session" {
         None
     } else {
@@ -446,6 +462,12 @@ fn register_hook_session(
                 if updated.project.is_none() {
                     updated.project = project;
                 }
+                if harness.is_some() {
+                    updated.harness = harness;
+                }
+                // The hook reads MARSHAL_IDENTITY from the session's environment
+                // each time, so it's current.
+                updated.identity = identity;
                 updated
             }
             None => Session {
@@ -469,6 +491,8 @@ fn register_hook_session(
                 project,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness,
+                identity,
             },
         });
     if let Err(e) = result {
@@ -488,8 +512,14 @@ fn handle_prompt_submit(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     };
 
     let (inbox, ids) = surface_unread(&cmd_ctx, &sid);
+    // MUS-3: a session that took a predecessor's nickname over after it
+    // registered is told once, here, since its session block named the old one.
+    let body = match crate::succession::take_notice(&cmd_ctx, &sid) {
+        Some(notice) => notice + &inbox,
+        None => inbox,
+    };
     HookOutcome {
-        body: inbox,
+        body,
         deferred_ack: (!ids.is_empty()).then(|| (SessionId(Arc::from(sid)), ids)),
     }
 }
@@ -656,9 +686,14 @@ fn handle_session_end(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome 
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     };
     if let Err(e) = cmd_ctx.emit_del(&stub) {
         log::warn!("[hook] session-end DEL failed for {sid}: {e:?}");
+    } else {
+        // MUS-3: an ended session can be taken over by its successor.
+        crate::succession::record_removed(sid, chrono::Utc::now().timestamp_millis());
     }
     end_all_waits(&cmd_ctx, sid);
     HookOutcome::text(String::new())

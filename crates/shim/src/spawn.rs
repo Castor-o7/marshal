@@ -186,6 +186,8 @@ const PASSED_ENV: &[&str] = &[
     "MARSHAL_BIN_DIR",
     "MARSHAL_CODEX_BIN",
     "MARSHAL_WAITER_LOCK_WAIT_SECS",
+    // A test's guard against the default daemon (MAR-56), passed only if set.
+    "MARSHAL_TEST",
     // Where the daemon-address file is read from.
     "XDG_CONFIG_HOME",
 ];
@@ -675,6 +677,8 @@ mod tests {
             project: None,
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         })
     }
 

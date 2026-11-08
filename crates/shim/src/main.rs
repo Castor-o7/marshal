@@ -14,6 +14,7 @@ mod channels;
 mod codex_bridge;
 mod codex_hook;
 mod codex_setup;
+mod doctor;
 mod link;
 mod mcp;
 mod roster_read;
@@ -100,6 +101,16 @@ fn main() -> Result<()> {
         Some("--check") if argv.next().is_none() => {
             println!("ok");
             return Ok(());
+        }
+        // Read-only health check: is this binary the one on PATH, does the
+        // daemon accept a connection, and is Claude Code wired to Marshal.
+        // Exits non-zero if any check fails. See `doctor`.
+        Some("doctor") if argv.next().is_none() => {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?
+                .block_on(doctor::run());
         }
         Some("statusline") if argv.next().is_none() => {
             statusline::render();
@@ -235,6 +246,7 @@ Usage: marshal-shim [COMMAND]
 With no command, serves MCP on stdio for the agent session that started it.
 
 Commands:
+  doctor        Check this machine's setup and say how to fix what's wrong (read-only)
   statusline    Render the Claude Code status line prefix from stdin
   claude-hook   Forward a Claude hook, or wait for mail:
                 claude-hook <session-start|prompt-submit|post-tool-use|wait> [base-url]
@@ -428,6 +440,13 @@ async fn serve() -> Result<()> {
         // The drain task below acks each direct push once it is written to
         // Claude, so the daemon can leave it unread until then.
         acks_pushes: (!is_codex).then_some(true),
+        // MUS-3: the same harness and identity the hooks report, since this
+        // SET replaces the row the hooks wrote.
+        harness: Some(if is_codex { "codex" } else { "claude" }.to_string()),
+        identity: std::env::var("MARSHAL_IDENTITY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
     };
     let session = Arc::new(Mutex::new(session));
 
@@ -1085,13 +1104,17 @@ fn roster_miss_step(misses: u32, roster_empty: bool, present: bool) -> (u32, boo
 /// `client_id` doesn't count: the daemon finds a caller by that binding, so every
 /// write would fail "no session on the roster" while the row looks fine. A hook
 /// that read the roster just before our SET landed can leave such a row.
-fn registered_on_roster(sessions: &[Arc<Session>], me: &SessionId) -> bool {
+pub(crate) fn registered_on_roster(sessions: &[Arc<Session>], me: &SessionId) -> bool {
     sessions
         .iter()
         .any(|s| &s.id == me && s.client_id.is_some())
 }
 
-fn emit_session_set(client: &MykoClient, session: &Session, current: &Arc<Mutex<Session>>) {
+pub(crate) fn emit_session_set(
+    client: &MykoClient,
+    session: &Session,
+    current: &Arc<Mutex<Session>>,
+) {
     let current = Arc::clone(current);
     let result = client.send_command::<marshal_entities::RegisterSession, ()>(
         &marshal_entities::RegisterSession {
@@ -1145,9 +1168,18 @@ fn emit_session_del(client: &MykoClient, session: &Session) {
 pub(crate) fn daemon_address() -> String {
     first_daemon_address(
         read_address_from_config_file(),
-        std::env::var(ADDRESS_ENV).ok(),
-        std::env::var(ADDRESS_ENV_LEGACY).ok(),
+        address_env(ADDRESS_ENV),
+        address_env(ADDRESS_ENV_LEGACY),
     )
+}
+
+/// An address variable, unless it's unset or blank: a blank one would win
+/// over the fallback and then reach `localhost` anyway.
+pub(crate) fn address_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn first_daemon_address(
@@ -1157,7 +1189,71 @@ fn first_daemon_address(
 ) -> String {
     file.or(env)
         .or(legacy_env)
-        .unwrap_or_else(|| DEFAULT_DAEMON_ADDRESS.to_string())
+        .unwrap_or_else(fallback_daemon_address)
+}
+
+/// Set by the shim's own tests on every shim they start (MAR-56). Under it the
+/// shim never falls back to `localhost:6155`/`:6156`, which on a developer's
+/// machine is often a live daemon, and only reads or writes config files in
+/// the system temp dir.
+const TEST_ENV: &str = "MARSHAL_TEST";
+
+/// Whether this is a test: the shim's unit tests, or a shim started with
+/// `MARSHAL_TEST` set.
+pub(crate) fn test_mode() -> bool {
+    cfg!(test) || std::env::var_os(TEST_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// The daemon a shim with nothing configured talks to. Under test, refuses.
+pub(crate) fn fallback_daemon_address() -> String {
+    if test_mode() {
+        refuse_default_address();
+    }
+    DEFAULT_DAEMON_ADDRESS.to_string()
+}
+
+/// Stop a test before it reaches the default daemon. A unit test panics, so
+/// only that test fails; a shim process says why and exits 2.
+pub(crate) fn refuse_default_address() -> ! {
+    let msg = format!(
+        "marshal-shim: {TEST_ENV} is set but no daemon address was given; refusing \
+         {DEFAULT_DAEMON_ADDRESS} and its hook port, which may be a live daemon. Set \
+         MARSHAL_DAEMON_ADDRESS (or MARSHAL_BASE_URL for hooks) to the test's own daemon."
+    );
+    if cfg!(test) {
+        panic!("{msg}");
+    }
+    eprintln!("{msg}");
+    std::process::exit(2)
+}
+
+/// Under test, keep only config paths inside the system temp dir, so a test
+/// that forgot to set `HOME` neither reads the operator's `daemon-address` nor
+/// writes `nickname-*` files into the real config dir.
+pub(crate) fn keep_test_paths(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    if !test_mode() {
+        return paths;
+    }
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.canonicalize().unwrap_or(tmp);
+    paths.into_iter().filter(|p| under(p, &tmp)).collect()
+}
+
+/// Whether `path` is inside `dir`, comparing the nearest existing ancestor's
+/// real path so that a symlinked temp dir (macOS `/var` → `/private/var`)
+/// still matches.
+fn under(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    let mut probe = path;
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            let rest = path.strip_prefix(probe).unwrap_or(std::path::Path::new(""));
+            return real.join(rest).starts_with(dir);
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return path.starts_with(dir),
+        }
+    }
 }
 
 pub(crate) fn read_address_from_config_file() -> Option<String> {
@@ -1315,7 +1411,7 @@ pub(crate) fn config_file_candidates(filename: &str) -> Vec<std::path::PathBuf> 
                 .join(filename),
         );
     }
-    out
+    keep_test_paths(out)
 }
 
 #[cfg(windows)]
@@ -1331,7 +1427,7 @@ pub(crate) fn config_file_candidates(filename: &str) -> Vec<std::path::PathBuf> 
     if let Some(pd) = std::env::var_os("PROGRAMDATA") {
         out.push(std::path::PathBuf::from(pd).join("marshal").join(filename));
     }
-    out
+    keep_test_paths(out)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1555,9 +1651,38 @@ mod tests {
             first_daemon_address(None, None, some("ws://old:6155")),
             "ws://old:6155"
         );
+        // Nothing configured would mean localhost, which a test must never
+        // reach (MAR-56): under test it refuses instead.
+        let refused = std::panic::catch_unwind(|| first_daemon_address(None, None, None));
+        let msg = refused.expect_err("a test must not fall back to localhost");
+        let msg = msg
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(msg.contains(DEFAULT_DAEMON_ADDRESS), "{msg}");
+    }
+
+    #[test]
+    fn under_test_only_temp_dir_config_paths_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inside = tmp.path().join("config/marshal/daemon-address");
+        let outside =
+            std::path::PathBuf::from("/definitely-not-tmp/.config/marshal/daemon-address");
         assert_eq!(
-            first_daemon_address(None, None, None),
-            DEFAULT_DAEMON_ADDRESS
+            super::keep_test_paths(vec![outside, inside.clone()]),
+            vec![inside]
+        );
+    }
+
+    #[test]
+    fn a_blank_address_variable_counts_as_unset() {
+        // SAFETY: the variable name is unique to this test.
+        unsafe { std::env::set_var("MARSHAL_TEST_BLANK_ADDRESS", "  ") };
+        assert_eq!(super::address_env("MARSHAL_TEST_BLANK_ADDRESS"), None);
+        unsafe { std::env::set_var("MARSHAL_TEST_BLANK_ADDRESS", " ws://x:1 ") };
+        assert_eq!(
+            super::address_env("MARSHAL_TEST_BLANK_ADDRESS").as_deref(),
+            Some("ws://x:1")
         );
     }
     use super::{
@@ -1705,6 +1830,8 @@ mod tests {
                 project: None,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness: None,
+                identity: None,
             })
         };
         assert!(registered_on_roster(&[row("me", Some("c"))], &me));

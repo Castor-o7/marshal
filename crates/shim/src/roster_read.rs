@@ -24,14 +24,11 @@ use marshal_entities::{
     GetAllSessionNicknames, GetAllSessions, GetAllWakeWatchers, Session, SessionNickname,
     WakeWatcher, wake_state,
 };
-use myko::client::MykoClient;
+use myko::client::{ConnectionStatus, MykoClient, QueryMapWatch};
 use serde_json::{Value, json};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
-/// How long to let the wake watchers arrive once the roster has. There may be
-/// none, so this can't wait for them to appear.
-const WATCHERS_SETTLE: Duration = Duration::from_secs(1);
 
 fn view(
     sessions: &[Arc<Session>],
@@ -79,6 +76,9 @@ fn view(
                     "git_branch": s.git_branch,
                     "pid": s.pid,
                     "channels_enabled": s.channels_enabled,
+                    "harness": s.harness,
+                    // MUS-3: a claimed role, which reaches this session by name.
+                    "role": s.identity.as_deref().filter(|i| *i != "none"),
                 },
             })
         })
@@ -89,35 +89,45 @@ fn view(
 pub async fn run() -> Result<()> {
     marshal_entities::link();
     let client = MykoClient::new();
-    let sessions = client.watch_query::<GetAllSessions>(GetAllSessions {});
-    let nicknames = client.watch_query::<GetAllSessionNicknames>(GetAllSessionNicknames {});
-    let watchers = client.watch_query::<GetAllWakeWatchers>(GetAllWakeWatchers {});
-    client.set_address(Some(crate::daemon_address()));
+    // `_state` watches carry the daemon's first answer as its own signal, so an
+    // empty roster is a fact once it's arrived, not a wait (MAR-57).
+    let sessions = client.watch_query_map_state::<GetAllSessions>(GetAllSessions {});
+    let nicknames =
+        client.watch_query_map_state::<GetAllSessionNicknames>(GetAllSessionNicknames {});
+    let watchers = client.watch_query_map_state::<GetAllWakeWatchers>(GetAllWakeWatchers {});
+    let address = crate::daemon_address();
+    client.set_address(Some(address.clone()));
 
-    // An empty result can't be told from one that hasn't arrived, so never report
-    // an empty roster as a fact.
     let started = Instant::now();
-    while sessions.get().is_empty() {
+    while !(sessions.ready().get() && nicknames.ready().get() && watchers.ready().get()) {
         if started.elapsed() > CONNECT_TIMEOUT {
-            bail!(
-                "no roster within {CONNECT_TIMEOUT:?}: the daemon is unreachable or has no sessions"
-            );
+            if matches!(
+                client.connection_status_sync(),
+                ConnectionStatus::Connected(_)
+            ) {
+                bail!("connected to {address}, but it sent no roster within {CONNECT_TIMEOUT:?}");
+            }
+            bail!("couldn't reach the daemon at {address} within {CONNECT_TIMEOUT:?}");
         }
         tokio::time::sleep(POLL).await;
     }
-    let settling = Instant::now();
-    while watchers.get().is_empty() && settling.elapsed() < WATCHERS_SETTLE {
-        tokio::time::sleep(POLL).await;
-    }
 
+    let mut sessions = values(&sessions);
+    // A map has no order of its own: list sessions oldest connection first.
+    sessions
+        .sort_by(|a, b| (a.connected_at, a.id.0.as_ref()).cmp(&(b.connected_at, b.id.0.as_ref())));
     let output = view(
-        &sessions.get(),
-        &nicknames.get(),
-        &watchers.get(),
+        &sessions,
+        &values(&nicknames),
+        &values(&watchers),
         Utc::now().timestamp_millis(),
     );
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+fn values<T: hyphae::CellValue>(watch: &QueryMapWatch<T>) -> Vec<Arc<T>> {
+    watch.map().snapshot().into_iter().map(|(_, v)| v).collect()
 }
 
 #[cfg(test)]
@@ -150,6 +160,8 @@ mod tests {
             channels_enabled: None,
             acks_pushes: None,
             agent_id: None,
+            harness: None,
+            identity: None,
         })
     }
 

@@ -178,6 +178,8 @@ impl Cell {
                 project: None,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness: None,
+                identity: None,
             })
             .expect("register sender");
     }
@@ -263,6 +265,8 @@ impl ClaudeShim {
                 "plugin:marshal-shim@marshal",
             ])
             .env("SHIM", SHIM)
+            // MAR-56: the shim refuses the default daemon if it ever falls back.
+            .env("MARSHAL_TEST", "1")
             .env("HOME", home.path())
             // The daemon-address file outranks the env var, and
             // `XDG_CONFIG_HOME` is searched first: point it at the temp home

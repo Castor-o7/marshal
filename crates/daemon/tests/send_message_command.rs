@@ -67,6 +67,8 @@ fn session(id: &str, client_id: Option<&str>) -> Session {
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -634,6 +636,14 @@ fn caller_without_session_errors() {
         "error should name the unbound client id, got: {}",
         err.message,
     );
+    // MAR-18: the shim retries this refusal by its code, so the daemon's
+    // refusal must start with it.
+    assert!(
+        err.message.starts_with(marshal_entities::UNREGISTERED_CODE),
+        "{}",
+        err.message
+    );
+    assert!(marshal_entities::is_unregistered_refusal(&err.message));
     assert_eq!(message_count(&ctx), 0);
 }
 
@@ -660,5 +670,51 @@ fn unidentified_caller_errors() {
         "error should explain the missing identity, got: {}",
         err.message,
     );
+    assert_eq!(message_count(&ctx), 0);
+}
+
+fn claiming(id: &str, role: &str) -> Session {
+    let mut s = session(id, Some(&format!("c-{id}")));
+    s.identity = Some(role.into());
+    s
+}
+
+fn send_to(ctx: &MykoServerContext, to: &str) -> Result<SendMessageResult, String> {
+    SendMessage {
+        response_required: false,
+        to_session_id: SessionId(Arc::from(to)),
+        body: "for the role".into(),
+        as_session: None,
+        idempotency_key: None,
+    }
+    .execute(cmd_ctx(ctx, Some("c-sender")))
+    .map_err(|e| e.message)
+}
+
+#[test]
+fn a_role_claimed_by_one_session_reaches_it() {
+    // MAR-9 (from MUS-3): the watchman can be reached by role
+    // (`MARSHAL_IDENTITY=watchman`).
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &claiming("the-watchman", "watchman"));
+    send_to(&ctx, "watchman").expect("a send to a claimed role");
+    let m = only_message(&ctx);
+    assert_eq!(
+        m.to_session_id.as_ref().map(|s| s.0.as_ref()),
+        Some("the-watchman")
+    );
+}
+
+#[test]
+fn a_role_claimed_by_two_sessions_is_refused() {
+    // A role is a claim, not attested: with two claimants, neither is
+    // guessed at, and the sender is told to name one.
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &claiming("first", "watchman"));
+    set_session(&ctx, &claiming("second", "watchman"));
+    let err = send_to(&ctx, "watchman").expect_err("an ambiguous role is refused");
+    assert!(err.contains("claimed by 2 sessions"), "{err}");
     assert_eq!(message_count(&ctx), 0);
 }

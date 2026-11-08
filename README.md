@@ -34,7 +34,7 @@ marshal-daemon &
 # or under your favorite supervisor (systemd user unit, launchd, tmux pane, ...)
 ```
 
-The daemon binds `0.0.0.0:6155` by default (so peers on other hosts can reach it without remembering to flip a flag) and writes its event log to `~/.local/state/marshal/events.jsonl`. Restrict to localhost only with `MARSHAL_BIND=127.0.0.1:6155`.
+The daemon binds `127.0.0.1:6155` by default, so only this machine can reach it, and writes its event log to `~/.local/state/marshal/events.jsonl`. To let sessions on other hosts reach it, set `MARSHAL_BIND` to an address they can reach, such as `MARSHAL_BIND=0.0.0.0:6155`. Marshal has no authentication, so expose it only on a network you trust.
 
 ### 3. Add the plugin in Claude Code
 
@@ -412,7 +412,9 @@ Code, you can instead pin it in a per-project `.mcp.json`:
 }
 ```
 
-The daemon's bind address is set with `MARSHAL_BIND` (default `0.0.0.0:6155` — set `MARSHAL_BIND=127.0.0.1:6155` to restrict to localhost).
+The daemon's bind address is set with `MARSHAL_BIND` (default `127.0.0.1:6155`, localhost only; set `MARSHAL_BIND=0.0.0.0:6155` to accept other hosts).
+
+With `MARSHAL_TEST` set, a shim never falls back to `localhost:6155` or its hook port: with no address given, it exits with an error instead. It also ignores config files outside the system temp dir. The shim's own tests set it on every shim they start (`crates/shim/tests/support`), so a test can't reach the daemon you're running. Set it yourself for a hand-run check against a throwaway daemon.
 
 ## Workspace layout
 

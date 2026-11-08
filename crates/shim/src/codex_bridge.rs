@@ -1493,10 +1493,11 @@ fn parse_args(args: &[String]) -> Result<BridgeArgs> {
     }
 
     let daemon = daemon
+        .filter(|d| !d.trim().is_empty())
         .or_else(crate::read_address_from_config_file)
-        .or_else(|| std::env::var(crate::ADDRESS_ENV).ok())
-        .or_else(|| std::env::var(crate::ADDRESS_ENV_LEGACY).ok())
-        .unwrap_or_else(|| crate::DEFAULT_DAEMON_ADDRESS.to_string());
+        .or_else(|| crate::address_env(crate::ADDRESS_ENV))
+        .or_else(|| crate::address_env(crate::ADDRESS_ENV_LEGACY))
+        .unwrap_or_else(crate::fallback_daemon_address);
     if socket.is_some() && endpoint.is_some() {
         anyhow::bail!("codex-bridge: --socket and --endpoint are mutually exclusive");
     }
@@ -2882,6 +2883,8 @@ mod tests {
             project: Some("repo".into()),
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         })
     }
 
