@@ -24,6 +24,7 @@ import { Type } from "typebox";
 
 import { MarshalDaemon } from "./daemon.ts";
 import { pullForTurn } from "./inbox-pull.ts";
+import { deliverLivePush } from "./live-push.ts";
 import { resolveIdentity, type Identity } from "./identity.ts";
 import type { NotifyChannelMeta, SessionItem } from "./entities.ts";
 import { shouldRegisterPrimeAgentSession } from "./runtime.ts";
@@ -98,40 +99,20 @@ async function init(pi: ExtensionAPI) {
       sessionCtx.ui.notify(`marshal: new message from ${who}`, "info");
     }
 
-    const text = meta.body ? `new message from ${who} [response_required=${meta.response_required ?? false}]: ${meta.body}` : undefined;
-    void (async () => {
-      try {
-        if (text) {
-          // A successful daemon live push has already marked the durable
-          // message read. Do not drain here: that can consume a different
-          // unread message before it has been injected.
-          const content = meta.body_truncated
-            ? `${text}\n[preview truncated; read the full message with marshal_messages${meta.message_id ? ` (message ${meta.message_id})` : ""}]`
-            : text;
-          await pi.sendMessage(
-            { customType: "marshal-channel", content, display: true, details: meta },
-            { deliverAs: "steer", triggerTurn: true },
-          );
-        } else {
-          // Compatibility fallback for older daemons that omit body metadata.
-          // The pull is acked only once it has been injected.
-          const pull = await daemon!.pullInbox(sid);
-          if (!pull) return;
-          try {
-            await pi.sendMessage(
-              { customType: "marshal-channel", content: pull.text, display: true, details: meta },
-              { deliverAs: "steer", triggerTurn: true },
-            );
-          } catch (e) {
-            pull.release();
-            throw e;
-          }
-          await pull.commit().catch(() => log("inbox ack failed"));
-        }
-      } catch (e) {
-        log(`live push injection failed: ${String(e)}`);
-      }
-    })();
+    // The session registers with acksPushes, so the daemon leaves the pushed
+    // message unread until deliverLivePush acks it, once pi.sendMessage has
+    // resolved. If it throws, the message stays unread for the next turn's
+    // pull (MAR-10).
+    const inject = (content: string) =>
+      pi.sendMessage(
+        { customType: "marshal-channel", content, display: true, details: meta },
+        { deliverAs: "steer", triggerTurn: true },
+      );
+    deliverLivePush(meta, who, {
+      inject,
+      hold: (messageId) => (daemon ? daemon.holdPush(sid, messageId) : null),
+      pull: () => (daemon ? daemon.pullInbox(sid) : Promise.resolve(null)),
+    }).catch((e) => log(`live push injection failed: ${String(e)}`));
   }
 
   // ── Status helpers ────────────────────────────────────────────────────
