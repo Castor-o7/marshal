@@ -110,7 +110,7 @@ export class MarshalDaemon {
    *  same session would each read the unread set before either acks, then
    *  render + inject the same messages twice. Chain drains so read→ack is
    *  atomic per session. */
-  private readonly draining = new Map<string, Promise<string | null>>();
+  private readonly draining = new Map<string, Promise<unknown>>();
   /** Per session, the pushed messages being prompted, and until when each is
    *  held out of drains. */
   private readonly pushing = new Map<string, Map<string, number>>();
@@ -121,6 +121,9 @@ export class MarshalDaemon {
   private connected = false;
   private rosterChangedHandler: (() => void) | null = null;
   private connectionChangedHandler: ((connected: boolean) => void) | null = null;
+  /** Whether a connection has been up before, so the next one is a reconnect. */
+  private everConnected = false;
+  private reconnectHandler: ((sessionIds: string[]) => void) | null = null;
 
   constructor(cfg: DaemonConfig) {
     this.cfg = cfg;
@@ -140,6 +143,13 @@ export class MarshalDaemon {
         this.connectionChangedHandler?.(true);
         this.log(`connected to ${this.cfg.address}; re-publishing ${this.sessions.size} session(s)`);
         for (const item of this.sessions.values()) this.emitSet(item);
+        // MAR-48 (from muster's MUS-90): mail sent while the connection was
+        // down couldn't be pushed, since the daemon still had each session
+        // bound to the old, dead client, and nothing offers it again. So a
+        // reconnect asks each session to show what waited. The SETs above go
+        // first on this socket, so anything sent after them is pushed live.
+        if (this.everConnected) this.reconnectHandler?.([...this.sessions.keys()]);
+        this.everConnected = true;
       } else if (status === ConnectionStatus.Disconnected) {
         this.connected = false;
         this.connectionChangedHandler?.(false);
@@ -184,6 +194,12 @@ export class MarshalDaemon {
     });
 
     this.client.setAddress(withMykoPath(this.cfg.address));
+  }
+
+  /** Called on each reconnect, after the sessions are registered again, with
+   *  their ids, so each can show the mail that waited out the drop (MAR-48). */
+  onReconnect(handler: (sessionIds: string[]) => void): void {
+    this.reconnectHandler = handler;
   }
 
   onNotify(handler: NotifyHandler): void {
@@ -367,18 +383,78 @@ export class MarshalDaemon {
   }
 
   /** Hold a pushed message out of this session's drains while it's being
-   *  prompted. Returns the release. */
-  holdPush(sessionId: string, messageId: string): () => void {
-    let held = this.pushing.get(sessionId);
-    if (!held) {
-      held = new Map();
-      this.pushing.set(sessionId, held);
-    }
+   *  prompted. Returns the release, or null when a pull already holds it:
+   *  that pull shows it (MAR-48). */
+  holdPush(sessionId: string, messageId: string): (() => void) | null {
+    if (this.isHeld(sessionId, messageId)) return null;
+    const held = this.heldFor(sessionId);
     const until = Date.now() + this.leaseMs;
     held.set(messageId, until);
     return () => {
       if (held.get(messageId) === until) held.delete(messageId);
     };
+  }
+
+  /**
+   * Read this session's unread mail without acking it, for mail that waited
+   * out a reconnect (MAR-48). The messages are held out of drains and pushes
+   * until `commit`, once opencode has taken the text, acks them, or `release`
+   * gives them back for the next turn. Null when there's nothing unread.
+   */
+  pullInbox(sessionId: string): Promise<{ text: string; commit(): Promise<void>; release(): void } | null> {
+    if (!this.connected) return Promise.resolve(null);
+    const prev = this.draining.get(sessionId) ?? Promise.resolve(null);
+    const next = prev.catch(() => null).then(() => this.pullInboxInner(sessionId));
+    this.draining.set(sessionId, next);
+    void next.finally(() => {
+      if (this.draining.get(sessionId) === next) this.draining.delete(sessionId);
+    });
+    return next;
+  }
+
+  private async pullInboxInner(sessionId: string): Promise<{ text: string; commit(): Promise<void>; release(): void } | null> {
+    let result: ReadMessagesResult;
+    try {
+      result = await this.sendForInbox(
+        readMessages({ asSession: sessionId, toSession: sessionId, inbox: false, sent: false, unread: true, limit: INBOX_PULL_LIMIT }),
+      );
+    } catch (e) {
+      this.log(`inbox pull failed: ${String(e)}`);
+      return null;
+    }
+    const messages = (result.messages ?? []).filter((m) => !this.isHeld(sessionId, m.messageId));
+    if (messages.length === 0) return null;
+    const text = this.renderInbox(messages);
+    const held = this.heldFor(sessionId);
+    const until = Date.now() + this.leaseMs;
+    const ids = messages.map((m) => m.messageId);
+    for (const id of ids) held.set(id, until);
+    const settle = (settled: string[]) => {
+      for (const id of settled) if (held.get(id) === until) held.delete(id);
+    };
+    return {
+      text,
+      commit: async () => {
+        // Past the lease, a later drain may have shown and acked a message.
+        const mine = ids.filter((id) => held.get(id) === until && until > Date.now());
+        if (!mine.length) return;
+        try {
+          await this.sendForInbox(ackMessages(sessionId, mine));
+        } finally {
+          settle(mine);
+        }
+      },
+      release: () => settle(ids),
+    };
+  }
+
+  private heldFor(sessionId: string): Map<string, number> {
+    let held = this.pushing.get(sessionId);
+    if (!held) {
+      held = new Map();
+      this.pushing.set(sessionId, held);
+    }
+    return held;
   }
 
   private isHeld(sessionId: string, messageId: string): boolean {
