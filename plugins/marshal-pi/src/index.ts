@@ -109,10 +109,8 @@ async function init(pi: ExtensionAPI) {
           { customType: "marshal-channel", content, display: true },
           { deliverAs: "steer", triggerTurn: true },
         ),
-      drainInbox: () => (daemon ? daemon.drainInbox(sid) : Promise.resolve(null)),
-      ack: async (messageId) => {
-        if (daemon) await daemon.ackMessages(sid, [messageId]);
-      },
+      hold: (messageId) => (daemon ? daemon.holdPush(sid, messageId) : null),
+      pull: () => (daemon ? daemon.pullInbox(sid) : Promise.resolve(null)),
     }).catch((e) => log(`live push injection failed: ${String(e)}`));
   }
 
