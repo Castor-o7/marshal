@@ -64,7 +64,7 @@ per-machine pairing, a session frame filter and a written threat model). It was 
 myko-server, which is the part I don't want to bring here. So I'd port the behaviour and its tests
 onto myko#129 instead, in small PRs: first tests and docs, then the opt-in pieces one at a time.
 
-I've read myko#129 against these four cases and left notes on the PR, and I'm glad to help test it.
+I've read myko#129 against these four cases, and I'm glad to help test it.
 
 ## Questions for you
 
