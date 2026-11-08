@@ -210,7 +210,7 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   branch unless the session set its own, with a test.
 - [ ] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: no test binds a port
   picked by asking the OS and releasing it, and the e2e suites pass run in parallel.
-  Partly done (#PR), by where the listener lives. Every in-process hook listener is bound to port 0
+  Partly done (#28), by where the listener lives. Every in-process hook listener is bound to port 0
   by the test and handed over (`http_listener::serve_until`), so there's no window. myko-server
   6.11.5 binds its own port and takes no listener, so a test's myko server, and a daemon subprocess,
   still get a picked port; they now report a lost bind and are started again on a new one, instead
