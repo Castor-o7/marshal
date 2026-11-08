@@ -138,8 +138,24 @@ impl Daemon {
             myko: free_port(),
             child: None,
         };
-        d.spawn();
-        d
+        // Its ports are picked by binding port 0 and closing it, so another
+        // process can take one before the daemon binds it. The daemon then
+        // exits saying so, and it's started again on new ports (MAR-21).
+        let mut lost = Vec::new();
+        for _ in 0..5 {
+            match d.try_spawn() {
+                Ok(()) => return d,
+                Err(log) if log.contains("in use") => {
+                    lost.push(format!("{} {} {}", d.bind, d.hook, d.myko));
+                    (d.bind, d.hook, d.myko) = (free_port(), free_port(), free_port());
+                }
+                Err(log) => panic!("marshal-daemon didn't come up; log:\n{log}"),
+            }
+        }
+        panic!(
+            "marshal-daemon lost its ports 5 times: {lost:?}; log:\n{}",
+            d.log()
+        );
     }
 
     fn config_dir(&self) -> PathBuf {
@@ -199,7 +215,17 @@ impl Daemon {
         cmd
     }
 
+    /// Start it again on the same ports, as a restart does.
     fn spawn(&mut self) {
+        if let Err(log) = self.try_spawn() {
+            panic!("marshal-daemon didn't come up; log:\n{log}");
+        }
+    }
+
+    /// Start it, and wait for it to listen. `Err` with this start's log if it
+    /// exited or never listened.
+    fn try_spawn(&mut self) -> Result<(), String> {
+        let before = self.log().len();
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -213,13 +239,30 @@ impl Daemon {
             .stderr(log)
             .spawn()
             .expect("spawn marshal-daemon");
-        self.child = Some(child);
+        let mut child = child;
         let up = |port| TcpStream::connect(("127.0.0.1", port)).is_ok();
-        assert!(
-            wait_until(Duration::from_secs(20), || up(self.hook) && up(self.bind)),
-            "marshal-daemon didn't come up; log:\n{}",
+        let exited = |c: &mut Child| c.try_wait().ok().flatten().is_some();
+        let listening = wait_until(Duration::from_secs(20), || {
+            exited(&mut child) || (up(self.hook) && up(self.bind))
+        });
+        // A port another process holds answers too. A daemon that lost its
+        // WebSocket bind exits at once; one that lost its hook bind logs it
+        // and keeps running, so its log is read as well.
+        if listening && !exited(&mut child) {
+            thread::sleep(Duration::from_millis(300));
+        }
+        let hook_lost = || {
             self.log()
-        );
+                .get(before..)
+                .is_some_and(|log| log.contains("[hook] listener exited"))
+        };
+        if exited(&mut child) || !listening || hook_lost() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(self.log().get(before..).unwrap_or_default().to_string());
+        }
+        self.child = Some(child);
+        Ok(())
     }
 
     /// Stop it the way systemd does (SIGTERM, which ends held waits first), and
@@ -2212,8 +2255,8 @@ const PUSH_PLUGIN_NOT_APPLICABLE: &[(&str, &str)] = &[
     ),
 ];
 
-/// OpenCode's, which differ from Pi's only in why the roster can't say none: its plugin doesn't
-/// declare its channel yet, so the roster says none though it wakes by the push (MUS-89).
+/// OpenCode's, which differ from Pi's only in the reason given for why the roster can't say
+/// none (MUS-89, fixed for Marshal by MAR-13).
 /// Every push plugin's entry but `wake-none-not-expected` is taken by index, so
 /// `opencode_skips_what_every_push_plugin_skips` checks the two lists agree.
 const OPENCODE_NOT_APPLICABLE: &[(&str, &str)] = &[
@@ -2225,8 +2268,8 @@ const OPENCODE_NOT_APPLICABLE: &[(&str, &str)] = &[
     PUSH_PLUGIN_NOT_APPLICABLE[6],
     (
         "wake-none-not-expected",
-        "it wakes by the live push; its roster row says none only because the plugin doesn't \
-         declare its channel (MUS-89), and once it does it never will",
+        "it wakes by the live push, and its plugin declares that channel when it registers \
+         (MAR-13), so the roster says channel, never none",
     ),
 ];
 
