@@ -447,19 +447,41 @@ async fn send_message(host: &ToolHost, args: &Value) -> Result<ToolOutcome, Tool
     let to_session_id = resolve_visible_nickname(&sessions, &nicknames, &to)
         .map_err(ToolError::invalid_params)?
         .unwrap_or_else(|| SessionId(std::sync::Arc::from(to.as_str())));
+    // Every send carries a key, so a timeout can tell the caller how to retry.
+    let key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     let cmd = SendMessage {
         response_required: response_required(args)?,
         to_session_id,
         body,
         as_session: caller(host, args)?,
+        idempotency_key: Some(key.clone()),
     };
     let cell = host
         .client
         .send_command::<SendMessage, SendMessageResult>(&cmd);
     let result = await_command(cell, REQUEST_TIMEOUT)
         .await
-        .map_err(ToolError::invalid_params)?;
+        .map_err(|e| ToolError::invalid_params(retry_hint(e, &key)))?;
     Ok(ToolOutcome::Json(send_message_output(&result)))
+}
+
+/// `await_command`'s error when the response handler went away before a reply.
+const RESPONSE_DROPPED: &str = "command response handler dropped";
+
+/// A send whose reply never came (timed out, or its handler dropped) may still
+/// have arrived, so say how to retry without a duplicate. A refusal is final,
+/// and adds nothing.
+fn retry_hint(error: String, key: &str) -> String {
+    if error.starts_with("command timed out") || error == RESPONSE_DROPPED {
+        format!(
+            "{error}. The message may still have been delivered. To retry safely, send the same `to`, `body` and `response_required` with idempotency_key `{key}`."
+        )
+    } else {
+        error
+    }
 }
 
 fn send_message_output(result: &SendMessageResult) -> Value {
@@ -653,6 +675,7 @@ pub fn tools_def(is_codex: bool) -> Vec<ToolDef> {
                 json!({
                     "to":   { "type": "string", "description": "Nickname, session id/prefix, or operator email from the roster." },
                     "body": { "type": "string", "description": "Message body." },
+                    "idempotency_key": { "type": "string", "description": "Only to retry a send whose reply never came: the key its error gave, with the same `to`, `body` and `response_required`." },
                     "response_required": { "type": "boolean", "default": false, "description": "Whether this message needs an answer. Normally false for answers, results, and release notices." }
                 }),
                 &["to", "body"],
@@ -868,7 +891,7 @@ where
     cell.own(guard);
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("command response handler dropped".to_string()),
+        Ok(Err(_)) => Err(RESPONSE_DROPPED.to_string()),
         Err(_) => Err(format!(
             "command timed out after {} ms (daemon unresponsive?)",
             timeout.as_millis()
@@ -945,6 +968,18 @@ mod tests {
             channels_enabled: None,
             acks_pushes: None,
         })
+    }
+
+    #[test]
+    fn a_timeout_says_how_to_retry_and_a_refusal_does_not() {
+        let timeout = retry_hint("command timed out after 10000 ms".to_string(), "k1");
+        assert!(timeout.contains("idempotency_key `k1`"), "{timeout}");
+        let dropped = retry_hint(RESPONSE_DROPPED.to_string(), "k2");
+        assert!(dropped.contains("idempotency_key `k2`"), "{dropped}");
+        assert_eq!(
+            retry_hint("no such session".to_string(), "k1"),
+            "no such session"
+        );
     }
 
     #[test]

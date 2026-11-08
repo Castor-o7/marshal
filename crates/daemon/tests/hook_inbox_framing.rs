@@ -64,6 +64,7 @@ fn send(ctx: &MykoServerContext, body: &str) {
         to_session_id: SessionId(Arc::from("recipient")),
         body: body.into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx)
     .expect("send to recipient");

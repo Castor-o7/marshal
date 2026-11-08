@@ -199,6 +199,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "HOOK-E2E-PROBE-marker".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists to eagerly registered recipient");
@@ -265,6 +266,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "HOOK-E2E-QUEUED-marker".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists unread message before session end");
@@ -326,6 +328,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "HOOK-E2E-NEW-marker".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists new message after resume");
@@ -362,6 +365,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: long_body.clone(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists long message");
