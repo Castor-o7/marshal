@@ -84,6 +84,9 @@ pub async fn run_sweeper(ctx: MykoServerContext) {
     loop {
         interval.tick().await;
         sweep_once(&ctx, &mut disconnected_since);
+        // Before the rooms, so a room its last live member just left goes
+        // this tick (MAR-19).
+        sweep_memberships(&ctx);
         sweep_rooms(&ctx);
         sweep_wake_watchers(&ctx);
         // Prune old messages on the first tick (boot cleanup) and every
@@ -93,6 +96,43 @@ pub async fn run_sweeper(ctx: MykoServerContext) {
             sweep_messages(&ctx);
         }
         tick = tick.wrapping_add(1);
+    }
+}
+
+/// A session that has left the roster leaves its rooms too (MAR-19, from
+/// MUS-58). `del_by_id` doesn't cascade, so without this a reaped or ended
+/// session stayed a member of every room it was in, `everyone` included, and
+/// broadcasts counted it. A session that comes back is put back in its
+/// auto-rooms by the `auto_rooms` saga on its next Session SET; an adhoc room
+/// it had joined it must join again.
+fn sweep_memberships(ctx: &MykoServerContext) {
+    let (Some(members), Some(sessions)) = (
+        ctx.registry.get(RoomMember::ENTITY_NAME_STATIC),
+        ctx.registry.get(Session::ENTITY_NAME_STATIC),
+    ) else {
+        return;
+    };
+    let live: HashSet<Arc<str>> = sessions
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    for (id, item) in members.entries().materialize().get() {
+        let Some(member) = downcast_item::<RoomMember>(&item) else {
+            continue;
+        };
+        if !live.contains(&member.session_id.0) {
+            match ctx.del_by_id(RoomMember::ENTITY_NAME_STATIC, &id) {
+                Ok(()) => log::info!(
+                    "[cleanup] {} left {}: no longer on the roster",
+                    member.session_id.0,
+                    member.room_id.0
+                ),
+                Err(e) => log::warn!("[cleanup] removing room member {id} failed: {e}"),
+            }
+        }
     }
 }
 
@@ -552,6 +592,71 @@ mod tests {
         assert!(
             !ids.contains("project:stale"),
             "empty auto-room must be reaped"
+        );
+    }
+
+    fn member_ids(ctx: &MykoServerContext) -> HashSet<String> {
+        ctx.registry
+            .get(RoomMember::ENTITY_NAME_STATIC)
+            .map(|s| {
+                s.entries()
+                    .materialize()
+                    .get()
+                    .into_iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// MAR-19: a session that ends leaves every room it was in, `everyone`
+    /// included, and an auto-room it was the last member of goes on the same
+    /// tick.
+    #[test]
+    fn a_session_off_the_roster_leaves_its_rooms() {
+        let ctx = setup();
+        set_hook_session(&ctx, "live", Utc::now().timestamp_millis());
+        set_hook_session(&ctx, "gone", Utc::now().timestamp_millis());
+        set_room(
+            &ctx,
+            "everyone",
+            RoomKind::Auto {
+                source: AutoSource::Everyone,
+            },
+        );
+        set_room(
+            &ctx,
+            "project:gone-only",
+            RoomKind::Auto {
+                source: AutoSource::Project {
+                    basename: "gone-only".into(),
+                },
+            },
+        );
+        set_room(&ctx, "design-sync", RoomKind::Adhoc);
+        set_member(&ctx, "everyone", "live");
+        set_member(&ctx, "everyone", "gone");
+        set_member(&ctx, "project:gone-only", "gone");
+        set_member(&ctx, "design-sync", "gone");
+
+        // The session ends; its memberships stay until the sweeper runs.
+        ctx.del_by_id(Session::ENTITY_NAME_STATIC, "gone")
+            .expect("DEL session");
+        sweep_memberships(&ctx);
+        sweep_rooms(&ctx);
+
+        let members = member_ids(&ctx);
+        assert_eq!(
+            members,
+            HashSet::from([RoomMember::make_id("everyone", "live")]),
+            "everyone lists only live sessions, and the ended one is in no room"
+        );
+        let rooms = room_ids(&ctx);
+        assert!(rooms.contains("everyone"));
+        assert!(rooms.contains("design-sync"), "an empty adhoc room stays");
+        assert!(
+            !rooms.contains("project:gone-only"),
+            "an emptied auto-room goes"
         );
     }
 

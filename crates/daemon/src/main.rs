@@ -127,9 +127,8 @@ async fn main() -> Result<()> {
         session_filter.bind(Arc::new(handle));
     }
 
-    // Spawn the periodic sweeper. WS-shim sessions reap on client loss +
-    // grace; pull/hook sessions reap on the activity backstop. See cleanup.
-    tokio::spawn(daemon::cleanup::run_sweeper(server.ctx()));
+    // The periodic sweeper starts below, once myko has caught up with Postgres
+    // (MAR-19).
 
     // Spawn marshal's own plain-HTTP listener for the Claude Code `/hook/*`
     // endpoints. Shares the server ctx (same registry + event log); stock
@@ -150,8 +149,23 @@ async fn main() -> Result<()> {
     }
 
     log::info!("marshal-daemon listening on ws://{bind_addr}, hooks on http://{hook_bind}");
+    // The sweeper starts only once myko has replayed Postgres. `build` starts
+    // the replay in the background and only `run` waits for it, so a sweep
+    // before then would find room memberships whose sessions hadn't loaded yet
+    // and remove them, on every restart (MAR-19, from MUS-58). WS-shim
+    // sessions reap on client loss + grace; pull/hook sessions on the activity
+    // backstop. See cleanup.
+    let sweeper = async {
+        while !server.is_ready() {
+            tokio::time::sleep(SWEEPER_READY_POLL).await;
+        }
+        log::info!("marshal-daemon: the store is loaded; starting the cleanup sweeper");
+        tokio::spawn(daemon::cleanup::run_sweeper(server.ctx()));
+        std::future::pending::<()>().await;
+    };
     tokio::select! {
         r = server.run() => r.map_err(|e| anyhow::anyhow!(e))?,
+        () = sweeper => {}
         signal = stop_signal() => {
             log::info!("marshal-daemon: {signal}; ending held waits, then stopping");
             let _ = stop_tx.send(true);
@@ -161,6 +175,9 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+/// How often the sweeper checks, before it starts, whether myko has caught up.
+const SWEEPER_READY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// How long a stopping daemon gives held waits to write their replies.
 const STOP_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
