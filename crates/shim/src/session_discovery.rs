@@ -98,7 +98,7 @@ pub fn resolve(cwd: &str) -> Option<SessionId> {
         return Some(sid);
     }
     let home = home_dir()?;
-    resolve_under(&home, cwd, MAX_WAIT, real_parent_info)
+    resolve_under(&real_liveness, &home, cwd, MAX_WAIT, real_parent_info)
 }
 
 /// This shim's parent process id (the `claude` that spawned it). `None` if the
@@ -117,13 +117,14 @@ pub(crate) fn parent_pid() -> Option<u32> {
 /// is absent (older Claude) or unreadable.
 pub(crate) fn canonical_session_id(parent_pid: u32) -> Option<SessionId> {
     let home = home_dir()?;
-    sid_from_claude_sessions_file(&home, parent_pid)
+    sid_from_claude_sessions_file(&real_liveness, &home, parent_pid)
 }
 
 /// Test seam: same logic as `resolve()` but takes HOME, max wait, and
 /// the parent-info source explicitly. Lets unit tests exercise both
 /// tiers without forking a child whose parent PID we control.
 pub(crate) fn resolve_under<F>(
+    liveness: &dyn Fn(u32) -> Liveness,
     home: &Path,
     cwd: &str,
     max_wait: Duration,
@@ -166,7 +167,7 @@ where
     let deadline = Instant::now() + max_wait;
     loop {
         // Tier 0: Claude's own per-PID session manifest. Authoritative.
-        if let Some(sid) = sid_from_claude_sessions_file(home, parent.pid) {
+        if let Some(sid) = sid_from_claude_sessions_file(liveness, home, parent.pid) {
             log::info!(
                 "[marshal-shim] session discovery: ~/.claude/sessions/{}.json → session_id {}",
                 parent.pid,
@@ -218,29 +219,150 @@ pub(crate) struct ParentInfo {
 /// Read `<home>/.claude/sessions/<parent_pid>.json` and pull `sessionId`.
 /// This is Claude Code's own per-PID session manifest (≥ 2.1.172) — the
 /// canonical source. Returns None if the file doesn't exist, isn't
-/// valid JSON, or doesn't carry a non-empty `sessionId`. The parser
-/// uses minimal direct string scanning to avoid a serde_json dep on
-/// the hot path; if Claude ever drops the convention this gracefully
-/// falls through to the other tiers.
-fn sid_from_claude_sessions_file(home: &Path, parent_pid: u32) -> Option<SessionId> {
+/// valid JSON, doesn't carry a non-empty `sessionId`, or isn't live (MAR-45, from muster MUS-107,
+/// [`manifest_is_live`]): a manifest left by a process that has exited, whose
+/// pid another process now holds, names a session that's gone.
+fn sid_from_claude_sessions_file(
+    liveness: &dyn Fn(u32) -> Liveness,
+    home: &Path,
+    parent_pid: u32,
+) -> Option<SessionId> {
     let path = home
         .join(".claude")
         .join("sessions")
         .join(format!("{parent_pid}.json"));
     let content = std::fs::read_to_string(&path).ok()?;
-    // Cheap parse: look for `"sessionId":"..."`. The file is small
-    // (~300 bytes) and Claude writes it as a single-line JSON object;
-    // anything trickier (escaped quotes inside a UUID value) doesn't
-    // happen in practice.
-    let needle = "\"sessionId\":\"";
-    let start = content.find(needle)? + needle.len();
-    let rest = &content[start..];
-    let end = rest.find('"')?;
-    let sid = &rest[..end];
+    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let sid = manifest.get("sessionId")?.as_str()?;
     if sid.is_empty() {
         return None;
     }
+    if !manifest_is_live(&manifest, parent_pid, &liveness(parent_pid)) {
+        log::warn!(
+            "[marshal-shim] session discovery: {path:?} names session {sid}, but isn't pid \
+             {parent_pid}'s: that process isn't the one that wrote it, so it's ignored"
+        );
+        return None;
+    }
     Some(SessionId(Arc::from(sid)))
+}
+
+/// What can be learned about a running process, to check a manifest is its own
+/// (MAR-45, from muster MUS-107). Each field is `None` where the platform can't say.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Liveness {
+    /// Whether a process with the pid exists.
+    pub running: Option<bool>,
+    /// Linux: its start time in clock ticks since boot, field 22 of
+    /// `/proc/<pid>/stat`, which Claude records as the manifest's `procStart`.
+    pub start_ticks: Option<u64>,
+    /// When it started, by the wall clock.
+    pub started_at: Option<SystemTime>,
+}
+
+/// How much later than the manifest's `startedAt` a process may seem to have
+/// started and still be the one that wrote it: wall-clock start times are read
+/// to the second on macOS, and Linux's are derived from the uptime.
+const STARTED_AT_SLACK: Duration = Duration::from_secs(2);
+
+/// Whether the manifest `m`, read for `pid`, was written by the process now
+/// holding that pid (MAR-45, from muster MUS-107). Pids are reused, and Claude leaves a manifest
+/// behind when it dies without cleaning up, so a stale manifest can name a
+/// session that's gone, for an unrelated process now holding its pid. It's
+/// stale if it names another pid; if no process holds the pid; if its
+/// `procStart` differs from the process's start ticks; or, where those can't be
+/// compared, if the process started after the manifest's `startedAt`, so after
+/// the session it describes. Whatever can't be read is taken on trust, so an
+/// older Claude's manifest, or a platform that can't say, behaves as before.
+pub(crate) fn manifest_is_live(m: &serde_json::Value, pid: u32, live: &Liveness) -> bool {
+    if m.get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|named| named != u64::from(pid))
+    {
+        return false;
+    }
+    if live.running == Some(false) {
+        return false;
+    }
+    let proc_start = m.get("procStart").and_then(|v| match v {
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        other => other.as_u64(),
+    });
+    if let (Some(written), Some(now)) = (proc_start, live.start_ticks) {
+        return written == now;
+    }
+    let started_at = m
+        .get("startedAt")
+        .and_then(serde_json::Value::as_u64)
+        .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms));
+    if let (Some(session), Some(process)) = (started_at, live.started_at) {
+        return process <= session + STARTED_AT_SLACK;
+    }
+    true
+}
+
+/// [`Liveness`] for `pid`, read from the system.
+pub(crate) fn real_liveness(pid: u32) -> Liveness {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => Liveness {
+                running: Some(true),
+                start_ticks: linux_start_ticks(&stat),
+                started_at: linux_process_start_time(pid),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Liveness {
+                running: Some(false),
+                ..Liveness::default()
+            },
+            Err(_) => Liveness::default(),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Liveness {
+            running: unix_pid_running(pid),
+            start_ticks: None,
+            started_at: macos_process_start_time(pid),
+        }
+    }
+    #[cfg(windows)]
+    {
+        Liveness {
+            running: None,
+            start_ticks: None,
+            started_at: windows_process_start_time(pid),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        Liveness::default()
+    }
+}
+
+/// Whether a process holds `pid`, by `kill(pid, 0)`: `ESRCH` means none does,
+/// and `EPERM` that one does under another user. `None` for anything else.
+#[cfg(target_os = "macos")]
+fn unix_pid_running(pid: u32) -> Option<bool> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        Some(libc::EPERM) => Some(true),
+        _ => None,
+    }
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line, the process's start time in clock
+/// ticks since boot. The comm field is in parentheses and may hold spaces, so
+/// the count starts after the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn linux_start_ticks(stat: &str) -> Option<u64> {
+    let tail = &stat[stat.rfind(')')? + 1..];
+    tail.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// The live fields marshal scrapes from Claude's per-PID manifest
@@ -504,9 +626,7 @@ fn linux_process_start_time(pid: u32) -> Option<SystemTime> {
     // ')' before splitting; starttime is field 22 overall = index 19
     // in the post-comm tail (state, ppid, pgrp, … starttime).
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let last_paren = stat.rfind(')')?;
-    let tail = &stat[last_paren + 1..];
-    let starttime_ticks: u64 = tail.split_whitespace().nth(19)?.parse().ok()?;
+    let starttime_ticks = linux_start_ticks(&stat)?;
 
     // Boot time = now - uptime. /proc/uptime is "<seconds_up> <idle>".
     let uptime_raw = std::fs::read_to_string("/proc/uptime").ok()?;
@@ -543,16 +663,26 @@ fn real_parent_info() -> Option<ParentInfo> {
 
 #[cfg(target_os = "macos")]
 fn macos_process_start_time(pid: u32) -> Option<SystemTime> {
+    // `lstart` is printed in the local time zone, with no offset, so `ps` is
+    // run in UTC to print the time [`parse_lstart_utc`] reads. Parsed as UTC
+    // while printed in local time, a Mac east of UTC saw a live Claude as
+    // starting hours after its manifest's `startedAt`, and refused it (MAR-45, from muster MUS-107).
+    // The day and month names follow the locale, so it's the C locale's.
     let out = std::process::Command::new("ps")
+        .env("TZ", "UTC")
+        .env("LC_ALL", "C")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8(out.stdout).ok()?;
-    // lstart format: "Tue Jun 10 17:31:30 2026". chrono parses this with
-    // %a %b %e %H:%M:%S %Y; the shim already pulls in chrono.
+    parse_lstart_utc(&String::from_utf8(out.stdout).ok()?)
+}
+
+/// A `ps -o lstart` time, such as "Tue Jun 10 17:31:30 2026", printed in UTC.
+#[cfg(any(target_os = "macos", test))]
+fn parse_lstart_utc(s: &str) -> Option<SystemTime> {
     chrono::NaiveDateTime::parse_from_str(s.trim(), "%a %b %e %H:%M:%S %Y")
         .ok()
         .and_then(|dt| dt.and_utc().timestamp_millis().try_into().ok())
@@ -706,6 +836,157 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe that can say nothing, so the manifest is taken on trust, as before
+    /// MAR-45, from muster MUS-107: these tests' parent pids are made up.
+    fn unprobed(_pid: u32) -> Liveness {
+        Liveness::default()
+    }
+
+    fn write_manifest(home: &Path, pid: u32, body: &str) {
+        let sessions = home.join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join(format!("{pid}.json")), body).unwrap();
+    }
+
+    /// MAR-45, from muster MUS-107: a manifest whose `procStart` matches the process holding its pid
+    /// is trusted; one left by an exited process, whose pid another now holds,
+    /// isn't; and a missing one gives nothing, as before.
+    #[test]
+    fn only_a_live_manifest_names_the_session() {
+        let tmp = make_tempdir();
+        let home = tmp.join("home");
+        let body = r#"{"pid":4017,"sessionId":"live-id","startedAt":1794011880448,"procStart":"192149093"}"#;
+        write_manifest(&home, 4017, body);
+        let id = |probe: &dyn Fn(u32) -> Liveness| {
+            sid_from_claude_sessions_file(probe, &home, 4017).map(|s| s.0.to_string())
+        };
+
+        let live = |_| Liveness {
+            running: Some(true),
+            start_ticks: Some(192_149_093),
+            started_at: None,
+        };
+        assert_eq!(id(&live).as_deref(), Some("live-id"));
+
+        // The pid was reused: another process, started later, holds it now.
+        let reused = |_| Liveness {
+            running: Some(true),
+            start_ticks: Some(192_990_001),
+            started_at: None,
+        };
+        assert_eq!(id(&reused), None, "a reused pid passed as the session's");
+
+        let gone = |_| Liveness {
+            running: Some(false),
+            ..Liveness::default()
+        };
+        assert_eq!(id(&gone), None, "no process holds the pid");
+
+        // Can't read the start time: trusted, as before.
+        let unreadable = |_| Liveness {
+            running: Some(true),
+            ..Liveness::default()
+        };
+        assert_eq!(id(&unreadable).as_deref(), Some("live-id"));
+
+        assert_eq!(
+            sid_from_claude_sessions_file(&live, &home, 4018),
+            None,
+            "no manifest"
+        );
+    }
+
+    /// Without `procStart` (or start ticks, off Linux), the wall-clock start
+    /// decides: a process that started after the session began isn't its own.
+    #[test]
+    fn without_start_ticks_a_process_younger_than_the_session_is_stale() {
+        let started = 1_794_011_880_448u64;
+        let m = serde_json::json!({"pid": 7, "sessionId": "s", "startedAt": started});
+        let at = |ms: u64| Liveness {
+            running: Some(true),
+            start_ticks: Some(5),
+            started_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms)),
+        };
+        assert!(
+            manifest_is_live(&m, 7, &at(started - 1_500)),
+            "Claude starts, then writes"
+        );
+        assert!(
+            manifest_is_live(&m, 7, &at(started + 1_000)),
+            "within the slack"
+        );
+        assert!(
+            !manifest_is_live(&m, 7, &at(started + 60_000)),
+            "a later process"
+        );
+        assert!(
+            !manifest_is_live(&m, 8, &at(started)),
+            "another pid's manifest"
+        );
+        assert!(
+            manifest_is_live(
+                &serde_json::json!({"sessionId": "s"}),
+                7,
+                &at(started + 60_000)
+            ),
+            "an older Claude's manifest, with neither, is trusted"
+        );
+    }
+
+    #[test]
+    fn lstart_is_read_as_utc() {
+        // 2026-11-07T02:55:15Z, as `TZ=UTC ps -o lstart=` prints it.
+        let at = parse_lstart_utc("Sat Nov  7 02:55:15 2026\n").expect("parses");
+        assert_eq!(
+            at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+            1_794_020_115
+        );
+        assert_eq!(parse_lstart_utc("not a time"), None);
+    }
+
+    /// On the platform that runs `ps` for it, the start time read for this
+    /// process is close to the truth, whatever the local time zone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_process_start_time_is_recent_in_any_zone() {
+        let started = macos_process_start_time(std::process::id()).expect("ps lstart");
+        let age = SystemTime::now()
+            .duration_since(started)
+            .unwrap_or_default();
+        assert!(
+            age < Duration::from_secs(3600),
+            "{age:?}: lstart was read in the wrong zone"
+        );
+        assert!(
+            started <= SystemTime::now() + Duration::from_secs(2),
+            "lstart read as later than now: the wrong zone"
+        );
+    }
+
+    #[test]
+    fn start_ticks_are_field_22_after_the_comm() {
+        let stat =
+            "4017 (claude (2) x) S 1 4017 4017 0 -1 4194560 1 0 0 0 1 2 0 0 20 0 9 0 192149093 1 2";
+        assert_eq!(linux_start_ticks(stat), Some(192_149_093));
+        assert_eq!(linux_start_ticks("garbage"), None);
+    }
+
+    /// This process is live, and its own probe says so, with start ticks on Linux.
+    #[test]
+    fn the_real_probe_sees_this_process() {
+        let me = std::process::id();
+        let live = real_liveness(me);
+        assert_ne!(live.running, Some(false));
+        #[cfg(target_os = "linux")]
+        {
+            let ticks = live.start_ticks.expect("start ticks on Linux");
+            let m = serde_json::json!({"pid": me, "procStart": ticks.to_string()});
+            assert!(manifest_is_live(&m, me, &live));
+            let m = serde_json::json!({"pid": me, "procStart": (ticks + 1).to_string()});
+            assert!(!manifest_is_live(&m, me, &live));
+        }
+    }
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -728,9 +1009,13 @@ mod tests {
             started_at: None,
             cmdline: Vec::new(),
         };
-        let got = resolve_under(&home, "/tmp/x", Duration::from_millis(10), move || {
-            Some(clone_parent(&parent))
-        });
+        let got = resolve_under(
+            &unprobed,
+            &home,
+            "/tmp/x",
+            Duration::from_millis(10),
+            move || Some(clone_parent(&parent)),
+        );
         assert_eq!(
             got.as_ref().map(|s| s.0.as_ref()),
             Some("14b684ba-618f-48f4-91d7-422ef99c9e38")
@@ -756,7 +1041,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            sid_from_claude_sessions_file(&home, 4017)
+            sid_from_claude_sessions_file(&unprobed, &home, 4017)
                 .as_ref()
                 .map(|s| s.0.as_ref()),
             Some("d77d5f3a-old")
@@ -769,7 +1054,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            sid_from_claude_sessions_file(&home, 4017)
+            sid_from_claude_sessions_file(&unprobed, &home, 4017)
                 .as_ref()
                 .map(|s| s.0.as_ref()),
             Some("c80daf7d-new")
@@ -794,6 +1079,7 @@ mod tests {
             ],
         };
         let got = resolve_under(
+            &unprobed,
             &home,
             "/tmp/fallback",
             Duration::from_millis(10),
@@ -833,9 +1119,13 @@ mod tests {
             started_at: None,
             cmdline: Vec::new(),
         };
-        let got = resolve_under(&home, "/tmp/race", Duration::from_secs(5), move || {
-            Some(clone_parent(&parent))
-        });
+        let got = resolve_under(
+            &unprobed,
+            &home,
+            "/tmp/race",
+            Duration::from_secs(5),
+            move || Some(clone_parent(&parent)),
+        );
         assert_eq!(
             got.as_ref().map(|s| s.0.as_ref()),
             Some("raced-into-existence")
@@ -964,6 +1254,7 @@ mod tests {
         };
 
         let got = resolve_under(
+            &unprobed,
             &home,
             "/tmp/shared-cwd",
             Duration::from_millis(10),
@@ -992,6 +1283,7 @@ mod tests {
         };
 
         let got = resolve_under(
+            &unprobed,
             &home,
             "/tmp/wanted-cwd",
             Duration::from_millis(50),
@@ -1021,6 +1313,7 @@ mod tests {
         };
 
         let got = resolve_under(
+            &unprobed,
             &home,
             "/tmp/cmdline-cwd",
             Duration::from_millis(10),
@@ -1034,13 +1327,19 @@ mod tests {
         let tmp = make_tempdir();
         let home = tmp.join("nonexistent");
         let started = Instant::now();
-        let got = resolve_under(&home, "/tmp/whatever", Duration::from_secs(2), || {
-            Some(ParentInfo {
-                pid: 1,
-                started_at: Some(SystemTime::UNIX_EPOCH),
-                cmdline: Vec::new(),
-            })
-        });
+        let got = resolve_under(
+            &unprobed,
+            &home,
+            "/tmp/whatever",
+            Duration::from_secs(2),
+            || {
+                Some(ParentInfo {
+                    pid: 1,
+                    started_at: Some(SystemTime::UNIX_EPOCH),
+                    cmdline: Vec::new(),
+                })
+            },
+        );
         assert!(got.is_none());
         assert!(started.elapsed() < Duration::from_millis(100));
     }
@@ -1071,6 +1370,7 @@ mod tests {
         };
 
         let got = resolve_under(
+            &unprobed,
             &home,
             r"C:\Users\admin",
             Duration::from_millis(10),
