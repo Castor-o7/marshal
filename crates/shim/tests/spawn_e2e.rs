@@ -81,14 +81,27 @@ struct Cell {
 }
 
 impl Cell {
+    /// A cell on a free port. The port is picked by binding port 0 and
+    /// closing it, so another process can take it first: then it's picked
+    /// again (MAR-21).
     fn spawn() -> Self {
         marshal_entities::link();
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .and_then(|l| l.local_addr())
-            .expect("reserve port")
-            .port();
-        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut lost = Vec::new();
+        for _ in 0..5 {
+            let bind = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .and_then(|listener| listener.local_addr())
+                .expect("pick a free port");
+            match Self::try_spawn(bind) {
+                Ok(cell) => return cell,
+                Err(why) => lost.push(format!("{bind}: {why}")),
+            }
+        }
+        panic!("no free port held for the test cell: {lost:?}");
+    }
+
+    fn try_spawn(bind: SocketAddr) -> Result<Self, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (failed_tx, failed_rx) = std::sync::mpsc::channel::<String>();
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
         let join = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -105,18 +118,43 @@ impl Cell {
                 );
                 ready_tx.send(server.ctx()).expect("publish cell context");
                 tokio::select! {
-                    result = server.run() => result.expect("run test cell"),
+                    result = server.run() => {
+                        if let Err(e) = result {
+                            let _ = failed_tx.send(e.to_string());
+                        }
+                    }
                     _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()) => {}
                 }
             });
         });
         let ctx = Arc::new(ready_rx.recv_timeout(WAIT).expect("cell context"));
-        Self {
+        // A port another process holds accepts connections too; the cell's
+        // own bind failure comes at once, so it's waited for a moment.
+        let deadline = Instant::now() + WAIT;
+        while std::net::TcpStream::connect(bind).is_err() {
+            if let Ok(why) = failed_rx.try_recv() {
+                // The thread's runtime waits on the shutdown channel as it ends.
+                drop(shutdown_tx);
+                let _ = join.join();
+                return Err(why);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("nothing listening on {bind}"));
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if let Ok(why) = failed_rx.recv_timeout(Duration::from_millis(200)) {
+            // The thread's runtime waits on the shutdown channel as it ends.
+            drop(shutdown_tx);
+            let _ = join.join();
+            return Err(why);
+        }
+        Ok(Self {
             address: format!("ws://{bind}"),
             ctx,
             shutdown: Some(shutdown_tx),
             join: Some(join),
-        }
+        })
     }
 
     /// Every message the cell holds.
