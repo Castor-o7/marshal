@@ -288,6 +288,10 @@ fn read_roster(host: &ToolHost, uri: &str) -> ResourceContent {
                 // Would a message wake it? `waiting` is observed by the daemon; `channel`
                 // and `busy` are declared by the session, which can claim anything.
                 "wake": marshal_entities::wake_state(s, &watchers, now_ms).as_str(),
+                // MUS-3: a role this session claims (`MARSHAL_IDENTITY`), which
+                // reaches it by name. Declared: any session can claim one.
+                "declared_role": s.identity.as_deref().filter(|i| *i != "none"),
+                "harness": s.harness,
                 "rooms": rooms,
             })
         })
@@ -1109,6 +1113,8 @@ mod tests {
             project: None,
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         })
     }
 

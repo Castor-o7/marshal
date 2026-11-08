@@ -14,6 +14,7 @@ mod channels;
 mod codex_bridge;
 mod codex_hook;
 mod codex_setup;
+mod doctor;
 mod link;
 mod mcp;
 mod roster_read;
@@ -100,6 +101,16 @@ fn main() -> Result<()> {
         Some("--check") if argv.next().is_none() => {
             println!("ok");
             return Ok(());
+        }
+        // Read-only health check: is this binary the one on PATH, does the
+        // daemon accept a connection, and is Claude Code wired to Marshal.
+        // Exits non-zero if any check fails. See `doctor`.
+        Some("doctor") if argv.next().is_none() => {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?
+                .block_on(doctor::run());
         }
         Some("statusline") if argv.next().is_none() => {
             statusline::render();
@@ -235,6 +246,7 @@ Usage: marshal-shim [COMMAND]
 With no command, serves MCP on stdio for the agent session that started it.
 
 Commands:
+  doctor        Check this machine's setup and say how to fix what's wrong (read-only)
   statusline    Render the Claude Code status line prefix from stdin
   claude-hook   Forward a Claude hook, or wait for mail:
                 claude-hook <session-start|prompt-submit|post-tool-use|wait> [base-url]
@@ -428,6 +440,13 @@ async fn serve() -> Result<()> {
         // The drain task below acks each direct push once it is written to
         // Claude, so the daemon can leave it unread until then.
         acks_pushes: (!is_codex).then_some(true),
+        // MUS-3: the same harness and identity the hooks report, since this
+        // SET replaces the row the hooks wrote.
+        harness: Some(if is_codex { "codex" } else { "claude" }.to_string()),
+        identity: std::env::var("MARSHAL_IDENTITY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
     };
     let session = Arc::new(Mutex::new(session));
 
@@ -1620,6 +1639,8 @@ mod tests {
                 project: None,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness: None,
+                identity: None,
             })
         };
         assert!(registered_on_roster(&[row("me", Some("c"))], &me));

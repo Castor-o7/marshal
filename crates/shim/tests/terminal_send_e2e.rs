@@ -152,6 +152,8 @@ impl Cell {
                 project: None,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness: None,
+                identity: None,
             })
             .expect("register recipient");
     }
@@ -180,6 +182,72 @@ fn tell(address: &str, home: &Path, body: &str) -> Output {
         .env_remove("MYKO_ADDRESS")
         .output()
         .expect("run marshal-shim tell")
+}
+
+/// `marshal-shim <args>` against `address`, isolated like [`tell`], with how
+/// long it took.
+fn shim_timed(address: &str, home: &Path, args: &[&str]) -> (Output, Duration) {
+    let started = Instant::now();
+    let out = Command::new(SHIM)
+        .args(args)
+        .env("MARSHAL_TEST", "1")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"))
+        .env("MARSHAL_DAEMON_ADDRESS", address)
+        .env_remove("MYKO_ADDRESS")
+        .output()
+        .expect("run marshal-shim");
+    (out, started.elapsed())
+}
+
+/// Well under the 10 s an unreachable daemon is given: an answer, not a timeout.
+const PROMPT: Duration = Duration::from_secs(5);
+
+#[test]
+fn the_roster_of_a_daemon_with_no_sessions_is_an_empty_list_at_once() {
+    // MAR-57: an empty roster used to look like one that hadn't arrived, so
+    // `roster` waited the full timeout and exited 1.
+    let cell = Cell::spawn();
+    let home = tempfile::tempdir().expect("terminal home");
+    let (out, took) = shim_timed(&cell.address, home.path(), &["roster"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{:?}: {stderr}", out.status);
+    assert!(took < PROMPT, "took {took:?}");
+    let roster: serde_json::Value = serde_json::from_slice(&out.stdout).expect("roster JSON");
+    assert_eq!(roster["sessions"], serde_json::json!([]));
+}
+
+#[test]
+fn the_roster_still_lists_the_sessions_there_are() {
+    let cell = Cell::spawn();
+    cell.add_recipient();
+    let home = tempfile::tempdir().expect("terminal home");
+    let (out, took) = shim_timed(&cell.address, home.path(), &["roster"]);
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(took < PROMPT, "took {took:?}");
+    let roster: serde_json::Value = serde_json::from_slice(&out.stdout).expect("roster JSON");
+    let ids: Vec<&str> = roster["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .filter_map(|s| s["session_id"].as_str())
+        .collect();
+    assert_eq!(ids, [RECIPIENT]);
+}
+
+#[test]
+fn tell_to_an_unknown_name_on_an_empty_daemon_fails_at_once() {
+    let cell = Cell::spawn();
+    let home = tempfile::tempdir().expect("terminal home");
+    let (out, took) = shim_timed(&cell.address, home.path(), &["tell", "nobody-here", "hi"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a send to nobody can't succeed");
+    assert!(
+        stderr.contains("no team or session named `nobody-here`"),
+        "{stderr}"
+    );
+    assert!(took < PROMPT, "took {took:?}");
 }
 
 #[test]
