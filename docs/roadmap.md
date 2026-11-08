@@ -263,7 +263,7 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
   write until it's registered (MUS-72, 78, 79; built on the fork as MAR-43), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
-  predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), and
+  predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), a `MARSHAL_PERSIST` other than `file` stops startup (MAR-53: so a typo can't silently lose mail; before, the variable meant nothing), and
   optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
   (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
   resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. Done when: the draft is agreed with the
