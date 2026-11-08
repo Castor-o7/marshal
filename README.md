@@ -414,6 +414,8 @@ Code, you can instead pin it in a per-project `.mcp.json`:
 
 The daemon's bind address is set with `MARSHAL_BIND` (default `127.0.0.1:6155`, localhost only; set `MARSHAL_BIND=0.0.0.0:6155` to accept other hosts).
 
+With `MARSHAL_TEST` set, a shim never falls back to `localhost:6155` or its hook port: with no address given, it exits with an error instead. It also ignores config files outside the system temp dir. The shim's own tests set it on every shim they start (`crates/shim/tests/support`), so a test can't reach the daemon you're running. Set it yourself for a hand-run check against a throwaway daemon.
+
 ## Workspace layout
 
 | Component | Description |
