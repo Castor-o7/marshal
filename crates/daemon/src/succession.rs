@@ -326,7 +326,7 @@ fn find_predecessor(
     let watching: HashSet<&str> = watchers
         .iter()
         .filter(|w| w.until > now)
-        .map(|w| w.id.0.as_ref())
+        .map(|w| w.session())
         .collect();
     let me = session.id.0.as_ref();
     let o = OBSERVED.lock().unwrap_or_else(|e| e.into_inner());

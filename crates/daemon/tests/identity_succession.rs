@@ -369,3 +369,31 @@ fn unread_mail_is_handed_to_the_successor() {
         .expect("succession record");
     assert_eq!(rec.handed_over, vec![unread.id.0.to_string()]);
 }
+
+/// MAR-54: a Codex bridge's wake record is keyed `<session>#bridge:<bridge>`
+/// (MAR-4), not by the session id, and it still counts as a waiter: a
+/// predecessor a bridge can wake isn't taken over, however quiet its row.
+#[test]
+fn a_bridge_wake_record_counts_as_a_waiter() {
+    use marshal_entities::{WakeWatcher, WakeWatcherId};
+    let ctx = setup();
+    let cwd = unique_cwd();
+    let hour_ago = chrono::Utc::now().timestamp_millis() - 3_600_000;
+    let mut old = session(&cwd, None, None);
+    old.connected_at = hour_ago;
+    old.last_activity_at = Some(hour_ago);
+    let nick = start(&ctx, &old);
+    let sid = old.id.0.as_ref();
+    ctx.set(&WakeWatcher {
+        id: WakeWatcherId(Arc::from(WakeWatcher::bridge_id(sid, "bridge-1").as_str())),
+        until: chrono::Utc::now().timestamp_millis() + 120_000,
+        session_id: Some(old.id.clone()),
+    })
+    .expect("bridge record SET");
+    let new = session(&cwd, None, None);
+    assert_ne!(
+        start(&ctx, &new),
+        nick,
+        "a session a bridge can wake keeps its nickname"
+    );
+}
