@@ -248,8 +248,10 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   MUS-33 (muster `9a0b61c`). Mail to an operator goes to their most active session, and a session can
   claim a far-future `lastActivityAt`. Done when: a `lastActivityAt` later than now doesn't outrank a
   real one when routing operator mail, with a test.
-- [ ] **MAR-52: Parity: Run CI on macOS.** From MUS-13 (muster #163). Done when: a `macos-15` job runs
-  the workspace tests on the fork's CI and passes. Keep the change to ci.yml small: every story edits it.
+- [ ] **MAR-52: Parity: Run CI on macOS.** From MUS-13 (muster #163). Held until the official swap to
+  Marshal, by the operator (2026-11-08: "we'll get macos tests ready when we perform the official swap");
+  as for MAR-35, Rally hold 1418. Done when: a `macos-15` job runs the workspace tests on the fork's CI
+  and passes. Keep the change to ci.yml small: every story edits it.
 - [ ] **MAR-53: Parity: Keep messages across a daemon restart without Postgres (opt-in).** From MUS-17
   (muster `8b4b4c2`, `3dd12aa`, `d6b6cdf`; design in muster's local-persistence-design.md). Without
   Postgres a restart loses every message. Done when: with `MARSHAL_PERSIST=file` an unread message, read
