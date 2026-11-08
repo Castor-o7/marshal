@@ -24,7 +24,7 @@ import type { Event } from "@opencode-ai/sdk";
 
 import { MarshalDaemon } from "./daemon.js";
 import { resolveIdentity } from "./identity.js";
-import { deliverPush } from "./push.js";
+import { deliverPush, deliverWaiting } from "./push.js";
 
 const DEFAULT_ADDRESS = "ws://localhost:6155";
 
@@ -109,9 +109,31 @@ export const MarshalPlugin: Plugin = async (input) => {
       drain: () => daemon.drainInbox(sid),
     })
       .then((shown) =>
-        log(shown ? `marshal: auto-advanced session ${sid}` : `marshal: inbound push for ${sid} had no body and inbox was empty`),
+        log(shown ? `marshal: auto-advanced session ${sid}` : `marshal: inbound push for ${sid} had nothing new to show`),
       )
       .catch((e: unknown) => log(`marshal: auto-advance prompt failed, left unread: ${String(e)}`));
+  });
+  // MAR-48: on a reconnect, show each session the mail that waited out the
+  // drop. It couldn't be pushed while the connection was down, so without
+  // this it would wait for the next prompt. It's acked once opencode has
+  // taken the prompt; if the prompt fails it stays unread for the next turn.
+  daemon.onReconnect((sessionIds) => {
+    for (const sid of sessionIds) {
+      void deliverWaiting({
+        prompt: (text) => {
+          log(`marshal: showing ${sid} mail that waited out a reconnect (${text.length} chars)`);
+          return client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] }, throwOnError: true });
+        },
+        pull: () => daemon.pullInbox(sid),
+      })
+        .then((shown) => {
+          if (!shown) return;
+          void client.tui
+            .showToast({ body: { message: "marshal: mail that arrived while disconnected", variant: "info" } })
+            .catch(() => {});
+        })
+        .catch((e: unknown) => log(`marshal: showing mail that waited out a reconnect failed, left unread: ${String(e)}`));
+    }
   });
   daemon.onRosterChanged(() => ui?.invalidate({ surface: "sidebar" }));
   daemon.onConnectionChanged(() => {

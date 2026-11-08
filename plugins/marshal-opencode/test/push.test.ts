@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { deliverPush, pushText, type PushTarget } from "../src/push.js";
+import { deliverPush, deliverWaiting, pushText, type PushTarget } from "../src/push.js";
 
 describe("live push text", () => {
   test("a whole body is shown as is", () => {
@@ -31,15 +31,16 @@ describe("live push text", () => {
 
 // MAR-10: a push is acked only once opencode has taken it.
 describe("deliverPush", () => {
-  function fakeTarget(opts: { promptFails?: boolean; inbox?: string | null } = {}) {
+  function fakeTarget(opts: { promptFails?: boolean; inbox?: string | null; pulled?: string[] } = {}) {
     const calls: string[] = [];
-    const held = new Set<string>();
+    const held = new Set<string>(opts.pulled);
     const target: PushTarget = {
       prompt: async (text) => {
         calls.push(`prompt:${text}`);
         if (opts.promptFails) throw new Error("opencode lost it");
       },
       hold: (id) => {
+        if (held.has(id)) return null;
         held.add(id);
         calls.push(`hold:${id}`);
         return () => {
@@ -87,9 +88,55 @@ describe("deliverPush", () => {
     expect(t.calls).toEqual(["prompt:new message from bob: hello"]);
   });
 
+  // MAR-48: a reconnect's pull already holds it, and shows it.
+  test("a push a pull already holds is left to the pull", async () => {
+    const t = fakeTarget({ pulled: ["m1"] });
+    expect(await deliverPush({ body: "hi", message_id: "m1" }, "alice", t.target)).toBe(false);
+    expect(t.calls).toEqual([]);
+  });
+
   test("a push with no body and an empty inbox prompts nothing", async () => {
     const t = fakeTarget();
     expect(await deliverPush({}, "alice", t.target)).toBe(false);
     expect(t.calls).toEqual([]);
+  });
+});
+
+// MAR-48: on a reconnect, the mail that waited out the drop is prompted and acked.
+describe("deliverWaiting", () => {
+  function fakePull(text: string | null) {
+    const calls: string[] = [];
+    const pull = async () =>
+      text === null
+        ? null
+        : {
+            text,
+            commit: async () => { calls.push("commit"); },
+            release: () => { calls.push("release"); },
+          };
+    return { pull, calls };
+  }
+
+  test("prompts the unread mail and acks it once opencode has taken it", async () => {
+    const p = fakePull("2 new messages");
+    const prompted: string[] = [];
+    expect(await deliverWaiting({ pull: p.pull, prompt: async (t) => { prompted.push(t); } })).toBe(true);
+    expect(prompted).toEqual(["2 new messages"]);
+    expect(p.calls).toEqual(["commit"]);
+  });
+
+  test("prompts nothing when nothing is unread", async () => {
+    const p = fakePull(null);
+    const prompted: string[] = [];
+    expect(await deliverWaiting({ pull: p.pull, prompt: async (t) => { prompted.push(t); } })).toBe(false);
+    expect(prompted).toEqual([]);
+  });
+
+  test("acks nothing when the prompt fails, and gives the mail back", async () => {
+    const p = fakePull("1 new message");
+    await expect(
+      deliverWaiting({ pull: p.pull, prompt: async () => { throw new Error("opencode lost it"); } }),
+    ).rejects.toThrow("opencode lost it");
+    expect(p.calls).toEqual(["release"]);
   });
 });
