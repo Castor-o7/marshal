@@ -6,10 +6,12 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::{
     net::SocketAddr,
     path::Path,
-    process::{Command, Output},
+    process::Output,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -24,7 +26,6 @@ use myko::{
 };
 use myko_server::{BlackholePersister, MykoServer};
 
-const SHIM: &str = env!("CARGO_BIN_EXE_marshal-shim");
 const RECIPIENT: &str = "terminal-e2e-recipient-0001";
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -173,7 +174,7 @@ impl Drop for Cell {
 /// `marshal-shim tell` with its own config directory, so no address file from
 /// this machine is read: the cell's address comes from the environment.
 fn tell(address: &str, home: &Path, body: &str) -> Output {
-    Command::new(SHIM)
+    support::shim(support::shared_home())
         .args(["tell", RECIPIENT, body])
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
@@ -188,14 +189,9 @@ fn tell(address: &str, home: &Path, body: &str) -> Output {
 /// long it took.
 fn shim_timed(address: &str, home: &Path, args: &[&str]) -> (Output, Duration) {
     let started = Instant::now();
-    let out = Command::new(SHIM)
+    let out = support::shim(home)
         .args(args)
-        .env("MARSHAL_TEST", "1")
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("APPDATA", home.join("appdata"))
         .env("MARSHAL_DAEMON_ADDRESS", address)
-        .env_remove("MYKO_ADDRESS")
         .output()
         .expect("run marshal-shim");
     (out, started.elapsed())
