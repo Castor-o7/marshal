@@ -517,7 +517,7 @@ pub fn begin_wait(
 
 /// How long a `WakeWatcher` counts without being refreshed, which is how long a
 /// wait that timed out and wasn't followed by another still shows as waiting.
-const WAKE_WATCHER_TTL_MS: i64 = 2 * 60 * 1000;
+pub(crate) const WAKE_WATCHER_TTL_MS: i64 = 2 * 60 * 1000;
 /// Refresh a held wait once this old, so its inbox checks don't each write an event.
 const WAKE_WATCHER_REFRESH_MS: i64 = 60 * 1000;
 

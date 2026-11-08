@@ -37,19 +37,35 @@ struct Daemon {
     hooks: SocketAddr,
 }
 
-fn free_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-    listener.local_addr().expect("reserved address")
-}
-
 /// A daemon cell with its WebSocket and hook listeners on free ports. The
 /// threads run until the test process exits.
+///
+/// The hook listener is bound here and handed over, so its port can't be
+/// taken in between. myko's server binds its own port, so that one is picked
+/// by binding port 0 and closing it; if another process takes it first, the
+/// server's bind fails and another is picked (MAR-21).
 fn daemon() -> Daemon {
     marshal_entities::link();
     daemon::link();
-    let ws_addr = free_addr();
-    let hooks = free_addr();
+    let mut lost = Vec::new();
+    for _ in 0..5 {
+        let ws_addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("pick a free port");
+        match try_daemon(ws_addr) {
+            Ok(daemon) => return daemon,
+            Err(why) => lost.push(format!("{ws_addr}: {why}")),
+        }
+    }
+    panic!("no free port held for the myko server: {lost:?}");
+}
+
+fn try_daemon(ws_addr: SocketAddr) -> Result<Daemon, String> {
+    let hook_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hook listener");
+    hook_listener.set_nonblocking(true).unwrap();
+    let hooks = hook_listener.local_addr().expect("hook address");
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (failed_tx, failed_rx) = std::sync::mpsc::channel::<String>();
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -65,8 +81,19 @@ fn daemon() -> Daemon {
             );
             let ctx = server.ctx();
             ready_tx.send(ctx.clone()).expect("publish context");
-            tokio::spawn(daemon::http_listener::run(hooks, Arc::new(ctx)));
-            let _ = server.run().await;
+            let listener = tokio::net::TcpListener::from_std(hook_listener).expect("hook listener");
+            // Held while the listener runs, so its waits aren't told to stop.
+            let (_running, stopping) = tokio::sync::watch::channel(false);
+            let hooks = tokio::spawn(daemon::http_listener::serve_until(
+                listener,
+                Arc::new(ctx),
+                stopping,
+            ));
+            if let Err(e) = server.run().await {
+                // A lost bind ends this cell; the hook listener goes with it.
+                hooks.abort();
+                let _ = failed_tx.send(e.to_string());
+            }
         });
     });
     let ctx = ready_rx.recv_timeout(WAIT).expect("daemon came up");
@@ -75,11 +102,26 @@ fn daemon() -> Daemon {
         assert!(Instant::now() < deadline, "hook listener never came up");
         thread::sleep(Duration::from_millis(25));
     }
-    Daemon {
+    // A port another process holds accepts connections too, so a connect
+    // alone doesn't say the server bound it. Its bind failure comes at once,
+    // so it's waited for a moment after the port answers.
+    while TcpStream::connect(ws_addr).is_err() {
+        if let Ok(why) = failed_rx.try_recv() {
+            return Err(why);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("nothing listening on {ws_addr}"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if let Ok(why) = failed_rx.recv_timeout(Duration::from_millis(200)) {
+        return Err(why);
+    }
+    Ok(Daemon {
         ctx,
         ws: format!("ws://{ws_addr}"),
         hooks,
-    }
+    })
 }
 
 /// Built from JSON so the helper names only the required fields: every
