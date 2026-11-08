@@ -2515,3 +2515,89 @@ fn delivery_conformance() {
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// The members of `room_id` as `marshal://rooms` shows them to `mcp`.
+fn room_members(mcp: &mut Mcp, room_id: &str) -> Vec<String> {
+    let Ok(r) = mcp.rpc("resources/read", json!({"uri": "marshal://rooms"})) else {
+        return Vec::new();
+    };
+    let text = r["contents"][0]["text"].as_str().unwrap_or_default();
+    let rooms: Value = serde_json::from_str(text).unwrap_or_default();
+    rooms["rooms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|room| room["room_id"] == json!(room_id))
+        .flat_map(|room| room["members"].as_array().cloned().unwrap_or_default())
+        .filter_map(|m| m["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn log_tail(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    lines[lines.len().saturating_sub(80)..].join("\n")
+}
+
+/// MAR-19: an adhoc membership survives a restart on the same Postgres. The
+/// sweeper drops memberships whose session isn't on the roster, so it must
+/// start only once myko has replayed the store; started before that, a boot
+/// sweep could find the membership before its session and drop it. That
+/// window is too narrow to hit on purpose (myko fills its stores one entity
+/// type at a time), so this pins the outcome; the order itself is pinned by
+/// `cleanup::tests::the_sweeper_waits_for_the_store_to_load`.
+#[test]
+#[ignore = "needs `cargo build --workspace` and CONFORMANCE_POSTGRES_URL; run with --ignored"]
+fn adhoc_membership_survives_a_postgres_restart() {
+    let Some(url) = std::env::var("CONFORMANCE_POSTGRES_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+    else {
+        assert!(
+            std::env::var_os("CONFORMANCE_REQUIRE_POSTGRES").is_none(),
+            "no postgres (set CONFORMANCE_POSTGRES_URL)"
+        );
+        eprintln!("adhoc_membership_survives_a_postgres_restart: no postgres, skipped");
+        return;
+    };
+    const ROOM: &str = "mar19-adhoc";
+    let mut daemon = Daemon::start(Mode::Plain, Some(&url), false);
+    let member_id = uuid::Uuid::new_v4().to_string();
+    let mut member = Cell::sender(&daemon, &member_id);
+    // Its shim's writes are refused until its session is on the roster.
+    let joined = wait_until(Duration::from_secs(15), || {
+        member.tool("join_room", json!({"name": ROOM})).is_ok()
+    });
+    assert!(joined, "join_room never succeeded");
+    assert!(
+        wait_until(Duration::from_secs(10), || room_members(&mut member, ROOM)
+            .contains(&member_id)),
+        "the join never showed in marshal://rooms"
+    );
+
+    daemon.restart();
+    let loaded = "the store is loaded; starting the cleanup sweeper";
+    // The member's shim redials. Wait for the sweeper, then past a few of its
+    // ticks (3 s each): any boot sweep that was going to drop it has run.
+    assert!(
+        wait_until(Duration::from_secs(20), || daemon
+            .log()
+            .matches(loaded)
+            .count()
+            >= 2),
+        "the restarted daemon never started its sweeper; log:\n{}",
+        log_tail(&daemon.log())
+    );
+    thread::sleep(Duration::from_secs(10));
+    let observer_id = uuid::Uuid::new_v4().to_string();
+    let mut observer = Cell::sender(&daemon, &observer_id);
+    let mut seen = Vec::new();
+    let kept = wait_until(Duration::from_secs(10), || {
+        seen = room_members(&mut observer, ROOM);
+        seen.contains(&member_id)
+    });
+    assert!(
+        kept,
+        "the adhoc membership didn't survive the restart; {ROOM} has {seen:?}; log:\n{}",
+        log_tail(&daemon.log())
+    );
+}
