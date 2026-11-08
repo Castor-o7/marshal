@@ -200,6 +200,14 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
 
 MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
 
+## Cutover
+
+- [ ] **MAR-59: Cutover: a kit to prove one session on Marshal.** Step 1 of the cutover runbook
+  (rally's docs/cutover.md, RAL-119). Done when: [cutover-test-session.md](cutover-test-session.md)
+  gives the project-local wiring, the checks with their expected output, and teardown, checked
+  against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
+  doc is marked not yet run.
+
 ## Parity with muster (gap survey, 2026-11-08)
 
 Toward the operator's goal of bringing Marshal up to muster's capabilities. A survey of the 62 finished
