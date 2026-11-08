@@ -83,8 +83,25 @@ const MESSAGE_SWEEP_EVERY: u64 = 100;
 /// (lower) vs. wake-ups per minute (higher).
 pub const TICK_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Run the sweeper forever. Spawn this on a tokio task and forget it.
-pub async fn run_sweeper(ctx: MykoServerContext) {
+/// How often [`run_sweeper_when_ready`] checks, before it starts, whether the
+/// store has loaded.
+const READY_POLL: Duration = Duration::from_millis(100);
+
+/// Start the sweeper once `ready` says the store has loaded, on a task of its
+/// own, and return. This is the only way to start it (MAR-19): the sweeper
+/// drops memberships whose session isn't on the roster, so a sweep while myko
+/// is still replaying Postgres would find a membership before its session
+/// and drop it, on every restart. The daemon passes `MykoServer::is_ready`.
+pub async fn run_sweeper_when_ready(ctx: MykoServerContext, ready: impl Fn() -> bool) {
+    while !ready() {
+        tokio::time::sleep(READY_POLL).await;
+    }
+    log::info!("marshal-daemon: the store is loaded; starting the cleanup sweeper");
+    tokio::spawn(run_sweeper(ctx));
+}
+
+/// Run the sweeper forever. Started only by [`run_sweeper_when_ready`].
+async fn run_sweeper(ctx: MykoServerContext) {
     let mut disconnected_since: HashMap<Arc<str>, Instant> = HashMap::new();
     let mut interval = tokio::time::interval(TICK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -796,6 +813,41 @@ mod tests {
             !rooms.contains("project:gone-only"),
             "an emptied auto-room goes"
         );
+    }
+
+    /// MAR-19: nothing is swept until the store has loaded. A membership
+    /// whose session hasn't replayed yet stays; once ready, the sweeper runs.
+    #[tokio::test]
+    async fn the_sweeper_waits_for_the_store_to_load() {
+        let ctx = setup();
+        set_hook_session(&ctx, "live", Utc::now().timestamp_millis());
+        set_room(&ctx, "design-sync", RoomKind::Adhoc);
+        set_member(&ctx, "design-sync", "not-replayed-yet");
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ready.clone();
+        let started = tokio::spawn(run_sweeper_when_ready(ctx.clone(), move || {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+
+        // The sweeper's first tick is immediate, so an ungated start would
+        // have dropped the membership by now.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            member_ids(&ctx).contains(&RoomMember::make_id("design-sync", "not-replayed-yet")),
+            "swept before the store had loaded"
+        );
+
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        started.await.expect("the sweeper starts once ready");
+        let mut gone = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if member_ids(&ctx).is_empty() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "once the store had loaded, the sweeper ran");
     }
 
     fn set_message(ctx: &MykoServerContext, id: &str, sent_at: i64) {
