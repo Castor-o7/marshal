@@ -200,8 +200,14 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   predecessor's nickname by harness and directory (MAR-9), and
   optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
-- [ ] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
-  runs in the fork's CI and passes, with each licence exception explained.
+- [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
+  runs in the fork's CI and passes, with each licence exception explained. Done: CI's
+  `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
+  Eight advisories in the lockfile (rustls, rustls-webpki, tokio, ctutils, webpki-roots) were fixed
+  by semver-compatible updates, and yanked chacha20 was bumped. myko's crates are AGPL by design and
+  are listed by name. The web UI's four git crates (mullion, css-styled and two of its parts)
+  declare no licence and are excluded by name: a real gap, which needs a licence upstream or their
+  replacement.
 - [ ] **MAR-18: Later: Stable error code for the unregistered refusal.** From MUS-80. The shim matches
   the refusal's text. Done when: the refusal carries a code, the shim matches the code, and a test
   covers both.

@@ -1,0 +1,76 @@
+# Dependency audit (MAR-16, from muster's MUS-11). CI runs `cargo deny check`.
+# Every exception below says why it's there and what would let it go.
+
+[graph]
+all-features = true
+# These four come from ignition-is-go's git repositories, for the web UI only
+# (marshal-ui, through mullion), and declare no licence, so cargo-deny can't
+# check them. That is a real gap, not a pass: without a licence there is no
+# stated permission to use them. They're excluded by name so the check still
+# covers everything else; the fix is a licence upstream, or replacing them.
+# Excluding them also drops what only they pull in. That's build-time only:
+# css-spec-data's build script fetches with ureq (so webpki-roots 0.26), and
+# css-styled-derive's macro uses rkyv 0.7 (RUSTSEC-2026-0235, unsafe archive
+# validation; its fix needs parcel_sourcemap on rkyv 0.8).
+exclude = [
+  "mullion",
+  "css-styled",
+  "css-styled-derive",
+  "css-spec-data",
+]
+
+[advisories]
+# Every advisory fails the check unless it's listed here with the reason it
+# can't reach Marshal at runtime, and what would let us drop the entry.
+ignore = [
+  # Unmaintained, not vulnerable: compile-time macros under leptos (web UI).
+  { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc macro under leptos, compile time only" },
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: unmaintained proc macro under leptos, compile time only" },
+  # Unmaintained, not vulnerable: only myko's optional TypeScript code generation
+  # (the entities crate's `ts-export` feature) pulls it in; no binary uses it.
+  { id = "RUSTSEC-2026-0249", reason = "smartstring: only under myko's optional codegen-ts feature, not in any binary" },
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+  "BSL-1.0",
+  "0BSD",
+  "CC0-1.0",
+]
+# myko and its crates are AGPL-3.0-or-later. Marshal is built on myko by
+# design: both come from ignition-is-go, and myko is upstream Marshal's own
+# runtime, so these are expected. Listed per crate so no other AGPL
+# dependency slips in unnoticed.
+exceptions = [
+  { name = "myko", allow = ["AGPL-3.0-or-later"] },
+  { name = "myko-macros", allow = ["AGPL-3.0-or-later"] },
+  { name = "myko-server", allow = ["AGPL-3.0-or-later"] },
+  { name = "myko-leptos", allow = ["AGPL-3.0-or-later"] },
+  { name = "autosocket", allow = ["AGPL-3.0-or-later"] },
+]
+
+[bans]
+# Duplicate versions are common in this tree (two webpki-roots, for one); warn
+# rather than fail.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io. The UI's two git repositories (css-styled, mullion) aren't
+# listed: their crates are excluded above, so the check never meets them, and
+# if that exclusion goes, they must be allowed here on purpose.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
