@@ -1909,10 +1909,6 @@ const MARSHAL_NOT_APPLICABLE: &[(&str, &str)] = &[
         "unread-mail-follows-a-restart",
         "Marshal doesn't hand a successor its predecessor's mail yet (muster's MUS-47)",
     ),
-    (
-        "restart-keeps-unread-mail-file",
-        "Marshal has no file-backed store (muster's MUS-17); the Postgres cells cover restarts",
-    ),
 ];
 
 const TLS_EXCLUDED: &str = "Marshal has no TLS gate yet (MAR-23); runs as plain mode would";
@@ -2597,5 +2593,113 @@ fn adhoc_membership_survives_a_postgres_restart() {
         kept,
         "the adhoc membership didn't survive the restart; {ROOM} has {seen:?}; log:\n{}",
         log_tail(&daemon.log())
+    );
+}
+
+/// The bodies of `mcp`'s unread direct messages, with their ids.
+fn unread_bodies(mcp: &mut Mcp) -> Option<Vec<(String, String)>> {
+    let r = mcp
+        .rpc(
+            "resources/read",
+            json!({"uri": "marshal://messages?inbox=true&unread=true"}),
+        )
+        .ok()?;
+    let text = r["contents"][0]["text"].as_str()?;
+    let result: Value = serde_json::from_str(text).ok()?;
+    Some(
+        result["messages"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| {
+                Some((
+                    m["messageId"].as_str()?.to_string(),
+                    m["body"].as_str()?.to_string(),
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// What a restart kept: whether the adhoc membership, the unread message and
+/// the read state all came back.
+struct Kept {
+    membership: bool,
+    unread: bool,
+    read_stays_read: bool,
+}
+
+/// A session joins an adhoc room and gets two messages, and reads and acks
+/// one. Then the daemon restarts, with or without `MARSHAL_PERSIST=file`.
+fn restart_with_rooms_and_read_state(persist_file: bool) -> Kept {
+    const ROOM: &str = "mar53-adhoc";
+    let mut daemon = Daemon::start(Mode::Plain, None, persist_file);
+    let member_id = uuid::Uuid::new_v4().to_string();
+    let mut member = Cell::sender(&daemon, &member_id);
+    // Its shim's writes are refused until its session is on the roster.
+    assert!(
+        wait_until(Duration::from_secs(15), || member
+            .tool("join_room", json!({"name": ROOM}))
+            .is_ok()),
+        "join_room never succeeded"
+    );
+    let sender_id = uuid::Uuid::new_v4().to_string();
+    let mut sender = Cell::sender(&daemon, &sender_id);
+    assert!(sender.row(&member_id, Duration::from_secs(15)).is_some());
+    let (read, unread) = (token("read-before"), token("unread-before"));
+    for body in [&read, &unread] {
+        sender.send(&member_id, body, None).expect("send");
+    }
+    let mut inbox = Vec::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            inbox = unread_bodies(&mut member).unwrap_or_default();
+            inbox.len() == 2
+        }),
+        "both messages never showed unread: {inbox:?}"
+    );
+    let read_id = inbox
+        .iter()
+        .find(|(_, body)| body == &read)
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    member
+        .tool("ack_messages", json!({"message_ids": [read_id]}))
+        .expect("ack");
+
+    daemon.restart();
+    // The member's shim redials; give the sweeper a few ticks too.
+    thread::sleep(Duration::from_secs(8));
+    let mut observer = Cell::sender(&daemon, &uuid::Uuid::new_v4().to_string());
+    let membership = wait_until(Duration::from_secs(10), || {
+        room_members(&mut observer, ROOM).contains(&member_id)
+    });
+    let mut after = None;
+    wait_until(Duration::from_secs(10), || {
+        after = unread_bodies(&mut member);
+        after.as_ref().is_some_and(|a| !a.is_empty())
+    });
+    let after = after.unwrap_or_default();
+    Kept {
+        membership,
+        unread: after.iter().any(|(_, body)| body == &unread),
+        read_stays_read: !after.iter().any(|(_, body)| body == &read),
+    }
+}
+
+/// MAR-53: with `MARSHAL_PERSIST=file` and no Postgres, an adhoc membership,
+/// an unread message and the read state of another all survive a restart.
+/// Without the setting, a restart still loses them: the default is unchanged.
+#[test]
+#[ignore = "needs `cargo build --workspace` first; run with --ignored"]
+fn the_file_store_keeps_rooms_and_read_state_across_a_restart() {
+    let kept = restart_with_rooms_and_read_state(true);
+    assert!(kept.membership, "the adhoc membership didn't survive");
+    assert!(kept.unread, "the unread message didn't survive");
+    assert!(kept.read_stays_read, "a read message came back unread");
+
+    let lost = restart_with_rooms_and_read_state(false);
+    assert!(
+        !lost.membership && !lost.unread,
+        "without MARSHAL_PERSIST=file a restart kept state: the default changed"
     );
 }
