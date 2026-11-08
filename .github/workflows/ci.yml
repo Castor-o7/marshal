@@ -212,3 +212,19 @@ jobs:
         continue-on-error: true
         timeout-minutes: 1
         run: python3 scripts/ci/report_resources.py
+
+  # MAR-16: dependency audit (advisories, licences, bans and sources), as
+  # configured in deny.toml, where every exception says why. Additive: it
+  # gates nothing else. cargo-deny is built from crates.io at a pinned version
+  # with its lockfile, so no third-party action runs.
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo install --locked cargo-deny --version 0.20.2
+      - run: cargo deny check
