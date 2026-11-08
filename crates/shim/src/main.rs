@@ -14,6 +14,7 @@ mod channels;
 mod codex_bridge;
 mod codex_hook;
 mod codex_setup;
+mod doctor;
 mod link;
 mod mcp;
 mod session_discovery;
@@ -95,6 +96,16 @@ fn main() -> Result<()> {
         Some("--check") if argv.next().is_none() => {
             println!("ok");
             return Ok(());
+        }
+        // Read-only health check: is this binary the one on PATH, does the
+        // daemon accept a connection, and is Claude Code wired to Marshal.
+        // Exits non-zero if any check fails. See `doctor`.
+        Some("doctor") if argv.next().is_none() => {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?
+                .block_on(doctor::run());
         }
         Some("statusline") if argv.next().is_none() => {
             statusline::render();
@@ -198,6 +209,7 @@ Usage: marshal-shim [COMMAND]
 With no command, serves MCP on stdio for the agent session that started it.
 
 Commands:
+  doctor        Check this machine's setup and say how to fix what's wrong (read-only)
   statusline    Render the Claude Code status line prefix from stdin
   claude-hook   Forward a Claude hook, or wait for mail:
                 claude-hook <session-start|prompt-submit|post-tool-use|wait> [base-url]
