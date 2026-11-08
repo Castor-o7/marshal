@@ -139,9 +139,8 @@ async fn main() -> Result<()> {
         session_filter.bind(Arc::new(handle));
     }
 
-    // Spawn the periodic sweeper. WS-shim sessions reap on client loss +
-    // grace; pull/hook sessions reap on the activity backstop. See cleanup.
-    tokio::spawn(daemon::cleanup::run_sweeper(server.ctx()));
+    // The periodic sweeper starts below, once myko has caught up with Postgres
+    // (MAR-19).
 
     // The operator's control files (MAR-46): `marshal-daemon forget` writes
     // them in the state directory, and this applies them every 2 s.
@@ -180,8 +179,16 @@ async fn main() -> Result<()> {
     }
 
     log::info!("marshal-daemon listening on ws://{bind_addr}, hooks on http://{hook_bind}");
+    // The sweeper starts only once myko has replayed Postgres (MAR-19, from
+    // MUS-58). `build` starts the replay in the background and only `run`
+    // waits for it. See `cleanup::run_sweeper_when_ready`.
+    let sweeper = async {
+        daemon::cleanup::run_sweeper_when_ready(server.ctx(), || server.is_ready()).await;
+        std::future::pending::<()>().await;
+    };
     tokio::select! {
         r = server.run() => r.map_err(|e| anyhow::anyhow!(e))?,
+        () = sweeper => {}
         signal = stop_signal() => {
             log::info!("marshal-daemon: {signal}; ending held waits, then stopping");
             let _ = stop_tx.send(true);
