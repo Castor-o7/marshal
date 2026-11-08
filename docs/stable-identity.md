@@ -66,9 +66,17 @@ In one step, the daemon:
 - writes a `Succession` record: who took over from whom, the nickname, the
   key, why the predecessor counted as dead, and any alias.
 
-Mail to the old session id follows the record to the new session. Handing the
-predecessor's unread mail to its successor is muster's MUS-47, not ported yet,
-so the conformance cell `unread-mail-follows-a-restart` is n/a.
+It also hands the predecessor's unread direct mail to the successor (MAR-42,
+from muster's MUS-47): each such message is readdressed to the successor, so
+its next hook shows it once, as its own, and the record lists the ids. Mail
+the predecessor had read stays in its history. Mail sent afterwards to the
+old id, the old nickname or a late takeover's alias reaches the successor
+through addressing, below.
+
+One case can still show a message twice. The predecessor's waiter printed
+it, then its ack was lost, and then it died. The mail is still unread, so the
+successor gets it as well. That's the at-least-once rule every Marshal
+delivery follows.
 
 ## Default change
 

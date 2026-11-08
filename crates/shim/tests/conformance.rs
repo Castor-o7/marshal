@@ -1906,10 +1906,6 @@ const MARSHAL_NOT_APPLICABLE: &[(&str, &str)] = &[
         "Marshal has no operator pause to resume (MUS-10)",
     ),
     (
-        "unread-mail-follows-a-restart",
-        "Marshal doesn't hand a successor its predecessor's mail yet (muster's MUS-47)",
-    ),
-    (
         "restart-keeps-unread-mail-file",
         "Marshal has no file-backed store (muster's MUS-17); the Postgres cells cover restarts",
     ),

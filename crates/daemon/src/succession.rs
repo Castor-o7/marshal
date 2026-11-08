@@ -42,10 +42,10 @@ use std::{
 };
 
 use marshal_entities::{
-    GetAllRoomMembers, GetAllRooms, GetAllSessionIdentitys, GetAllSessionNicknames, GetAllSessions,
-    GetAllSuccessions, GetAllWakeWatchers, Room, RoomKind, RoomMember, RoomMemberId, Session,
-    SessionId, SessionIdentity, SessionIdentityId, SessionNickname, SessionNicknameId, Succession,
-    SuccessionId,
+    GetAllMessageReads, GetAllMessages, GetAllRoomMembers, GetAllRooms, GetAllSessionIdentitys,
+    GetAllSessionNicknames, GetAllSessions, GetAllSuccessions, GetAllWakeWatchers, Message,
+    MessageRead, Room, RoomKind, RoomMember, RoomMemberId, Session, SessionId, SessionIdentity,
+    SessionIdentityId, SessionNickname, SessionNicknameId, Succession, SuccessionId,
 };
 use myko::command::{CommandContext, CommandError};
 use myko::prelude::EventPublishing as _;
@@ -439,6 +439,8 @@ fn take_over(
     // its auto-rooms. `joined_at` is kept, so the successor sees the room's
     // history from when its predecessor joined.
     move_adhoc_memberships(ctx, pred, successor)?;
+    // MUS-47: its unread direct mail is the successor's now.
+    let handed_over = hand_over_unread(ctx, pred, successor)?;
     // Retire the predecessor's row if it's still there, so its fallback
     // nickname doesn't name it too. Its mail is kept (MUS-46).
     let sessions: Vec<Arc<Session>> = ctx.exec_query(GetAllSessions {})?;
@@ -468,8 +470,45 @@ fn take_over(
         alias,
         alias_until,
         told: false,
+        handed_over,
     })?;
     Ok(())
+}
+
+/// Readdress `from`'s unread direct messages to `to` (MUS-47), so the
+/// successor's inbox shows each once, as its own. Read mail stays with the
+/// predecessor's history. Returns the ids moved.
+fn hand_over_unread(
+    ctx: &CommandContext,
+    from: &str,
+    to: &str,
+) -> Result<Vec<String>, CommandError> {
+    let messages: Vec<Arc<Message>> = ctx.exec_query(GetAllMessages {})?;
+    let reads: Vec<Arc<MessageRead>> = ctx.exec_query(GetAllMessageReads {})?;
+    let read: HashSet<&str> = reads
+        .iter()
+        .filter(|r| r.session_id.0.as_ref() == from)
+        .map(|r| r.message_id.0.as_ref())
+        .collect();
+    let mut moved = Vec::new();
+    for m in messages.iter().filter(|m| {
+        m.to_session_id
+            .as_ref()
+            .is_some_and(|t| t.0.as_ref() == from)
+            && !read.contains(m.id.0.as_ref())
+    }) {
+        let mut readdressed = (**m).clone();
+        readdressed.to_session_id = Some(SessionId(Arc::from(to)));
+        ctx.emit_set(&readdressed)?;
+        moved.push(m.id.0.to_string());
+    }
+    if !moved.is_empty() {
+        log::info!(
+            "[identity] handed {} unread message(s) from {from} to {to}",
+            moved.len()
+        );
+    }
+    Ok(moved)
 }
 
 /// Give `to` each ad hoc room `from` is a member of, keeping when it joined.
@@ -866,6 +905,7 @@ mod tests {
                 alias: None,
                 alias_until: None,
                 told: false,
+                handed_over: Vec::new(),
             })
         };
         let chain = vec![rec("a", "b"), rec("b", "c")];

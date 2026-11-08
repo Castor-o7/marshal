@@ -147,6 +147,16 @@ launcher.
 - [ ] **MAR-9: Supporting: Stable nickname across a restart.** From MUS-3. Done when: a session
   restarted in the same harness and directory keeps its nickname, a role declared by environment can be
   reached after a restart, and a test shows both.
+- [ ] **MAR-42: Supporting: A restarted session's unread mail follows it.** From MUS-47, built on MAR-9.
+  A takeover readdresses the predecessor's unread direct mail to the successor; mail it had read stays
+  with it. Done when: the conformance cell `unread-mail-follows-a-restart` passes on claude and codex, a
+  daemon test shows unread mail moving and read mail staying, and the change is listed in MAR-15.
+- [ ] **MAR-54: Supporting: Codex rows on the roster can count as dead, from the bridge's signal.**
+  Follow-up to MAR-9. Succession never treats a Codex row still on the roster as dead
+  (`CODEX_PRESENT_ROWS_CAN_BE_DEAD`, "until MUS-77"), but MAR-12 has since given the roster the bridge's
+  wake path. Done when: it's decided from the bridge's records whether a present Codex row can count as
+  dead, and either the switch is turned on with a test that a live Codex sibling keeps its name, or the
+  reason it stays off is written in `stable-identity.md`.
 - [ ] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
@@ -205,8 +215,8 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
   write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
-  predecessor's nickname by harness and directory (MAR-9), and
-  optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
+  predecessor's nickname by harness and directory (MAR-9) and hand it the unread mail (MAR-42), have
+  `current_task` follow the branch (MAR-20), and optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's

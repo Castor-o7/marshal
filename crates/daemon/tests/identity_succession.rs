@@ -286,6 +286,7 @@ fn a_live_alias_isnt_given_to_a_new_session() {
         alias: Some(held.clone()),
         alias_until: Some(now + 600_000),
         told: false,
+        handed_over: Vec::new(),
     })
     .expect("succession SET");
     assert_ne!(
@@ -307,7 +308,64 @@ fn a_live_alias_isnt_given_to_a_new_session() {
         alias: Some(free.clone()),
         alias_until: Some(now - 1),
         told: false,
+        handed_over: Vec::new(),
     })
     .expect("succession SET");
     assert_eq!(start(&ctx, &later), free);
+}
+
+/// MUS-47: the predecessor's unread direct mail is the successor's after the
+/// takeover, and the record lists it. Mail it had read stays with it.
+#[test]
+fn unread_mail_is_handed_to_the_successor() {
+    use marshal_entities::{Message, MessageId, MessageRead, MessageReadId};
+    let ctx = setup();
+    let cwd = unique_cwd();
+    let old = session(&cwd, None, None);
+    start(&ctx, &old);
+    let mail = |body: &str| Message {
+        id: MessageId(Arc::from(Uuid::new_v4().to_string().as_str())),
+        from_session_id: SessionId(Arc::from("sender")),
+        to_session_id: Some(old.id.clone()),
+        to_room_id: None,
+        to_operator: None,
+        response_required: false,
+        body: body.into(),
+        sent_at: 1,
+    };
+    let unread = mail("unread");
+    let read = mail("read");
+    ctx.set(&unread).expect("message SET");
+    ctx.set(&read).expect("message SET");
+    ctx.set(&MessageRead {
+        id: MessageReadId(Arc::from(
+            MessageRead::make_id(read.id.0.as_ref(), old.id.0.as_ref()).as_str(),
+        )),
+        message_id: read.id.clone(),
+        session_id: old.id.clone(),
+        read_at: 2,
+    })
+    .expect("read SET");
+    end(&ctx, &old);
+    let new = session(&cwd, None, None);
+    start(&ctx, &new);
+
+    let messages = cmd(&ctx)
+        .exec_query(marshal_entities::GetAllMessages {})
+        .unwrap();
+    let to = |m: &Message| {
+        messages
+            .iter()
+            .find(|x| x.id == m.id)
+            .and_then(|x| x.to_session_id.clone())
+    };
+    assert_eq!(to(&unread), Some(new.id.clone()), "unread mail moves");
+    assert_eq!(to(&read), Some(old.id.clone()), "read mail stays");
+    let rec = cmd(&ctx)
+        .exec_query(GetAllSuccessions {})
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id.0.as_ref() == old.id.0.as_ref())
+        .expect("succession record");
+    assert_eq!(rec.handed_over, vec![unread.id.0.to_string()]);
 }
