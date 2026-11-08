@@ -64,6 +64,8 @@ fn session(id: &str, client_id: Option<&str>) -> Session {
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -271,4 +273,52 @@ fn self_mention_is_ignored() {
 
     assert!(res.mentioned.is_empty(), "the sender never pings itself");
     assert_eq!(messages(&ctx).len(), 1, "only the ambient room message");
+}
+
+/// MAR-19, from MUS-58: a member whose session has just been reaped, before the sweeper has removed its
+/// membership, isn't counted, and isn't reported as a failure either.
+#[test]
+fn a_member_reaped_during_a_broadcast_is_not_counted() {
+    let ctx = setup();
+    room_with_two(&ctx);
+    // A membership left behind by a session that's no longer on the roster.
+    set_member(&ctx, "everyone", "reaped");
+
+    let res = BroadcastMessage {
+        response_required: false,
+        to_room_id: RoomId(Arc::from("everyone")),
+        body: "takeover".into(),
+        as_session: None,
+    }
+    .execute(cmd_ctx(&ctx, Some("c-sender")))
+    .expect("broadcast ok");
+
+    assert_eq!(res.total, 1, "only the live member counts");
+    assert!(res.failed.is_empty(), "{:?}", res.failed);
+    assert_eq!(res.delivered.len(), 1);
+    assert_eq!(res.delivered[0].session_id.0.as_ref(), "peer");
+}
+
+#[test]
+fn a_room_whose_other_members_have_all_left_has_no_one_to_broadcast_to() {
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_room(&ctx, "everyone");
+    set_member(&ctx, "everyone", "sender");
+    set_member(&ctx, "everyone", "reaped");
+
+    let err = BroadcastMessage {
+        response_required: false,
+        to_room_id: RoomId(Arc::from("everyone")),
+        body: "anyone?".into(),
+        as_session: None,
+    }
+    .execute(cmd_ctx(&ctx, Some("c-sender")))
+    .expect_err("no live recipient");
+    assert!(
+        err.message.contains("no other members on the roster"),
+        "{}",
+        err.message
+    );
+    assert!(messages(&ctx).is_empty(), "nothing is stored");
 }

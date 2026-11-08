@@ -185,6 +185,8 @@ pub async fn run(target: Target, body: String) -> Result<()> {
         // A one-shot terminal send takes no pushes and embeds no agent.
         acks_pushes: None,
         agent_id: None,
+        harness: None,
+        identity: None,
     };
     // The shim's registration keeps the session it last set, to skip stale retries.
     let current = Arc::new(std::sync::Mutex::new(session.clone()));
@@ -282,6 +284,8 @@ mod tests {
             channels_enabled: None,
             acks_pushes: None,
             agent_id: None,
+            harness: None,
+            identity: None,
         })
     }
 

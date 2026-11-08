@@ -67,27 +67,47 @@ impl CommandHandler for AssignNickname {
 /// Hook registration calls this synchronously so callers can learn the
 /// collision-safe identity before the asynchronous assignment saga runs.
 pub fn ensure_assigned(ctx: &CommandContext, session_id: &str) -> Result<String, CommandError> {
+    // One naming at a time, so a saga and a hook naming the same session at
+    // once can't both take a predecessor over (MUS-3).
+    let _naming = crate::succession::NAMING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // The session may have DEL'd between the SET and our run — that's fine,
     // a stray assignment is harmless, but skip it to avoid reserving a name
     // for a gone session.
     let sessions: Vec<Arc<Session>> = ctx.exec_query(GetAllSessions {})?;
-    if !sessions.iter().any(|s| s.id.0.as_ref() == session_id) {
+    let Some(session) = sessions.iter().find(|s| s.id.0.as_ref() == session_id) else {
         return Ok(nickname(session_id));
-    }
+    };
 
     let assigned: Vec<Arc<SessionNickname>> = ctx.exec_query(GetAllSessionNicknames {})?;
+    let now = chrono::Utc::now().timestamp_millis();
 
     // Already has a handle → FROZEN. This early return is the whole
     // grandfather: once a session is named, no wordlist change moves it.
+    // Only a succession re-keys it (MUS-3).
     if let Some(existing) = assigned.iter().find(|n| n.id.0.as_ref() == session_id) {
+        crate::succession::record_identity(ctx, session, now)?;
         return Ok(existing.nickname.clone());
+    }
+
+    // MUS-3: a dead predecessor with the same identity hands its handle on.
+    if let Some(inherited) = crate::succession::name_from_predecessor(ctx, session, now)? {
+        return Ok(inherited);
     }
 
     // Assign: the current-wordlist candidate, re-hashed with a salt on the
     // rare collision so two sessions never share a handle. The un-salted
     // candidate equals the old pure-function output, so at rollout every
-    // live session is assigned exactly the handle it already had.
-    let taken: HashSet<&str> = assigned.iter().map(|n| n.nickname.as_str()).collect();
+    // live session is assigned exactly the handle it already had. A handle
+    // still reaching a session as an alias after a swap is taken too.
+    let aliases = crate::succession::live_aliases(ctx, now)?;
+    let taken: HashSet<&str> = assigned
+        .iter()
+        .map(|n| n.nickname.as_str())
+        .chain(aliases.iter().map(String::as_str))
+        .collect();
     let mut handle = nickname(session_id);
     let mut salt = 0u32;
     while taken.contains(handle.as_str()) {
