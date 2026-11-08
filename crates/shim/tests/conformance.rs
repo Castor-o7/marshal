@@ -2518,9 +2518,11 @@ fn adhoc_membership_survives_a_postgres_restart() {
     let mut daemon = Daemon::start(Mode::Plain, Some(&url), false);
     let member_id = uuid::Uuid::new_v4().to_string();
     let mut member = Cell::sender(&daemon, &member_id);
-    member
-        .tool("join_room", json!({"name": ROOM}))
-        .expect("join_room");
+    // Its shim's writes are refused until its session is on the roster.
+    let joined = wait_until(Duration::from_secs(15), || {
+        member.tool("join_room", json!({"name": ROOM})).is_ok()
+    });
+    assert!(joined, "join_room never succeeded");
     assert!(
         wait_until(Duration::from_secs(10), || room_members(&mut member, ROOM)
             .contains(&member_id)),
