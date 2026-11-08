@@ -69,6 +69,16 @@ pub fn run(ep: &str, base_override: Option<&str>) {
     run_for(Harness::Codex, ep, base_override);
 }
 
+/// `&identity=<MARSHAL_IDENTITY>` when it's set, for the daemon to match a
+/// restarted session on (MUS-3): a role such as `watchman`, or `none` to opt
+/// out. Empty when unset, and then the daemon infers it from the cwd.
+pub(crate) fn identity_q() -> String {
+    match std::env::var("MARSHAL_IDENTITY") {
+        Ok(v) if !v.trim().is_empty() => format!("&identity={}", url_q(v.trim())),
+        _ => String::new(),
+    }
+}
+
 /// Shared hook body for both harnesses.
 pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     let mut input = String::new();
@@ -101,10 +111,11 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     // has printed it, so a reply lost on the way (a hook killed at its timeout,
     // a dropped proxy hop) leaves the mail unread.
     let path = format!(
-        "/hook/{endpoint}?host={}&operator={}&harness={}&ack=client",
+        "/hook/{endpoint}?host={}&operator={}&harness={}&ack=client{}",
         url_q(&host),
         url_q(&op),
-        harness.name()
+        harness.name(),
+        identity_q()
     );
 
     let deadline = Instant::now() + harness.timeout();
@@ -245,10 +256,11 @@ fn wait_for_mail(
     let wait = if once { ONCE_WAIT } else { WATCH_WAIT };
     let body = registration_body(session_id, cwd, agent_id_from_env().as_deref());
     let path = format!(
-        "/hook/wait?host={}&operator={}&harness=claude&ack=client&timeout={}",
+        "/hook/wait?host={}&operator={}&harness=claude&ack=client&timeout={}{}",
         url_q(&short_host()),
         url_q(&operator()),
-        wait.as_secs()
+        wait.as_secs(),
+        identity_q()
     );
     let base = resolve_base(base_override);
     // The daemon answers within `WATCH_WAIT`; the read timeout only has to
@@ -471,9 +483,10 @@ fn wrap_long_lines(text: &str, max: usize) -> String {
 pub(crate) fn register_session(base: &str, session_id: &str, cwd: &str) -> Option<String> {
     let body = registration_body(session_id, cwd, agent_id_from_env().as_deref());
     let path = format!(
-        "/hook/session-register?host={}&operator={}&harness=codex",
+        "/hook/session-register?host={}&operator={}&harness=codex{}",
         url_q(&short_host()),
-        url_q(&operator())
+        url_q(&operator()),
+        identity_q()
     );
     let response = http_post(base, &path, &body, TIMEOUT)?;
     if let Ok(identity) = serde_json::from_str::<serde_json::Value>(&response)
