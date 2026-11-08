@@ -383,6 +383,12 @@ fn register_hook_session(
         log::warn!("[hook] not registering session id {sid:?}: it contains '#'");
         return None;
     }
+    // The operator forgot it (MAR-46): a waiter still polling under its id
+    // mustn't put the row back while the forget holds.
+    if crate::controls::is_forgotten(sid) {
+        log::debug!("[hook] not registering {sid}: the operator forgot it");
+        return None;
+    }
     let sid = sid.to_string();
     let agent_id = body
         .get("agent_id")
