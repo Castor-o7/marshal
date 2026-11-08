@@ -12,6 +12,25 @@ Goal: bring the muster features the ignition-is-go team asked for into Marshal, 
 
 Everything else here supports those three, or follows them.
 
+## Direction (operator, 2026-11-08)
+
+Muster is frozen. Castor-o7/marshal is the only active line, and muster is kept as the archive the
+ports come from. The ignition-is-go lead's invitation was to help Marshal rather than run a separate
+project, and this roadmap takes him at his word.
+
+The goals are security, durability and portability, and Marshal's core concept stays as it is: a
+message bus with a roster, for many harnesses. Work sits in one of three layers:
+
+1. **Upstream Marshal, the bus.** Additive or opt-in changes only, so a user who changes nothing
+   sees no difference. Default changes go to upstream as one issue (MAR-15).
+2. **This fork, where changes get tested.** Changes are proven on Murph before they're offered upstream.
+3. **Outside Marshal.** Rally, the watchman and the team process. These never go upstream.
+
+Most of Goals 1–3 and the conformance suite (MAR-14) are built and verified, waiting for their
+ticks. Next comes security (MAR-37, MAR-38, then the gate stories), with durability and portability
+stories filling the gaps. MAR-14 is test-only, which makes it the most useful thing to offer
+upstream next.
+
 This file lives on the Castor fork (Castor-o7/marshal) only, for Rally (project MAR); never send it
 upstream. The operator's planning doc is
 [Marshal Roadmap](https://claude.ai/artifact/3QkRvUo5Yxrwf3wt4Shuw1).
@@ -159,6 +178,21 @@ launcher.
 - [ ] **MAR-13: Later: OpenCode plugin declares its channel.** From MUS-89. Done when: the plugin
   reports its channel state when it registers, and the roster's `wake` for it matches what it can do.
 
+## Security: agree the shape with upstream first
+
+The gate stories below (MAR-23 to MAR-25) wait on myko#129, trevorsargent's PR that adds auth
+providers, machine credentials and authenticated gateways to myko itself. So the gate is built on
+that PR, not on a patched myko-server, and its shape is agreed upstream before any code.
+
+- [ ] **MAR-37: Security: Help land myko#129 and check it against the threat model.** Done when:
+  myko#129's auth provider and machine credentials have been tried against muster's four attackers
+  (a web page, one compromised session, a LAN device, a stolen machine), and what it covers and
+  doesn't is posted on myko#129 as a review or comment, by Josh or with his OK.
+- [ ] **MAR-38: Security: Propose opt-in authentication upstream as a design issue.** Draft in
+  [upstream-auth-issue-draft.md](upstream-auth-issue-draft.md). Needs the operator: Josh files it.
+  Done when: the issue is filed on ignition-is-go/marshal, and the gate stories are revised to
+  match the maintainers' answers.
+
 ## Later: strengthen Marshal
 
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
@@ -180,7 +214,7 @@ launcher.
 - [ ] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
 - [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
-  myko#129 (its auth provider). Done when: `--tls` serves pinned TLS, plain mode is unchanged, and the
+  myko#129 (its auth provider) and MAR-38 (upstream's answers decide the flag and shape). Done when: `--tls` serves pinned TLS, plain mode is unchanged, and the
   gate's e2e checks for TLS pass.
 - [ ] **MAR-24: Later: Gate: per-machine pairing.** Depends on MAR-23. Done when: a machine pairs with
   a one-time code, an unpaired machine is refused, and with pairings and neither `--tls` nor `--plain`
