@@ -159,9 +159,9 @@ the lamplighter's job (cobalt-bream), with Josh's go-ahead.
    goes idle again, `marshal-shim roster` shows it with the **same nickname** (MAR-9) and `wake:
    "waiting"`. Then check 3 passes again.
 
-If the message doesn't show, it's MAR-14's open question ("whether unread mail survives a restart",
-the conformance restart cells on Postgres). Stop there and report it, rather than going on with the
-cutover.
+If the message doesn't show, that's a regression: MAR-14's restart cells on Postgres, merged and run in
+CI, show unread mail surviving a restart. Stop there and report it to the watchman, with the token and
+the time of the restart, rather than going on with the cutover.
 
 ## (c) Teardown
 
