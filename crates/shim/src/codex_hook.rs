@@ -276,6 +276,12 @@ fn wait_for_mail(
         if parent_pid() != parent {
             return false;
         }
+        if superseded(session_id, parent) {
+            log::info!(
+                "[marshal-shim] waiter for {session_id}: the session's id has changed; exiting so the next one waits under the new id"
+            );
+            return false;
+        }
         let post = |path: &str, body: &str, timeout| {
             http_post_why(&base, path, body, Instant::now() + timeout)
         };
@@ -377,6 +383,28 @@ fn clear_refusal(session_id: &str) {
     if let Some(path) = refusal_marker(session_id) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Whether Claude has moved this waiter's session to a new id (MAR-44, from
+/// muster's MUS-104). A `/clear` or compaction re-mints the id in the same
+/// process, so the parent stays alive and a waiter started before it would
+/// poll under the old id forever: a row that is never reaped, and that still
+/// takes mail for the old id. Claude's live per-PID manifest names the current
+/// id; with no manifest (Codex, or an older Claude), nothing changes.
+fn superseded(session_id: &str, parent: Option<u32>) -> bool {
+    let current = parent.and_then(crate::session_discovery::canonical_session_id);
+    id_moved(session_id, current.as_ref().map(|s| s.0.as_ref()))
+}
+
+/// [`superseded`], reading the manifest under `home`.
+#[cfg(test)]
+fn superseded_under(home: &std::path::Path, session_id: &str, parent: u32) -> bool {
+    let current = crate::session_discovery::sid_from_claude_sessions_file(home, parent);
+    id_moved(session_id, current.as_ref().map(|s| s.0.as_ref()))
+}
+
+fn id_moved(session_id: &str, current: Option<&str>) -> bool {
+    current.is_some_and(|current| current != session_id)
 }
 
 /// This process's parent, which changes when the parent exits. `None` where
@@ -734,6 +762,33 @@ fn registration_body(session_id: &str, cwd: &str, agent_id: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_waiter_whose_session_id_moved_stands_down() {
+        assert!(
+            super::id_moved("old", Some("new")),
+            "a /clear re-minted the id"
+        );
+        assert!(!super::id_moved("same", Some("same")));
+        assert!(!super::id_moved("old", None), "no manifest: keep waiting");
+    }
+
+    #[test]
+    fn the_waiter_reads_the_id_from_claudes_live_manifest() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let pid = 4242;
+        // No manifest yet: nothing to compare against, so the waiter stays.
+        assert!(!super::superseded_under(home.path(), "old-id", pid));
+        let manifest = sessions.join(format!("{pid}.json"));
+        std::fs::write(&manifest, r#"{"pid":4242,"sessionId":"old-id","cwd":"/x"}"#).unwrap();
+        assert!(!super::superseded_under(home.path(), "old-id", pid));
+        // A /clear re-mints the id: Claude rewrites the manifest.
+        std::fs::write(&manifest, r#"{"pid":4242,"sessionId":"new-id","cwd":"/x"}"#).unwrap();
+        assert!(super::superseded_under(home.path(), "old-id", pid));
+        assert!(!super::superseded_under(home.path(), "new-id", pid));
+    }
+
     use super::*;
 
     #[test]

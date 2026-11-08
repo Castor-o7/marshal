@@ -222,7 +222,7 @@ pub(crate) struct ParentInfo {
 /// uses minimal direct string scanning to avoid a serde_json dep on
 /// the hot path; if Claude ever drops the convention this gracefully
 /// falls through to the other tiers.
-fn sid_from_claude_sessions_file(home: &Path, parent_pid: u32) -> Option<SessionId> {
+pub(crate) fn sid_from_claude_sessions_file(home: &Path, parent_pid: u32) -> Option<SessionId> {
     let path = home
         .join(".claude")
         .join("sessions")
