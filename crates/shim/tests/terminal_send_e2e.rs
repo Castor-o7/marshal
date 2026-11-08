@@ -189,14 +189,9 @@ fn tell(address: &str, home: &Path, body: &str) -> Output {
 /// long it took.
 fn shim_timed(address: &str, home: &Path, args: &[&str]) -> (Output, Duration) {
     let started = Instant::now();
-    let out = Command::new(SHIM)
+    let out = support::shim(home)
         .args(args)
-        .env("MARSHAL_TEST", "1")
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("APPDATA", home.join("appdata"))
         .env("MARSHAL_DAEMON_ADDRESS", address)
-        .env_remove("MYKO_ADDRESS")
         .output()
         .expect("run marshal-shim");
     (out, started.elapsed())

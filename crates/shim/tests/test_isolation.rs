@@ -45,7 +45,12 @@ fn run(mut cmd: Command, stdin: &str) -> Output {
 
 fn assert_refused(out: &Output, what: &str) {
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{what}: {:?} {stderr}", out.status);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{what}: {:?} {stderr}",
+        out.status
+    );
     assert!(
         stderr.contains("MARSHAL_TEST is set but no daemon address was given"),
         "{what}: {stderr}"
