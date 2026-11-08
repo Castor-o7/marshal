@@ -215,6 +215,10 @@ export class MarshalDaemon {
       host: this.cfg.identity.host,
       gitBranch: this.cfg.identity.gitBranch,
       project: this.cfg.identity.project,
+      // A live push wakes an opencode session: `onNotify` starts a turn with
+      // `session.prompt`. Declaring it lets the roster say `channel`, not
+      // `none`, while this plugin is connected (MAR-13).
+      channelsEnabled: true,
     };
     item.lastActivityAt = now;
     this.sessions.set(sessionId, item);
