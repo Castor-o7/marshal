@@ -110,8 +110,13 @@ async fn run_sweeper(ctx: MykoServerContext) {
     loop {
         interval.tick().await;
         sweep_once(&ctx, &mut disconnected_since);
-        // Before the rooms, so a room its last live member just left goes
-        // this tick (MAR-19).
+        crate::succession::recheck_pending(
+            &crate::succession::internal_ctx(&ctx),
+            Utc::now().timestamp_millis(),
+        );
+        // After succession, which moves a dead predecessor's adhoc
+        // memberships to its successor, and before the rooms, so a room its
+        // last live member just left goes this tick (MAR-19).
         sweep_memberships(&ctx);
         sweep_rooms(&ctx);
         sweep_wake_watchers(&ctx);
@@ -131,7 +136,12 @@ async fn run_sweeper(ctx: MykoServerContext) {
 /// broadcasts counted it. A session that comes back is put back in its
 /// auto-rooms by the `auto_rooms` saga on its next Session SET; an adhoc room
 /// it had joined it must join again.
-fn sweep_memberships(ctx: &MykoServerContext) {
+///
+/// One exception: a session a later one may still take over (MAR-9) keeps its
+/// adhoc memberships, so the takeover can move them to its successor
+/// ([`crate::succession::awaiting_successor`]). They go once it's taken over,
+/// or once it can't be.
+pub fn sweep_memberships(ctx: &MykoServerContext) {
     let (Some(members), Some(sessions)) = (
         ctx.registry.get(RoomMember::ENTITY_NAME_STATIC),
         ctx.registry.get(Session::ENTITY_NAME_STATIC),
@@ -145,19 +155,49 @@ fn sweep_memberships(ctx: &MykoServerContext) {
         .into_iter()
         .map(|(id, _)| id)
         .collect();
+    let adhoc: HashSet<Arc<str>> = ctx
+        .registry
+        .get(Room::ENTITY_NAME_STATIC)
+        .map(|rooms| {
+            rooms
+                .entries()
+                .materialize()
+                .get()
+                .into_iter()
+                .filter(|(_, item)| {
+                    downcast_item::<Room>(item).is_some_and(|r| matches!(r.kind, RoomKind::Adhoc))
+                })
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut awaiting: Option<HashSet<Arc<str>>> = None;
     for (id, item) in members.entries().materialize().get() {
         let Some(member) = downcast_item::<RoomMember>(&item) else {
             continue;
         };
-        if !live.contains(&member.session_id.0) {
-            match ctx.del_by_id(RoomMember::ENTITY_NAME_STATIC, &id) {
-                Ok(()) => log::info!(
-                    "[cleanup] {} left {}: no longer on the roster",
-                    member.session_id.0,
-                    member.room_id.0
-                ),
-                Err(e) => log::warn!("[cleanup] removing room member {id} failed: {e}"),
-            }
+        if live.contains(&member.session_id.0) {
+            continue;
+        }
+        if adhoc.contains(&member.room_id.0)
+            && awaiting
+                .get_or_insert_with(|| {
+                    crate::succession::awaiting_successor(
+                        &crate::succession::internal_ctx(ctx),
+                        Utc::now().timestamp_millis(),
+                    )
+                })
+                .contains(&member.session_id.0)
+        {
+            continue;
+        }
+        match ctx.del_by_id(RoomMember::ENTITY_NAME_STATIC, &id) {
+            Ok(()) => log::info!(
+                "[cleanup] {} left {}: no longer on the roster",
+                member.session_id.0,
+                member.room_id.0
+            ),
+            Err(e) => log::warn!("[cleanup] removing room member {id} failed: {e}"),
         }
     }
 }
@@ -346,6 +386,17 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
 
     let now = Instant::now();
     let now_ms = Utc::now().timestamp_millis();
+    // MUS-3: what succession needs to tell a dead predecessor from a live one.
+    let rows: Vec<(Arc<str>, Option<Arc<str>>)> = session_store
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .filter_map(|(id, item)| {
+            downcast_item::<Session>(&item).map(|s| (id, s.client_id.as_ref().map(|c| c.0.clone())))
+        })
+        .collect();
+    crate::succession::observe(&rows, &live_client_ids, now_ms);
     let held = held_waits(ctx, now_ms);
     let mut to_delete: Vec<Arc<str>> = Vec::new();
     let mut still_disconnected: HashSet<Arc<str>> = HashSet::new();
@@ -410,6 +461,9 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
             log::warn!("[cleanup] del session {} failed: {}", id, e);
             continue;
         }
+        // Seen go now, not on the next tick's observation, so this tick's
+        // membership sweep already knows it may be taken over (MAR-19).
+        crate::succession::record_removed(&id, now_ms);
         disconnected_since.remove(&id);
     }
 }
@@ -480,6 +534,8 @@ mod tests {
             project: None,
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         };
         let event = MEvent::from_item(&session, MEventType::SET, &Uuid::new_v4().to_string());
         ctx.apply_event_batch(vec![event])
@@ -548,6 +604,8 @@ mod tests {
             project: None,
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         };
         let event = MEvent::from_item(&session, MEventType::SET, &Uuid::new_v4().to_string());
         ctx.apply_event_batch(vec![event])

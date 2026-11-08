@@ -196,7 +196,8 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
 
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
-  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), a reaped session that comes back loses its adhoc rooms (MAR-19: it rejoins its auto-rooms, but has to rejoin any adhoc room itself), and
+  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
+  predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), and
   optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [ ] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
