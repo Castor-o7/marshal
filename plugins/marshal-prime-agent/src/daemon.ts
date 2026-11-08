@@ -41,7 +41,7 @@ import {
   type SessionNicknameItem,
 } from "./entities.ts";
 import type { Identity } from "./identity.ts";
-import { InboxPuller, type InboxPull } from "./inbox-pull.ts";
+import { InboxPuller, holdLeaseFromEnv, type InboxPull, type PushHold } from "./inbox-pull.ts";
 
 const LIVENESS_INTERVAL_MS = 5_000;
 const INBOX_PULL_LIMIT = 20;
@@ -84,7 +84,7 @@ export class MarshalDaemon {
     read: (sessionId) => this.readUnread(sessionId),
     ack: async (sessionId, messageIds) => { await this.sendForInbox(ackMessages(sessionId, messageIds)); },
     render: (messages) => this.renderInbox(messages),
-  });
+  }, { leaseMs: holdLeaseFromEnv() });
   private notifyHandler: NotifyHandler | null = null;
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
@@ -165,6 +165,10 @@ export class MarshalDaemon {
       // Prime Agent can render custom messages and trigger/steer turns through
       // its extension API, so advertise live-channel capability explicitly.
       channelsEnabled: true,
+      // The daemon leaves a pushed message unread until this extension acks
+      // it, once Prime Agent has taken it, so a push it fails to take reaches
+      // the next turn's pull instead of being lost (MAR-10).
+      acksPushes: true,
       kind: "prime-agent",
     } as SessionItem;
     (item as any).lastActivityAt = now;
@@ -265,6 +269,12 @@ export class MarshalDaemon {
   pullInbox(sessionId: string): Promise<InboxPull | null> {
     if (!this.connected) return Promise.resolve(null);
     return this.inbox.pull(sessionId).catch(() => null);
+  }
+
+  /** Hold one pushed message while Prime Agent takes it, so a turn's pull
+   *  doesn't show it too. Null when a pull already holds it. */
+  holdPush(sessionId: string, messageId: string): PushHold | null {
+    return this.inbox.holdPush(sessionId, messageId);
   }
 
   nicknameFor(sessionId: string): string {
