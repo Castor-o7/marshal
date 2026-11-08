@@ -483,7 +483,37 @@ async fn send_message(host: &ToolHost, args: &Value) -> Result<ToolOutcome, Tool
     let result = await_command(cell, REQUEST_TIMEOUT)
         .await
         .map_err(|e| ToolError::invalid_params(retry_hint(e, &key)))?;
-    Ok(ToolOutcome::Json(send_message_output(&result)))
+    let mut out = send_message_output(&result);
+    explain_inbox_delivery_once(
+        &mut out,
+        result.effective_live_push(),
+        &INBOX_DELIVERY_EXPLAINED,
+    );
+    Ok(ToolOutcome::Json(out))
+}
+
+/// Whether this shim has told its agent what `live_push: unavailable` means.
+static INBOX_DELIVERY_EXPLAINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+const INBOX_DELIVERY_NOTE: &str = "No live channel to this recipient, so the message waits in \
+     its inbox: it shows at the recipient's next tool call or prompt. An idle recipient is \
+     woken only when `wake` is `expected`; a busy one in a long command sees it when that \
+     command returns. Said once per session.";
+
+/// The first send that finds no live channel says what that means, so a
+/// sender isn't left guessing when a reply is slow (MAR-47, from muster's
+/// MUS-99). Only once per shim, to keep tool output small.
+fn explain_inbox_delivery_once(
+    out: &mut Value,
+    live_push: marshal_entities::LivePushStatus,
+    explained: &std::sync::atomic::AtomicBool,
+) {
+    if live_push == marshal_entities::LivePushStatus::Unavailable
+        && !explained.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        out["note"] = json!(INBOX_DELIVERY_NOTE);
+    }
 }
 
 /// `await_command`'s error when the response handler went away before a reply.
@@ -1186,6 +1216,25 @@ mod tests {
             wake,
             delivered_live,
         }
+    }
+
+    #[test]
+    fn the_first_inbox_only_send_explains_itself_once() {
+        let explained = std::sync::atomic::AtomicBool::new(false);
+        let send = |live_push| {
+            let mut out = send_message_output(&result(live_push, WakeStatus::Unobserved, false));
+            explain_inbox_delivery_once(&mut out, live_push, &explained);
+            out
+        };
+        assert!(send(LivePushStatus::Delivered).get("note").is_none());
+        let first = send(LivePushStatus::Unavailable);
+        let note = first["note"].as_str().expect("the first one explains");
+        assert!(note.contains("next tool call"), "{note}");
+        assert!(note.contains("`expected`"), "{note}");
+        assert!(
+            send(LivePushStatus::Unavailable).get("note").is_none(),
+            "only once"
+        );
     }
 
     #[test]
