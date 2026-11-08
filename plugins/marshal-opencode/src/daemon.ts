@@ -47,6 +47,14 @@ import type { Identity } from "./identity.js";
 
 const LIVENESS_INTERVAL_MS = 5_000;
 const INBOX_PULL_LIMIT = 20;
+
+/** How long a push may hold its message out of drains: the daemon's ack lease
+ *  (`MARSHAL_ACK_LEASE_SECS`, 60 s by default). Past it, a drain shows the
+ *  message, so a prompt that never resolves can't hide it for good. */
+function holdLeaseMs(env: Record<string, string | undefined> = process.env): number {
+  const secs = Number(env.MARSHAL_ACK_LEASE_SECS);
+  return Number.isFinite(secs) && secs > 0 ? secs * 1000 : 60_000;
+}
 // Marshal context enriches a turn but must never gate the harness itself. A
 // disconnected Myko client keeps sendCommand pending while it reconnects, so
 // bound the optional per-turn inbox read and fail open.
@@ -103,6 +111,10 @@ export class MarshalDaemon {
    *  render + inject the same messages twice. Chain drains so read→ack is
    *  atomic per session. */
   private readonly draining = new Map<string, Promise<string | null>>();
+  /** Per session, the pushed messages being prompted, and until when each is
+   *  held out of drains. */
+  private readonly pushing = new Map<string, Map<string, number>>();
+  private readonly leaseMs = holdLeaseMs();
   private notifyHandler: NotifyHandler | null = null;
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
@@ -215,6 +227,14 @@ export class MarshalDaemon {
       host: this.cfg.identity.host,
       gitBranch: this.cfg.identity.gitBranch,
       project: this.cfg.identity.project,
+      // A live push wakes an opencode session: `onNotify` starts a turn with
+      // `session.prompt`. Declaring it lets the roster say `channel`, not
+      // `none`, while this plugin is connected (MAR-13).
+      channelsEnabled: true,
+      // The daemon leaves a pushed message unread until this plugin acks it,
+      // once session.prompt has taken it, so a push opencode drops reaches
+      // the next drain instead of being lost (MAR-10).
+      acksPushes: true,
     };
     item.lastActivityAt = now;
     this.sessions.set(sessionId, item);
@@ -346,6 +366,26 @@ export class MarshalDaemon {
     return `- [${m.messageId}] ${this.senderLabel(m.fromSessionId)} [response_required=${m.responseRequired ?? false}]: ${m.body}`;
   }
 
+  /** Hold a pushed message out of this session's drains while it's being
+   *  prompted. Returns the release. */
+  holdPush(sessionId: string, messageId: string): () => void {
+    let held = this.pushing.get(sessionId);
+    if (!held) {
+      held = new Map();
+      this.pushing.set(sessionId, held);
+    }
+    const until = Date.now() + this.leaseMs;
+    held.set(messageId, until);
+    return () => {
+      if (held.get(messageId) === until) held.delete(messageId);
+    };
+  }
+
+  private isHeld(sessionId: string, messageId: string): boolean {
+    const until = this.pushing.get(sessionId)?.get(messageId);
+    return until !== undefined && until > Date.now();
+  }
+
   drainInbox(sessionId: string): Promise<string | null> {
     if (!this.connected) return Promise.resolve(null);
 
@@ -385,12 +425,14 @@ export class MarshalDaemon {
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
     }
     if (!result) return null;
-    if (!result.messages || result.messages.length === 0) return null;
+    // A message a push is prompting is that push's to show and ack.
+    const messages = (result.messages ?? []).filter((m) => !this.isHeld(sessionId, m.messageId));
+    if (messages.length === 0) return null;
 
-    const block = this.renderInbox(result.messages);
+    const block = this.renderInbox(messages);
 
     try {
-      await this.sendForInbox(ackMessages(sessionId, result.messages.map((m) => m.messageId)));
+      await this.sendForInbox(ackMessages(sessionId, messages.map((m) => m.messageId)));
     } catch (e) {
       this.log(`inbox ack failed (will re-surface next turn): ${String(e)}`);
     }

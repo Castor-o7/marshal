@@ -61,6 +61,10 @@ export interface SessionItem {
   operator?: string;
   host?: HostInfo;
   project?: string;
+  /** This session renders the daemon's live push (`NotifyChannel`). */
+  channelsEnabled?: boolean;
+  /** This client acks each live push itself, once opencode has taken it. */
+  acksPushes?: boolean;
 }
 
 // ── Write commands ───────────────────────────────────────────────────────

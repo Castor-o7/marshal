@@ -27,7 +27,10 @@ Four attackers I think are worth defending against, all on a single operator's m
    WebSocket upgrades, so a page can open `ws://127.0.0.1:6155` and act as a session. It can also
    send simple requests to the hook listener on `127.0.0.1:6156`.
 2. **One prompt-injected session**, which can claim to be another session.
-3. **Another device on the LAN**, since the daemon binds `0.0.0.0:6155` by default.
+3. **Another device on the LAN.** The daemon binds loopback by default, but sessions on other
+   machines only work once `MARSHAL_BIND` exposes it, and then anything on that network can act as
+   a session. (The README says the default is `0.0.0.0:6155`. The code says `127.0.0.1:6155`. I've
+   sent a small README fix separately.)
 4. **One lost or stolen machine** that was trusted, which should be removable on its own.
 
 Out of scope: other users with accounts on the same machine, the open internet, and root on the
@@ -37,14 +40,19 @@ daemon's host.
 
 - **Off by default.** Plain mode stays exactly as it is. A flag (say `marshal-daemon --auth`)
   turns it on.
-- **Built on myko#129.** Use its `with_auth_provider`, machine credentials and authenticated
-  gateway, so Marshal carries no auth code of its own and no vendored myko-server.
-- **Pairing a machine.** A one-time code on the daemon's host yields a machine credential; each
-  credential can be revoked by itself.
-- **Sessions bound to their machine.** An authenticated connection may act only as the sessions it
-  registered (`asSession` checked against the credential), and the hook listener takes a local token.
-- **TLS for the network port** when auth is on, with a pinned certificate, so a credential can't
-  be sniffed on the LAN.
+- **Built on myko#129.** Plug into its `with_auth_provider`, with a Marshal `Authenticator` and
+  `Authorizer`, so there's no vendored myko-server. As I read #129 (at `fcdbc52b`), it gives the
+  hooks for this: bearer admission, an authorizer that sees each command's arguments, and revoking
+  one credential through `validate_identity`. The credentials, the session rule and TLS would be
+  Marshal's to write.
+- **Pairing a machine.** A one-time code on the daemon's host yields a local token for that
+  machine. Each token can be revoked by itself, without disconnecting everyone else.
+- **Sessions bound to their machine.** A connection may act only as the sessions its token
+  registered: the authorizer checks `asSession` against the token's sessions. The shim and local
+  tools present a token too, and so does the hook listener, which is outside myko.
+- **TLS for the network port** when auth is on, with a pinned certificate, so a token can't be
+  sniffed on the LAN. #129 leaves TLS to whoever deploys it, so this would sit in front of myko's
+  listener or wrap it.
 - **Refuse browser origins** on the WebSocket and hook listener when auth is on.
 - **Failing safe.** Once machines are paired, the daemon shouldn't quietly come up open because a
   flag was forgotten. It could refuse to start without an explicit `--plain`. That's your call.
@@ -56,7 +64,7 @@ per-machine pairing, a session frame filter and a written threat model). It was 
 myko-server, which is the part I don't want to bring here. So I'd port the behaviour and its tests
 onto myko#129 instead, in small PRs: first tests and docs, then the opt-in pieces one at a time.
 
-I'm also glad to help test myko#129 itself against these four cases, if that's useful.
+I've read myko#129 against these four cases, and I'm glad to help test it.
 
 ## Questions for you
 
