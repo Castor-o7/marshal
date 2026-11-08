@@ -200,6 +200,20 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
 
 MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
 
+## Cutover
+
+- [ ] **MAR-59: Cutover: a kit to prove one session on Marshal.** Step 1 of the cutover runbook
+  (rally's docs/cutover.md, RAL-119). Done when: [cutover-test-session.md](cutover-test-session.md)
+  gives the project-local wiring, the checks with their expected output, and teardown, checked
+  against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
+  doc is marked not yet run.
+- [ ] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
+  `marshal-shim doctor` reads only `~/.claude/settings.json` and `~/.claude.json`, so it can't check a
+  session wired by a project-local `.claude/settings.json` and `.mcp.json`, which is how the cutover
+  moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
+  `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
+  and its exit status unchanged, with tests.
+
 ## Parity with muster (gap survey, 2026-11-08)
 
 Toward the operator's goal of bringing Marshal up to muster's capabilities. A survey of the 62 finished
