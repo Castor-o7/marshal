@@ -86,6 +86,41 @@ const CLAUDE_HOOKS: &[(&str, &str, bool)] = &[
 /// and enabled: `<plugin>@<marketplace>`.
 const PLUGIN_ID: &str = "marshal-shim@marshal";
 
+/// Whether `program` runs marshal-shim, however it's named: bare, by an
+/// absolute or relative path (either separator), or as `marshal-shim.exe`.
+fn is_shim(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let stem = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name);
+    stem == "marshal-shim"
+}
+
+/// A hook command split into its program and the rest, trimmed. A program
+/// in double quotes (a path with spaces) is unquoted.
+fn split_command(command: &str) -> (&str, &str) {
+    let command = command.trim();
+    if let Some(rest) = command.strip_prefix('"')
+        && let Some(end) = rest.find('"')
+    {
+        return (&rest[..end], rest[end + 1..].trim());
+    }
+    match command.split_once(char::is_whitespace) {
+        Some((program, args)) => (program, args.trim()),
+        None => (command, ""),
+    }
+}
+
+/// Whether a settings hook `command` is the hook `wanted` (as hooks.json
+/// spells it, `marshal-shim <args>`): the same arguments, run by any
+/// marshal-shim.
+fn same_hook(command: &str, wanted: &str) -> bool {
+    let (program, args) = split_command(command);
+    let (_, wanted_args) = split_command(wanted);
+    is_shim(program) && args.split_whitespace().eq(wanted_args.split_whitespace())
+}
+
 /// Every `(command, asyncRewake)` under `event` in a settings file's `hooks`.
 fn hook_commands<'a>(settings: &'a Value, event: &str) -> Vec<(&'a str, bool)> {
     settings["hooks"][event]
@@ -117,7 +152,7 @@ pub fn claude_wiring(settings: Option<&Value>, claude_json: Option<&Value>) -> V
             m.values().any(|v| {
                 v["command"]
                     .as_str()
-                    .is_some_and(|c| c.ends_with("marshal-shim"))
+                    .is_some_and(|c| is_shim(split_command(c).0))
             })
         });
     out.push(match (plugin, has_server) {
@@ -144,7 +179,7 @@ pub fn claude_wiring(settings: Option<&Value>, claude_json: Option<&Value>) -> V
             .map(|s| hook_commands(s, event))
             .unwrap_or_default()
             .into_iter()
-            .filter(|(c, _)| *c == command)
+            .filter(|(c, _)| same_hook(c, command))
             .map(|(_, r)| r)
             .collect();
         let check = "claude hook";
@@ -444,6 +479,48 @@ mod tests {
         let settings = json!({ "enabledPlugins": { PLUGIN_ID: false } });
         let f = claude_wiring(Some(&settings), Some(&json!({})));
         assert!(f.iter().any(|f| f.level == Level::Fail), "{:?}", levels(&f));
+    }
+
+    #[test]
+    fn a_hook_or_server_by_absolute_path_or_exe_counts() {
+        let mut settings = hooks_json();
+        settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] =
+            json!("/home/me/.cargo/bin/marshal-shim claude-hook prompt-submit");
+        settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"] =
+            json!(r#""C:\Program Files\Marshal\marshal-shim.exe" claude-hook post-tool-use"#);
+        settings["hooks"]["Stop"][0]["hooks"][0]["command"] =
+            json!(r"C:\Users\me\bin\marshal-shim.exe  claude-hook   wait");
+        let claude = json!({ "mcpServers": {
+            "marshal": { "command": r"C:\Users\me\bin\marshal-shim.exe" }
+        } });
+        let f = claude_wiring(Some(&settings), Some(&claude));
+        assert!(f.iter().all(|f| f.level == Level::Ok), "{:?}", levels(&f));
+    }
+
+    #[test]
+    fn another_program_or_other_args_dont_count() {
+        assert!(!same_hook(
+            "not-marshal-shim claude-hook wait",
+            "marshal-shim claude-hook wait"
+        ));
+        assert!(!same_hook(
+            "/bin/marshal-shimmer claude-hook wait",
+            "marshal-shim claude-hook wait"
+        ));
+        assert!(!same_hook(
+            "marshal-shim claude-hook prompt-submit",
+            "marshal-shim claude-hook wait"
+        ));
+        assert!(!same_hook(
+            "marshal-shim claude-hook wait extra",
+            "marshal-shim claude-hook wait"
+        ));
+        assert!(same_hook(
+            "  marshal-shim   claude-hook wait ",
+            "marshal-shim claude-hook wait"
+        ));
+        assert!(!is_shim("marshal-shim-old"));
+        assert!(is_shim("./marshal-shim"));
     }
 
     #[test]
