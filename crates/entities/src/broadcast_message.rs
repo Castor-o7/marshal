@@ -115,11 +115,15 @@ impl CommandHandler for BroadcastMessage {
             })?
             .clone();
 
-        // Resolve recipient set: members of the room minus the sender.
+        // Resolve recipient set: the room's members on the roster, minus the
+        // sender. A member whose session has left the roster isn't counted
+        // (MAR-19): the sweeper removes its membership within a tick, and until
+        // then it would only show up as a failure.
         let memberships: Vec<Arc<RoomMember>> = ctx.exec_query(GetAllRoomMembers {})?;
         let recipient_ids: Vec<SessionId> = memberships
             .iter()
             .filter(|m| m.room_id == room.id && m.session_id != sender.id)
+            .filter(|m| sessions.iter().any(|s| s.id == m.session_id))
             .map(|m| m.session_id.clone())
             .collect();
 
@@ -127,7 +131,7 @@ impl CommandHandler for BroadcastMessage {
             return Err(err(
                 &ctx,
                 &format!(
-                    "room '{}' has no other members — nothing to broadcast to",
+                    "room '{}' has no other members on the roster — nothing to broadcast to",
                     room.id.0.as_ref(),
                 ),
             ));

@@ -41,7 +41,7 @@ import {
   type SessionNicknameItem,
 } from "./entities.ts";
 import type { Identity } from "./identity.ts";
-import { InboxPuller, type InboxPull } from "./inbox-pull.ts";
+import { InboxPuller, holdLeaseFromEnv, type InboxPull, type PushHold } from "./inbox-pull.ts";
 
 const LIVENESS_INTERVAL_MS = 5_000;
 const INBOX_PULL_LIMIT = 20;
@@ -87,7 +87,7 @@ export class MarshalDaemon {
     read: (sessionId) => this.readUnread(sessionId),
     ack: async (sessionId, messageIds) => { await this.sendForInbox(ackMessages(sessionId, messageIds)); },
     render: (messages) => this.renderInbox(messages),
-  });
+  }, { leaseMs: holdLeaseFromEnv() });
   private notifyHandler: NotifyHandler | null = null;
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
@@ -168,6 +168,10 @@ export class MarshalDaemon {
       // Pi can render custom messages and start/steer turns through its
       // extension API, so identify the harness and advertise that capability.
       channelsEnabled: true,
+      // The daemon leaves a pushed message unread until this extension acks
+      // it, once pi has taken it, so a push pi fails to take reaches the next
+      // turn's pull instead of being lost (MAR-10).
+      acksPushes: true,
       kind: "pi",
     } as SessionItem;
     (item as any).lastActivityAt = now;
@@ -270,13 +274,10 @@ export class MarshalDaemon {
     return this.inbox.pull(sessionId).catch(() => null);
   }
 
-  /** Pull and commit in one step: the messages are acked before the caller
-   *  shows them. Only the live-push path still uses it. */
-  async drainInbox(sessionId: string): Promise<string | null> {
-    const pull = await this.pullInbox(sessionId);
-    if (!pull) return null;
-    await pull.commit().catch(() => this.log("inbox ack failed"));
-    return pull.text;
+  /** Hold one pushed message while pi takes it, so a turn's pull doesn't
+   *  show it too. Null when a pull already holds it. */
+  holdPush(sessionId: string, messageId: string): PushHold | null {
+    return this.inbox.holdPush(sessionId, messageId);
   }
 
   nicknameFor(sessionId: string): string {

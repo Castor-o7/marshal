@@ -118,7 +118,8 @@ fn daemon_address() -> Option<String> {
         }
     }
     let home = home_dir()?;
-    let path = config_dir(&home).join("daemon-address");
+    // Under test, only a file in the temp dir counts (MAR-56).
+    let path = crate::keep_test_paths(vec![config_dir(&home).join("daemon-address")]).pop()?;
     let contents = std::fs::read_to_string(path).ok()?;
     let line = contents.lines().next()?.trim();
     if line.is_empty() {

@@ -83,8 +83,25 @@ const MESSAGE_SWEEP_EVERY: u64 = 100;
 /// (lower) vs. wake-ups per minute (higher).
 pub const TICK_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Run the sweeper forever. Spawn this on a tokio task and forget it.
-pub async fn run_sweeper(ctx: MykoServerContext) {
+/// How often [`run_sweeper_when_ready`] checks, before it starts, whether the
+/// store has loaded.
+const READY_POLL: Duration = Duration::from_millis(100);
+
+/// Start the sweeper once `ready` says the store has loaded, on a task of its
+/// own, and return. This is the only way to start it (MAR-19): the sweeper
+/// drops memberships whose session isn't on the roster, so a sweep while myko
+/// is still replaying Postgres would find a membership before its session
+/// and drop it, on every restart. The daemon passes `MykoServer::is_ready`.
+pub async fn run_sweeper_when_ready(ctx: MykoServerContext, ready: impl Fn() -> bool) {
+    while !ready() {
+        tokio::time::sleep(READY_POLL).await;
+    }
+    log::info!("marshal-daemon: the store is loaded; starting the cleanup sweeper");
+    tokio::spawn(run_sweeper(ctx));
+}
+
+/// Run the sweeper forever. Started only by [`run_sweeper_when_ready`].
+async fn run_sweeper(ctx: MykoServerContext) {
     let mut disconnected_since: HashMap<Arc<str>, Instant> = HashMap::new();
     let mut interval = tokio::time::interval(TICK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -97,6 +114,10 @@ pub async fn run_sweeper(ctx: MykoServerContext) {
             &crate::succession::internal_ctx(&ctx),
             Utc::now().timestamp_millis(),
         );
+        // After succession, which moves a dead predecessor's adhoc
+        // memberships to its successor, and before the rooms, so a room its
+        // last live member just left goes this tick (MAR-19).
+        sweep_memberships(&ctx);
         sweep_rooms(&ctx);
         sweep_wake_watchers(&ctx);
         // Prune old messages on the first tick (boot cleanup) and every
@@ -106,6 +127,78 @@ pub async fn run_sweeper(ctx: MykoServerContext) {
             sweep_messages(&ctx);
         }
         tick = tick.wrapping_add(1);
+    }
+}
+
+/// A session that has left the roster leaves its rooms too (MAR-19, from
+/// MUS-58). `del_by_id` doesn't cascade, so without this a reaped or ended
+/// session stayed a member of every room it was in, `everyone` included, and
+/// broadcasts counted it. A session that comes back is put back in its
+/// auto-rooms by the `auto_rooms` saga on its next Session SET; an adhoc room
+/// it had joined it must join again.
+///
+/// One exception: a session a later one may still take over (MAR-9) keeps its
+/// adhoc memberships, so the takeover can move them to its successor
+/// ([`crate::succession::awaiting_successor`]). They go once it's taken over,
+/// or once it can't be.
+pub fn sweep_memberships(ctx: &MykoServerContext) {
+    let (Some(members), Some(sessions)) = (
+        ctx.registry.get(RoomMember::ENTITY_NAME_STATIC),
+        ctx.registry.get(Session::ENTITY_NAME_STATIC),
+    ) else {
+        return;
+    };
+    let live: HashSet<Arc<str>> = sessions
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let adhoc: HashSet<Arc<str>> = ctx
+        .registry
+        .get(Room::ENTITY_NAME_STATIC)
+        .map(|rooms| {
+            rooms
+                .entries()
+                .materialize()
+                .get()
+                .into_iter()
+                .filter(|(_, item)| {
+                    downcast_item::<Room>(item).is_some_and(|r| matches!(r.kind, RoomKind::Adhoc))
+                })
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut awaiting: Option<HashSet<Arc<str>>> = None;
+    for (id, item) in members.entries().materialize().get() {
+        let Some(member) = downcast_item::<RoomMember>(&item) else {
+            continue;
+        };
+        if live.contains(&member.session_id.0) {
+            continue;
+        }
+        if adhoc.contains(&member.room_id.0)
+            && awaiting
+                .get_or_insert_with(|| {
+                    crate::succession::awaiting_successor(
+                        &crate::succession::internal_ctx(ctx),
+                        Utc::now().timestamp_millis(),
+                    )
+                })
+                .contains(&member.session_id.0)
+        {
+            continue;
+        }
+        match ctx.del_by_id(RoomMember::ENTITY_NAME_STATIC, &id) {
+            Ok(()) => log::info!(
+                "[cleanup] {} left {}: no longer on the roster",
+                member.session_id.0,
+                member.room_id.0
+            ),
+            Err(e) => log::warn!("[cleanup] removing room member {id} failed: {e}"),
+        }
     }
 }
 
@@ -369,6 +462,9 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
             log::warn!("[cleanup] del session {} failed: {}", id, e);
             continue;
         }
+        // Seen go now, not on the next tick's observation, so this tick's
+        // membership sweep already knows it may be taken over (MAR-19).
+        crate::succession::record_removed(&id, now_ms);
         disconnected_since.remove(&id);
     }
 }
@@ -731,6 +827,106 @@ mod tests {
             !ids.contains("project:stale"),
             "empty auto-room must be reaped"
         );
+    }
+
+    fn member_ids(ctx: &MykoServerContext) -> HashSet<String> {
+        ctx.registry
+            .get(RoomMember::ENTITY_NAME_STATIC)
+            .map(|s| {
+                s.entries()
+                    .materialize()
+                    .get()
+                    .into_iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// MAR-19: a session that ends leaves every room it was in, `everyone`
+    /// included, and an auto-room it was the last member of goes on the same
+    /// tick.
+    #[test]
+    fn a_session_off_the_roster_leaves_its_rooms() {
+        let ctx = setup();
+        set_hook_session(&ctx, "live", Utc::now().timestamp_millis());
+        set_hook_session(&ctx, "gone", Utc::now().timestamp_millis());
+        set_room(
+            &ctx,
+            "everyone",
+            RoomKind::Auto {
+                source: AutoSource::Everyone,
+            },
+        );
+        set_room(
+            &ctx,
+            "project:gone-only",
+            RoomKind::Auto {
+                source: AutoSource::Project {
+                    basename: "gone-only".into(),
+                },
+            },
+        );
+        set_room(&ctx, "design-sync", RoomKind::Adhoc);
+        set_member(&ctx, "everyone", "live");
+        set_member(&ctx, "everyone", "gone");
+        set_member(&ctx, "project:gone-only", "gone");
+        set_member(&ctx, "design-sync", "gone");
+
+        // The session ends; its memberships stay until the sweeper runs.
+        ctx.del_by_id(Session::ENTITY_NAME_STATIC, "gone")
+            .expect("DEL session");
+        sweep_memberships(&ctx);
+        sweep_rooms(&ctx);
+
+        let members = member_ids(&ctx);
+        assert_eq!(
+            members,
+            HashSet::from([RoomMember::make_id("everyone", "live")]),
+            "everyone lists only live sessions, and the ended one is in no room"
+        );
+        let rooms = room_ids(&ctx);
+        assert!(rooms.contains("everyone"));
+        assert!(rooms.contains("design-sync"), "an empty adhoc room stays");
+        assert!(
+            !rooms.contains("project:gone-only"),
+            "an emptied auto-room goes"
+        );
+    }
+
+    /// MAR-19: nothing is swept until the store has loaded. A membership
+    /// whose session hasn't replayed yet stays; once ready, the sweeper runs.
+    #[tokio::test]
+    async fn the_sweeper_waits_for_the_store_to_load() {
+        let ctx = setup();
+        set_hook_session(&ctx, "live", Utc::now().timestamp_millis());
+        set_room(&ctx, "design-sync", RoomKind::Adhoc);
+        set_member(&ctx, "design-sync", "not-replayed-yet");
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ready.clone();
+        let started = tokio::spawn(run_sweeper_when_ready(ctx.clone(), move || {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+
+        // The sweeper's first tick is immediate, so an ungated start would
+        // have dropped the membership by now.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            member_ids(&ctx).contains(&RoomMember::make_id("design-sync", "not-replayed-yet")),
+            "swept before the store had loaded"
+        );
+
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        started.await.expect("the sweeper starts once ready");
+        let mut gone = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if member_ids(&ctx).is_empty() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "once the store had loaded, the sweeper ran");
     }
 
     fn set_message(ctx: &MykoServerContext, id: &str, sent_at: i64) {
