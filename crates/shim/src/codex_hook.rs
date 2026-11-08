@@ -399,7 +399,10 @@ fn superseded(session_id: &str, parent: Option<u32>) -> bool {
 /// [`superseded`], reading the manifest under `home`.
 #[cfg(test)]
 fn superseded_under(home: &std::path::Path, session_id: &str, parent: u32) -> bool {
-    let current = crate::session_discovery::sid_from_claude_sessions_file(home, parent);
+    // An unprobed process: MAR-45's liveness check trusts what it can't read,
+    // so this exercises only the id comparison.
+    let unprobed = |_| crate::session_discovery::Liveness::default();
+    let current = crate::session_discovery::sid_from_claude_sessions_file(&unprobed, home, parent);
     id_moved(session_id, current.as_ref().map(|s| s.0.as_ref()))
 }
 
