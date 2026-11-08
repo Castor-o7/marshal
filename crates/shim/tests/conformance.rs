@@ -55,8 +55,8 @@ const QUIET_FOR: Duration = Duration::from_secs(4);
 /// listed. They're reported as `flaky` and never fail the suite either way,
 /// and they're checked before `KNOWN_FAILURES`, which may list them too.
 const FLAKY: &[(&str, &str, &str, &str)] = &[
-    // Muster's entries were all identity-takeover cells, which are n/a on
-    // Marshal until MAR-9.
+    // Muster's entries were identity-takeover cells on claude-tls (MUS-93),
+    // n/a here until Marshal has a TLS gate (MAR-23); MAR-8 tracks them.
 ];
 
 /// Cells expected to fail today, each with the story that fixes it. The
@@ -1906,12 +1906,8 @@ const MARSHAL_NOT_APPLICABLE: &[(&str, &str)] = &[
         "Marshal has no operator pause to resume (MUS-10)",
     ),
     (
-        "restart-keeps-identity",
-        "Marshal doesn't hand a restarted session its predecessor's nickname yet (MAR-9)",
-    ),
-    (
         "unread-mail-follows-a-restart",
-        "Marshal doesn't hand a successor its predecessor's mail yet (MAR-9)",
+        "Marshal doesn't hand a successor its predecessor's mail yet (muster's MUS-47)",
     ),
     (
         "restart-keeps-unread-mail-file",

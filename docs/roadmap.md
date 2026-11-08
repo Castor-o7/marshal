@@ -204,7 +204,8 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
 
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
-  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), and
+  write until it's registered (MUS-72, 78, 79), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
+  predecessor's nickname by harness and directory (MAR-9), and
   optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`

@@ -13,8 +13,8 @@ that ran:
 - the `pi`, `opencode` and `prime-agent` columns: stage 2, with MAR-10 and MAR-11;
 - `operator-pause-stops-wakes` and `resume-wakes-held-mail`: Marshal has no
   operator pause;
-- `restart-keeps-identity` and `unread-mail-follows-a-restart`: Marshal doesn't
-  hand a restarted session its predecessor's nickname or mail yet (MAR-9);
+- `unread-mail-follows-a-restart`: Marshal hands a restarted session its
+  predecessor's nickname (MAR-9) but not its mail yet (muster's MUS-47);
 - `restart-keeps-unread-mail-file`: Marshal has no file-backed store; the
   Postgres cells cover restarts.
 
