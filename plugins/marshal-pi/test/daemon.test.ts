@@ -24,11 +24,11 @@ describe("marshal-pi daemon fails open while disconnected", () => {
     expect(makeDaemon().isConnected()).toBe(false);
   });
 
-  test("drainInbox returns immediately while disconnected", async () => {
+  test("pullInbox returns immediately while disconnected", async () => {
     const daemon = makeDaemon();
 
     const outcome = await Promise.race([
-      daemon.drainInbox("ses_disconnected"),
+      daemon.pullInbox("ses_disconnected"),
       new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
     ]);
 

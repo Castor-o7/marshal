@@ -356,15 +356,25 @@ pub fn resolve_caller(
                 .is_some_and(|id| id.0.as_ref() == client_id)
         })
         .cloned()
-        .ok_or_else(|| {
-            caller_err(
-                ctx,
-                &format!(
-                    "caller (client {}) has no session on the roster — re-SET your Session and retry",
-                    client_id,
-                ),
-            )
-        })
+        .ok_or_else(|| caller_err(ctx, &unregistered_refusal(client_id)))
+}
+
+/// The stable code that starts `resolve_caller`'s refusal of a connection with
+/// no session bound to it (MAR-18, from muster's MUS-80). myko's
+/// `CommandError` carries only a message, so the code goes in it. The shim
+/// retries on the code, never on the wording after it.
+pub const UNREGISTERED_CODE: &str = "[unregistered]";
+
+/// The refusal for a connection whose client has no session on the roster.
+pub fn unregistered_refusal(client_id: &str) -> String {
+    format!(
+        "{UNREGISTERED_CODE} caller (client {client_id}) has no session on the roster — re-SET your Session and retry"
+    )
+}
+
+/// Whether `message` is [`unregistered_refusal`]'s, by its code.
+pub fn is_unregistered_refusal(message: &str) -> bool {
+    message.contains(UNREGISTERED_CODE)
 }
 
 fn caller_err(ctx: &CommandContext, message: &str) -> CommandError {

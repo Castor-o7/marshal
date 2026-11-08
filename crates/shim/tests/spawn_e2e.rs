@@ -14,6 +14,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::{
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
@@ -33,7 +35,6 @@ use myko::{
 };
 use myko_server::{BlackholePersister, MykoServer};
 
-const SHIM: &str = env!("CARGO_BIN_EXE_marshal-shim");
 const WAIT: Duration = Duration::from_secs(10);
 const SPAWNER_ID: &str = "the-spawner";
 /// A harness that records its directory, its `MARSHAL_AGENT_ID` and its daemon
@@ -273,7 +274,7 @@ impl Rig {
 
     fn shim_env(&self, address: &str, args: &[&str], env: &[(&str, &Path)]) -> std::process::Child {
         let home = self.dir.path().join("home");
-        Command::new(SHIM)
+        support::shim(support::shared_home())
             .args(args)
             .envs(env.iter().map(|(k, v)| (*k, *v)))
             .env_remove("TMUX")
