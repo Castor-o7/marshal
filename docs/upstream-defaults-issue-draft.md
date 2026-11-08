@@ -58,8 +58,9 @@ resource read that waits for registration (listed at the end).
   after missing the row twice at 5 s. So an agent's first send after a restart failed, and agents
   read that as "Marshal is broken".
 - **Fork:** MAR-43, Castor-o7/marshal#38, merged at `6fb0bfa56cdd9df056a34d3934b2019b2d335a2b`.
-  A follow-up, MAR-18 (#53, in review), gives the refusal a stable code, `[unregistered]`, so the
-  retry doesn't depend on the message's wording.
+  A follow-up, MAR-18 (Castor-o7/marshal#53, merged at
+  `efb1c6631a57d5da8a4dde8e02adfcbf358269d0`), gives the refusal a stable code, `[unregistered]`, so
+  the retry doesn't depend on the message's wording.
 - **Opt-out:** none.
 - **Risk for upstream users:** the wait is per write, not just the first. A session that never
   registers (misconfigured, or its registration refused) pays it on **every** write: up to 5 s
