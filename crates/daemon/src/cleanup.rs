@@ -6,7 +6,9 @@
 //!   is in the live `Client` store. When the client drops, a `STALE_AFTER`
 //!   grace covers reconnect blips, then the session is DEL'd. Tracking is
 //!   in-memory (`disconnected_since`); daemon restart resets it, giving
-//!   every reloaded session a fresh grace window.
+//!   every reloaded session a fresh grace window. A session holding
+//!   `/hook/wait` (a current `WakeWatcher`) isn't reaped while it waits, and
+//!   its grace starts again when the wait ends (MAR-6).
 //!
 //! - **Pull/hook sessions** (`client_id: None`): an HTTP-MCP agent that
 //!   registered via `/hook/session-register` or `/hook/session-start` has no
@@ -41,6 +43,13 @@ use myko::{core::item::Eventable, server::MykoServerContext, utils::downcast_ite
 /// it going stale).
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
 
+/// The furthest ahead a `WakeWatcher`'s `until` may lie and still keep a
+/// disconnected session (MAR-6). The hook listener writes `until` at most
+/// `hooks::WAKE_WATCHER_TTL_MS` ahead. Any connected client can write a
+/// watcher, so a record further out than that isn't the listener's, and it
+/// mustn't keep a dead session forever.
+const HELD_WAIT_HORIZON_MS: i64 = crate::hooks::WAKE_WATCHER_TTL_MS;
+
 /// Activity backstop for pull/hook sessions (`client_id: None`). They have no
 /// WS client whose loss marks them dead, and `SessionEnd` only fires on a
 /// clean exit — a crashed or discarded Codex/hook agent leaves its row
@@ -74,8 +83,25 @@ const MESSAGE_SWEEP_EVERY: u64 = 100;
 /// (lower) vs. wake-ups per minute (higher).
 pub const TICK_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Run the sweeper forever. Spawn this on a tokio task and forget it.
-pub async fn run_sweeper(ctx: MykoServerContext) {
+/// How often [`run_sweeper_when_ready`] checks, before it starts, whether the
+/// store has loaded.
+const READY_POLL: Duration = Duration::from_millis(100);
+
+/// Start the sweeper once `ready` says the store has loaded, on a task of its
+/// own, and return. This is the only way to start it (MAR-19): the sweeper
+/// drops memberships whose session isn't on the roster, so a sweep while myko
+/// is still replaying Postgres would find a membership before its session
+/// and drop it, on every restart. The daemon passes `MykoServer::is_ready`.
+pub async fn run_sweeper_when_ready(ctx: MykoServerContext, ready: impl Fn() -> bool) {
+    while !ready() {
+        tokio::time::sleep(READY_POLL).await;
+    }
+    log::info!("marshal-daemon: the store is loaded; starting the cleanup sweeper");
+    tokio::spawn(run_sweeper(ctx));
+}
+
+/// Run the sweeper forever. Started only by [`run_sweeper_when_ready`].
+async fn run_sweeper(ctx: MykoServerContext) {
     let mut disconnected_since: HashMap<Arc<str>, Instant> = HashMap::new();
     let mut interval = tokio::time::interval(TICK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -84,6 +110,14 @@ pub async fn run_sweeper(ctx: MykoServerContext) {
     loop {
         interval.tick().await;
         sweep_once(&ctx, &mut disconnected_since);
+        crate::succession::recheck_pending(
+            &crate::succession::internal_ctx(&ctx),
+            Utc::now().timestamp_millis(),
+        );
+        // After succession, which moves a dead predecessor's adhoc
+        // memberships to its successor, and before the rooms, so a room its
+        // last live member just left goes this tick (MAR-19).
+        sweep_memberships(&ctx);
         sweep_rooms(&ctx);
         sweep_wake_watchers(&ctx);
         // Prune old messages on the first tick (boot cleanup) and every
@@ -93,6 +127,78 @@ pub async fn run_sweeper(ctx: MykoServerContext) {
             sweep_messages(&ctx);
         }
         tick = tick.wrapping_add(1);
+    }
+}
+
+/// A session that has left the roster leaves its rooms too (MAR-19, from
+/// MUS-58). `del_by_id` doesn't cascade, so without this a reaped or ended
+/// session stayed a member of every room it was in, `everyone` included, and
+/// broadcasts counted it. A session that comes back is put back in its
+/// auto-rooms by the `auto_rooms` saga on its next Session SET; an adhoc room
+/// it had joined it must join again.
+///
+/// One exception: a session a later one may still take over (MAR-9) keeps its
+/// adhoc memberships, so the takeover can move them to its successor
+/// ([`crate::succession::awaiting_successor`]). They go once it's taken over,
+/// or once it can't be.
+pub fn sweep_memberships(ctx: &MykoServerContext) {
+    let (Some(members), Some(sessions)) = (
+        ctx.registry.get(RoomMember::ENTITY_NAME_STATIC),
+        ctx.registry.get(Session::ENTITY_NAME_STATIC),
+    ) else {
+        return;
+    };
+    let live: HashSet<Arc<str>> = sessions
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let adhoc: HashSet<Arc<str>> = ctx
+        .registry
+        .get(Room::ENTITY_NAME_STATIC)
+        .map(|rooms| {
+            rooms
+                .entries()
+                .materialize()
+                .get()
+                .into_iter()
+                .filter(|(_, item)| {
+                    downcast_item::<Room>(item).is_some_and(|r| matches!(r.kind, RoomKind::Adhoc))
+                })
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut awaiting: Option<HashSet<Arc<str>>> = None;
+    for (id, item) in members.entries().materialize().get() {
+        let Some(member) = downcast_item::<RoomMember>(&item) else {
+            continue;
+        };
+        if live.contains(&member.session_id.0) {
+            continue;
+        }
+        if adhoc.contains(&member.room_id.0)
+            && awaiting
+                .get_or_insert_with(|| {
+                    crate::succession::awaiting_successor(
+                        &crate::succession::internal_ctx(ctx),
+                        Utc::now().timestamp_millis(),
+                    )
+                })
+                .contains(&member.session_id.0)
+        {
+            continue;
+        }
+        match ctx.del_by_id(RoomMember::ENTITY_NAME_STATIC, &id) {
+            Ok(()) => log::info!(
+                "[cleanup] {} left {}: no longer on the roster",
+                member.session_id.0,
+                member.room_id.0
+            ),
+            Err(e) => log::warn!("[cleanup] removing room member {id} failed: {e}"),
+        }
     }
 }
 
@@ -112,8 +218,11 @@ fn sweep_wake_watchers(ctx: &MykoServerContext) {
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    for (id, _) in watchers.entries().materialize().get() {
-        if !live.contains(&id)
+    for (id, item) in watchers.entries().materialize().get() {
+        // A bridge's record names its session; a held wait's is keyed by it (MAR-4).
+        let session = downcast_item::<WakeWatcher>(&item)
+            .map_or_else(|| id.clone(), |w| Arc::from(w.session()));
+        if !live.contains(&session)
             && let Err(e) = ctx.del_by_id(WakeWatcher::ENTITY_NAME_STATIC, &id)
         {
             log::warn!("[cleanup] removing wake watcher {id} failed: {e}");
@@ -276,6 +385,19 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
         .collect();
 
     let now = Instant::now();
+    let now_ms = Utc::now().timestamp_millis();
+    // MUS-3: what succession needs to tell a dead predecessor from a live one.
+    let rows: Vec<(Arc<str>, Option<Arc<str>>)> = session_store
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .filter_map(|(id, item)| {
+            downcast_item::<Session>(&item).map(|s| (id, s.client_id.as_ref().map(|c| c.0.clone())))
+        })
+        .collect();
+    crate::succession::observe(&rows, &live_client_ids, now_ms);
+    let held = held_waits(ctx, now_ms);
     let mut to_delete: Vec<Arc<str>> = Vec::new();
     let mut still_disconnected: HashSet<Arc<str>> = HashSet::new();
 
@@ -304,13 +426,18 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
                 .flatten()
                 .max()
                 .unwrap_or(0);
-                let now_ms = Utc::now().timestamp_millis();
                 if now_ms.saturating_sub(last_signal_ms) >= PULL_STALE_AFTER.as_millis() as i64 {
                     to_delete.push(id);
                 }
             }
             // WS shim session bound to a live client: healthy.
             Some(cid) if live_client_ids.contains(&cid.0) => {
+                disconnected_since.remove(&id);
+            }
+            // WS shim session whose client has gone, but which is holding
+            // `/hook/wait`: the harness is alive and waiting for mail, so
+            // keep it (MAR-6). Its grace starts again when the wait ends.
+            Some(_) if held.contains(&id) => {
                 disconnected_since.remove(&id);
             }
             // WS shim session whose client has gone: reconnect grace.
@@ -334,8 +461,30 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
             log::warn!("[cleanup] del session {} failed: {}", id, e);
             continue;
         }
+        // Seen go now, not on the next tick's observation, so this tick's
+        // membership sweep already knows it may be taken over (MAR-19).
+        crate::succession::record_removed(&id, now_ms);
         disconnected_since.remove(&id);
     }
+}
+
+/// Sessions with a held wait that counts now: a `WakeWatcher` whose `until`
+/// is in the future but within `HELD_WAIT_HORIZON_MS`.
+fn held_waits(ctx: &MykoServerContext, now_ms: i64) -> HashSet<Arc<str>> {
+    let Some(store) = ctx.registry.get(WakeWatcher::ENTITY_NAME_STATIC) else {
+        return HashSet::new();
+    };
+    store
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .filter_map(|(_, item)| {
+            let w = downcast_item::<WakeWatcher>(&item)?;
+            let ahead = w.until.saturating_sub(now_ms);
+            (ahead > 0 && ahead <= HELD_WAIT_HORIZON_MS).then(|| Arc::from(w.session()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -385,6 +534,8 @@ mod tests {
             project: None,
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         };
         let event = MEvent::from_item(&session, MEventType::SET, &Uuid::new_v4().to_string());
         ctx.apply_event_batch(vec![event])
@@ -430,6 +581,111 @@ mod tests {
         };
         let ev = MEvent::from_item(&client, MEventType::SET, &Uuid::new_v4().to_string());
         ctx.apply_event_batch(vec![ev]).expect("apply Client SET");
+    }
+
+    fn set_ws_session(ctx: &MykoServerContext, id: &str, client: &str) {
+        let session = Session {
+            id: SessionId(Arc::from(id)),
+            client_id: Some(myko::entities::client::ClientId(Arc::from(client))),
+            agent_id: None,
+            pid: 0,
+            cwd: "/repo".into(),
+            git_branch: None,
+            current_task: None,
+            session_name: None,
+            activity: None,
+            kind: None,
+            connected_at: 0,
+            last_activity_at: None,
+            last_tool: None,
+            last_tool_at: None,
+            operator: None,
+            host: None,
+            project: None,
+            channels_enabled: None,
+            acks_pushes: None,
+            harness: None,
+            identity: None,
+        };
+        let event = MEvent::from_item(&session, MEventType::SET, &Uuid::new_v4().to_string());
+        ctx.apply_event_batch(vec![event])
+            .expect("apply WS Session SET");
+    }
+
+    /// A held `/hook/wait`'s record: keyed by the session id, as the hook
+    /// listener writes it.
+    fn set_held_wait(ctx: &MykoServerContext, session: &str, until: i64) {
+        let watcher = WakeWatcher {
+            id: marshal_entities::WakeWatcherId(Arc::from(session)),
+            until,
+            session_id: None,
+        };
+        let event = MEvent::from_item(&watcher, MEventType::SET, &Uuid::new_v4().to_string());
+        ctx.apply_event_batch(vec![event])
+            .expect("apply WakeWatcher SET");
+    }
+
+    /// Sweep `id` as a WS session whose client dropped longer ago than the
+    /// grace, and say whether it survived.
+    fn survives_a_drop_past_the_grace(ctx: &MykoServerContext, id: &str) -> bool {
+        let dropped = Instant::now()
+            .checked_sub(STALE_AFTER + Duration::from_secs(1))
+            .expect("monotonic clock is past the grace");
+        let mut disconnected_since = HashMap::from([(Arc::<str>::from(id), dropped)]);
+        sweep_once(ctx, &mut disconnected_since);
+        session_ids(ctx).contains(id)
+    }
+
+    #[test]
+    fn sweep_keeps_a_dropped_session_holding_its_wait() {
+        let ctx = setup();
+        set_client(&ctx, "other-client");
+        set_ws_session(&ctx, "waiting", "gone-client");
+        set_held_wait(&ctx, "waiting", Utc::now().timestamp_millis() + 60_000);
+
+        let dropped = Instant::now()
+            .checked_sub(STALE_AFTER + Duration::from_secs(1))
+            .unwrap();
+        let mut disconnected_since = HashMap::from([(Arc::<str>::from("waiting"), dropped)]);
+        sweep_once(&ctx, &mut disconnected_since);
+
+        assert!(
+            session_ids(&ctx).contains("waiting"),
+            "a session holding /hook/wait must survive its WS dropping past the grace (MAR-6)"
+        );
+        assert!(
+            disconnected_since.is_empty(),
+            "the grace starts again once the wait ends"
+        );
+    }
+
+    #[test]
+    fn sweep_reaps_a_dropped_session_with_no_current_wait() {
+        let ctx = setup();
+        set_client(&ctx, "other-client");
+        set_ws_session(&ctx, "no-wait", "gone-client");
+        set_ws_session(&ctx, "lapsed", "gone-client");
+        set_held_wait(&ctx, "lapsed", Utc::now().timestamp_millis() - 1);
+
+        assert!(!survives_a_drop_past_the_grace(&ctx, "no-wait"));
+        assert!(
+            !survives_a_drop_past_the_grace(&ctx, "lapsed"),
+            "a wait that has stopped counting keeps nothing"
+        );
+    }
+
+    #[test]
+    fn sweep_ignores_a_wait_record_further_out_than_the_listener_writes() {
+        let ctx = setup();
+        set_client(&ctx, "other-client");
+        set_ws_session(&ctx, "forged", "gone-client");
+        let far = Utc::now().timestamp_millis() + HELD_WAIT_HORIZON_MS + 60_000;
+        set_held_wait(&ctx, "forged", far);
+
+        assert!(
+            !survives_a_drop_past_the_grace(&ctx, "forged"),
+            "a client-written record can't keep a dead session forever"
+        );
     }
 
     #[test]
@@ -550,6 +806,106 @@ mod tests {
             !ids.contains("project:stale"),
             "empty auto-room must be reaped"
         );
+    }
+
+    fn member_ids(ctx: &MykoServerContext) -> HashSet<String> {
+        ctx.registry
+            .get(RoomMember::ENTITY_NAME_STATIC)
+            .map(|s| {
+                s.entries()
+                    .materialize()
+                    .get()
+                    .into_iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// MAR-19: a session that ends leaves every room it was in, `everyone`
+    /// included, and an auto-room it was the last member of goes on the same
+    /// tick.
+    #[test]
+    fn a_session_off_the_roster_leaves_its_rooms() {
+        let ctx = setup();
+        set_hook_session(&ctx, "live", Utc::now().timestamp_millis());
+        set_hook_session(&ctx, "gone", Utc::now().timestamp_millis());
+        set_room(
+            &ctx,
+            "everyone",
+            RoomKind::Auto {
+                source: AutoSource::Everyone,
+            },
+        );
+        set_room(
+            &ctx,
+            "project:gone-only",
+            RoomKind::Auto {
+                source: AutoSource::Project {
+                    basename: "gone-only".into(),
+                },
+            },
+        );
+        set_room(&ctx, "design-sync", RoomKind::Adhoc);
+        set_member(&ctx, "everyone", "live");
+        set_member(&ctx, "everyone", "gone");
+        set_member(&ctx, "project:gone-only", "gone");
+        set_member(&ctx, "design-sync", "gone");
+
+        // The session ends; its memberships stay until the sweeper runs.
+        ctx.del_by_id(Session::ENTITY_NAME_STATIC, "gone")
+            .expect("DEL session");
+        sweep_memberships(&ctx);
+        sweep_rooms(&ctx);
+
+        let members = member_ids(&ctx);
+        assert_eq!(
+            members,
+            HashSet::from([RoomMember::make_id("everyone", "live")]),
+            "everyone lists only live sessions, and the ended one is in no room"
+        );
+        let rooms = room_ids(&ctx);
+        assert!(rooms.contains("everyone"));
+        assert!(rooms.contains("design-sync"), "an empty adhoc room stays");
+        assert!(
+            !rooms.contains("project:gone-only"),
+            "an emptied auto-room goes"
+        );
+    }
+
+    /// MAR-19: nothing is swept until the store has loaded. A membership
+    /// whose session hasn't replayed yet stays; once ready, the sweeper runs.
+    #[tokio::test]
+    async fn the_sweeper_waits_for_the_store_to_load() {
+        let ctx = setup();
+        set_hook_session(&ctx, "live", Utc::now().timestamp_millis());
+        set_room(&ctx, "design-sync", RoomKind::Adhoc);
+        set_member(&ctx, "design-sync", "not-replayed-yet");
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ready.clone();
+        let started = tokio::spawn(run_sweeper_when_ready(ctx.clone(), move || {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+
+        // The sweeper's first tick is immediate, so an ungated start would
+        // have dropped the membership by now.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            member_ids(&ctx).contains(&RoomMember::make_id("design-sync", "not-replayed-yet")),
+            "swept before the store had loaded"
+        );
+
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        started.await.expect("the sweeper starts once ready");
+        let mut gone = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if member_ids(&ctx).is_empty() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "once the store had loaded, the sweeper ran");
     }
 
     fn set_message(ctx: &MykoServerContext, id: &str, sent_at: i64) {

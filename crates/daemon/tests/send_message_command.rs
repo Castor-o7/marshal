@@ -67,6 +67,8 @@ fn session(id: &str, client_id: Option<&str>) -> Session {
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -125,6 +127,7 @@ fn offline_recipient_succeeds_and_persists_for_pull() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "hi".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let result = cmd
         .execute(cmd_ctx(&ctx, Some("c-sender")))
@@ -154,6 +157,7 @@ fn set_waiter(ctx: &MykoServerContext, id: &str) {
     let watcher = WakeWatcher {
         id: WakeWatcherId(Arc::from(id)),
         until: chrono::Utc::now().timestamp_millis() + 60_000,
+        session_id: None,
     };
     let ev = MEvent::from_item(&watcher, MEventType::SET, &Uuid::new_v4().to_string());
     ctx.apply_event_batch(vec![ev])
@@ -166,6 +170,7 @@ fn send_to_recipient(ctx: &MykoServerContext) -> SendMessageResult {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "hi".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(ctx, Some("c-sender")))
     .expect("send")
@@ -205,6 +210,36 @@ fn a_recipient_with_a_waiter_expects_a_wake() {
 }
 
 #[test]
+fn a_pull_recipient_with_a_waiter_expects_a_wake() {
+    // A session kept after its connection dropped has no client but
+    // still holds `/hook/wait`, so the message will wake it.
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    let watcher = WakeWatcher {
+        id: WakeWatcherId(Arc::from("recipient")),
+        until: chrono::Utc::now().timestamp_millis() + 60_000,
+        session_id: None,
+    };
+    let ev = MEvent::from_item(&watcher, MEventType::SET, &Uuid::new_v4().to_string());
+    ctx.apply_event_batch(vec![ev])
+        .expect("apply WakeWatcher SET");
+
+    let cmd = SendMessage {
+        response_required: false,
+        to_session_id: SessionId(Arc::from("recipient")),
+        body: "hi".into(),
+        as_session: None,
+        idempotency_key: None,
+    };
+    let result = cmd.execute(cmd_ctx(&ctx, Some("c-sender"))).expect("send");
+
+    assert_eq!(result.live_push, LivePushStatus::Unavailable);
+    assert_eq!(result.wake, WakeStatus::Expected);
+    assert_eq!(message_count(&ctx), 1);
+}
+
+#[test]
 fn stale_binding_succeeds_and_persists() {
     // A recipient whose `client_id` points at a connection that is no
     // longer live (post-bounce). The best-effort push finds no live client
@@ -218,6 +253,7 @@ fn stale_binding_succeeds_and_persists() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "hi".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let result = cmd
         .execute(cmd_ctx(&ctx, Some("c-sender")))
@@ -243,6 +279,7 @@ fn self_identified_sender_via_as_session_succeeds() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "from http".into(),
         as_session: Some(SessionId(Arc::from("sender"))),
+        idempotency_key: None,
     };
     let result = cmd
         .execute(cmd_ctx(&ctx, None))
@@ -293,6 +330,7 @@ fn unknown_recipient_errors_and_does_not_persist() {
         to_session_id: SessionId(Arc::from("does-not-exist")),
         body: "?".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let err = cmd
         .execute(cmd_ctx(&ctx, Some("c-sender")))
@@ -322,6 +360,7 @@ fn nickname_resolves_server_side() {
         to_session_id: SessionId(Arc::from(nick.as_str())),
         body: "hi".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let result = cmd
         .execute(cmd_ctx(&ctx, Some("c-sender")))
@@ -354,12 +393,146 @@ fn direct_message_ids_are_uuid_v7() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "hi".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send succeeds");
 
     let id = Uuid::parse_str(result.message_id.0.as_ref()).expect("message id is a UUID");
     assert_eq!(id.get_version_num(), 7);
+}
+
+#[test]
+fn a_retry_with_the_same_key_stores_one_message() {
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    let send = |body: &str, key: &str| {
+        SendMessage {
+            response_required: false,
+            to_session_id: SessionId(Arc::from("recipient")),
+            body: body.into(),
+            as_session: None,
+            idempotency_key: Some(key.into()),
+        }
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+    };
+
+    let first = send("hi", "k1").expect("first send succeeds");
+    let retry = send("hi", "k1").expect("a retry succeeds");
+    assert_eq!(retry.message_id, first.message_id);
+    assert_eq!(retry.sent_at, first.sent_at);
+    assert_eq!(retry.live_push, LivePushStatus::Unknown);
+    assert_eq!(only_message(&ctx).body, "hi");
+
+    assert!(
+        send("different", "k1").is_err(),
+        "a reused key can't carry a new message"
+    );
+    send("hi", "k2").expect("a new key is a new message");
+    assert_eq!(message_count(&ctx), 2);
+}
+
+fn keyed(to: &str, body: &str, response_required: bool, key: &str) -> SendMessage {
+    SendMessage {
+        response_required,
+        to_session_id: SessionId(Arc::from(to)),
+        body: body.into(),
+        as_session: None,
+        idempotency_key: Some(key.into()),
+    }
+}
+
+#[test]
+fn racing_attempts_with_the_same_key_store_one_message() {
+    // A retry sent while the timed-out first attempt is still running: both
+    // look for the first send at once, and only one may store and push.
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    let start = std::sync::Barrier::new(8);
+    let results: Vec<SendMessageResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                s.spawn(|| {
+                    start.wait();
+                    keyed("recipient", "hi", false, "race")
+                        .execute(cmd_ctx(&ctx, Some("c-sender")))
+                        .expect("every attempt succeeds")
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(
+        results
+            .windows(2)
+            .all(|w| w[0].message_id == w[1].message_id),
+        "one message id"
+    );
+    // A fresh send reports its push (`unavailable` here, with no live client);
+    // one that found the first send reports `unknown`. Two fresh sends would
+    // both store over the same id and both push, so the count can't show it.
+    let fresh = results
+        .iter()
+        .filter(|r| r.live_push != LivePushStatus::Unknown)
+        .count();
+    assert_eq!(fresh, 1, "exactly one attempt stored and pushed");
+    assert_eq!(message_count(&ctx), 1);
+}
+
+#[test]
+fn a_retry_finds_its_send_after_the_recipient_left_the_roster() {
+    // The retry isn't resolved again: the token may now name another session,
+    // or none, and it's still the same send.
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    let gone = session("recipient", None);
+    set_session(&ctx, &gone);
+    let first = keyed("recipient", "hi", false, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("first send succeeds");
+    let del = MEvent::from_item(&gone, MEventType::DEL, &Uuid::new_v4().to_string());
+    ctx.apply_event_batch(vec![del]).expect("apply Session DEL");
+
+    let retry = keyed("recipient", "hi", false, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("the retry finds the stored send");
+    assert_eq!(retry.message_id, first.message_id);
+    assert_eq!(retry.to_session_id, first.to_session_id);
+    assert_eq!(message_count(&ctx), 1);
+}
+
+#[test]
+fn a_key_reused_with_another_response_required_is_refused() {
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    keyed("recipient", "hi", false, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("first send succeeds");
+    let err = keyed("recipient", "hi", true, "k1")
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect_err("a changed response_required isn't the same message");
+    assert!(err.message.contains("different message"), "{}", err.message);
+    assert_eq!(message_count(&ctx), 1);
+}
+
+#[test]
+fn an_empty_or_overlong_key_is_refused() {
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &session("recipient", None));
+    for key in [String::new(), "  ".into(), "k".repeat(129)] {
+        let err = keyed("recipient", "hi", false, &key)
+            .execute(cmd_ctx(&ctx, Some("c-sender")))
+            .expect_err("the key is refused");
+        assert!(err.message.contains("idempotencyKey"), "{}", err.message);
+    }
+    keyed("recipient", "hi", false, &"k".repeat(128))
+        .execute(cmd_ctx(&ctx, Some("c-sender")))
+        .expect("a 128-byte key is accepted");
+    assert_eq!(message_count(&ctx), 1);
 }
 
 #[test]
@@ -371,19 +544,20 @@ fn operator_token_routes_to_the_humans_most_recently_active_agent() {
     set_session(&ctx, &session("sender", Some("c-sender")));
 
     let mut idle = session("max-idle", Some("c-idle"));
-    idle.operator = Some("max@lucid.rocks".into());
+    idle.operator = Some("operator@example.com".into());
     idle.last_activity_at = Some(1_000);
     let mut active = session("max-active", Some("c-active"));
-    active.operator = Some("max@lucid.rocks".into());
+    active.operator = Some("operator@example.com".into());
     active.last_activity_at = Some(9_000);
     set_session(&ctx, &idle);
     set_session(&ctx, &active);
 
     let cmd = SendMessage {
         response_required: false,
-        to_session_id: SessionId(Arc::from("max@lucid.rocks")),
+        to_session_id: SessionId(Arc::from("operator@example.com")),
         body: "your call on the redeploy".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let result = cmd
         .execute(cmd_ctx(&ctx, Some("c-sender")))
@@ -400,7 +574,7 @@ fn operator_token_routes_to_the_humans_most_recently_active_agent() {
     // its operator rather than treating it as ordinary peer chatter.
     assert_eq!(
         msg.to_operator.as_deref(),
-        Some("max@lucid.rocks"),
+        Some("operator@example.com"),
         "operator-tier routing must stamp `to_operator` (human-addressed)",
     );
 }
@@ -414,19 +588,20 @@ fn operator_routing_prefers_a_live_agent_and_accepts_the_op_prefix() {
     set_session(&ctx, &session("sender", Some("c-sender")));
 
     let mut disconnected = session("max-disc", None); // client_id None ⇒ not live
-    disconnected.operator = Some("max@lucid.rocks".into());
+    disconnected.operator = Some("operator@example.com".into());
     disconnected.last_activity_at = Some(9_000);
     let mut live = session("max-live", Some("c-live"));
-    live.operator = Some("max@lucid.rocks".into());
+    live.operator = Some("operator@example.com".into());
     live.last_activity_at = Some(5_000);
     set_session(&ctx, &disconnected);
     set_session(&ctx, &live);
 
     let cmd = SendMessage {
         response_required: false,
-        to_session_id: SessionId(Arc::from("op:max@lucid.rocks")),
+        to_session_id: SessionId(Arc::from("op:operator@example.com")),
         body: "ping".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let result = cmd
         .execute(cmd_ctx(&ctx, Some("c-sender")))
@@ -450,6 +625,7 @@ fn caller_without_session_errors() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "?".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let err = cmd
         .execute(cmd_ctx(&ctx, Some("c-orphan")))
@@ -460,6 +636,14 @@ fn caller_without_session_errors() {
         "error should name the unbound client id, got: {}",
         err.message,
     );
+    // MAR-18: the shim retries this refusal by its code, so the daemon's
+    // refusal must start with it.
+    assert!(
+        err.message.starts_with(marshal_entities::UNREGISTERED_CODE),
+        "{}",
+        err.message
+    );
+    assert!(marshal_entities::is_unregistered_refusal(&err.message));
     assert_eq!(message_count(&ctx), 0);
 }
 
@@ -474,6 +658,7 @@ fn unidentified_caller_errors() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "?".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let err = cmd
         .execute(cmd_ctx(&ctx, None))
@@ -485,5 +670,51 @@ fn unidentified_caller_errors() {
         "error should explain the missing identity, got: {}",
         err.message,
     );
+    assert_eq!(message_count(&ctx), 0);
+}
+
+fn claiming(id: &str, role: &str) -> Session {
+    let mut s = session(id, Some(&format!("c-{id}")));
+    s.identity = Some(role.into());
+    s
+}
+
+fn send_to(ctx: &MykoServerContext, to: &str) -> Result<SendMessageResult, String> {
+    SendMessage {
+        response_required: false,
+        to_session_id: SessionId(Arc::from(to)),
+        body: "for the role".into(),
+        as_session: None,
+        idempotency_key: None,
+    }
+    .execute(cmd_ctx(ctx, Some("c-sender")))
+    .map_err(|e| e.message)
+}
+
+#[test]
+fn a_role_claimed_by_one_session_reaches_it() {
+    // MAR-9 (from MUS-3): the watchman can be reached by role
+    // (`MARSHAL_IDENTITY=watchman`).
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &claiming("the-watchman", "watchman"));
+    send_to(&ctx, "watchman").expect("a send to a claimed role");
+    let m = only_message(&ctx);
+    assert_eq!(
+        m.to_session_id.as_ref().map(|s| s.0.as_ref()),
+        Some("the-watchman")
+    );
+}
+
+#[test]
+fn a_role_claimed_by_two_sessions_is_refused() {
+    // A role is a claim, not attested: with two claimants, neither is
+    // guessed at, and the sender is told to name one.
+    let ctx = setup();
+    set_session(&ctx, &session("sender", Some("c-sender")));
+    set_session(&ctx, &claiming("first", "watchman"));
+    set_session(&ctx, &claiming("second", "watchman"));
+    let err = send_to(&ctx, "watchman").expect_err("an ambiguous role is refused");
+    assert!(err.contains("claimed by 2 sessions"), "{err}");
     assert_eq!(message_count(&ctx), 0);
 }

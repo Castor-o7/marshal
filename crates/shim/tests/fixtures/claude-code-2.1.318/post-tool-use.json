@@ -1,0 +1,1 @@
+{"session_id":"{{session_id}}","transcript_path":"/tmp/conformance/.claude/projects/conformance/{{session_id}}.jsonl","cwd":"{{cwd}}","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"true","description":"No-op"},"tool_response":{"stdout":"","stderr":"","interrupted":false,"isImage":false}}

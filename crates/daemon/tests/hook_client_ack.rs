@@ -22,13 +22,6 @@ use uuid::Uuid;
 
 const RECIPIENT: &str = r#"{"session_id":"recipient","cwd":"/work/repo"}"#;
 
-fn pick_free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("pick free port");
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
 fn sender() -> Session {
     Session {
         id: SessionId(Arc::from("sender")),
@@ -50,6 +43,8 @@ fn sender() -> Session {
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -74,6 +69,7 @@ fn send(ctx: &MykoServerContext, body: &str) {
         to_session_id: SessionId(Arc::from("recipient")),
         body: body.into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(ctx))
     .expect("send to recipient");
@@ -133,7 +129,11 @@ fn start_stoppable() -> (
     let event = MEvent::from_item(&sender(), MEventType::SET, &Uuid::new_v4().to_string());
     ctx.apply_event_batch(vec![event]).expect("seed sender");
 
-    let addr: SocketAddr = format!("127.0.0.1:{}", pick_free_port()).parse().unwrap();
+    // Bound here and handed to the listener, so no other process can take
+    // the port between picking and binding it (MAR-21).
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hook listener");
+    std_listener.set_nonblocking(true).unwrap();
+    let addr: SocketAddr = std_listener.local_addr().unwrap();
     let listener_ctx = ctx.clone();
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     thread::spawn(move || {
@@ -142,7 +142,9 @@ fn start_stoppable() -> (
             .build()
             .expect("rt");
         rt.block_on(async move {
-            let _ = daemon::http_listener::run_until(addr, Arc::new(listener_ctx), stop_rx).await;
+            let listener = tokio::net::TcpListener::from_std(std_listener).expect("hook listener");
+            let _ =
+                daemon::http_listener::serve_until(listener, Arc::new(listener_ctx), stop_rx).await;
         });
     });
     let deadline = Instant::now() + Duration::from_secs(5);

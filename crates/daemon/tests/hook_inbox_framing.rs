@@ -43,6 +43,8 @@ fn sender() -> Session {
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -64,6 +66,7 @@ fn send(ctx: &MykoServerContext, body: &str) {
         to_session_id: SessionId(Arc::from("recipient")),
         body: body.into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx)
     .expect("send to recipient");

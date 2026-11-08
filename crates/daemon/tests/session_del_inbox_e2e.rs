@@ -44,15 +44,11 @@ impl ServerHandle {
     }
 }
 
-fn pick_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pick free port");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-fn spawn_server(bind: SocketAddr) -> ServerHandle {
+/// Start a myko server on `bind`, or say why it couldn't: most likely another
+/// process took the port after it was picked (MAR-21).
+fn try_spawn_server(bind: SocketAddr) -> Result<ServerHandle, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<MykoServerContext>(1);
+    let (failed_tx, failed_rx) = std::sync::mpsc::channel::<String>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
     let join = thread::spawn(move || {
@@ -70,7 +66,11 @@ fn spawn_server(bind: SocketAddr) -> ServerHandle {
             );
             ready_tx.send(server.ctx()).expect("send ctx");
             tokio::select! {
-                _ = server.run() => {}
+                r = server.run() => {
+                    if let Err(e) = r {
+                        let _ = failed_tx.send(e.to_string());
+                    }
+                }
                 _ = tokio::task::spawn_blocking(move || {
                     let _ = shutdown_rx.recv();
                 }) => {}
@@ -82,12 +82,53 @@ fn spawn_server(bind: SocketAddr) -> ServerHandle {
     let ctx = ready_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("server thread came up");
+    // A port another process holds accepts connections too, so a connect
+    // alone doesn't say the server bound it. Its bind failure comes at once,
+    // so it's waited for a moment after the port answers.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(bind).is_err() {
+        if let Ok(why) = failed_rx.try_recv() {
+            // The thread's runtime waits on the shutdown channel as it ends.
+            drop(shutdown_tx);
+            let _ = join.join();
+            return Err(why);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("nothing listening on {bind}"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if let Ok(why) = failed_rx.recv_timeout(Duration::from_millis(200)) {
+        // The thread's runtime waits on the shutdown channel as it ends.
+        drop(shutdown_tx);
+        let _ = join.join();
+        return Err(why);
+    }
 
-    ServerHandle {
+    Ok(ServerHandle {
         ctx,
         shutdown: Some(shutdown_tx),
         join: Some(join),
+    })
+}
+
+/// A myko server on a free port. The port is picked by binding port 0 and
+/// closing it, so another process can take it before the server binds it:
+/// then it's picked again (MAR-21).
+fn spawn_server_on_free_port() -> (ServerHandle, SocketAddr) {
+    let mut lost = Vec::new();
+    for _ in 0..5 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("pick a free port")
+            .port();
+        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        match try_spawn_server(bind) {
+            Ok(server) => return (server, bind),
+            Err(why) => lost.push(format!("{bind}: {why}")),
+        }
     }
+    panic!("no free port held for the myko server: {lost:?}");
 }
 
 fn wait_for(label: &str, mut f: impl FnMut() -> bool) {
@@ -122,6 +163,8 @@ fn make_session(id: &str) -> Session {
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -174,10 +217,8 @@ fn del_session_then_reregister_does_not_reinject_acked_direct_dm() {
     marshal_entities::link();
     daemon::link();
 
-    let port = pick_free_port();
-    let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (server, bind) = spawn_server_on_free_port();
     let addr = format!("ws://{bind}");
-    let server = spawn_server(bind);
 
     let client_a = MykoClient::new();
     client_a.set_protocol(MykoProtocol::JSON);
@@ -222,6 +263,7 @@ fn del_session_then_reregister_does_not_reinject_acked_direct_dm() {
         to_session_id: SessionId(Arc::from("sess-bravo")),
         body: "the one and only direct DM".into(),
         as_session: None,
+        idempotency_key: None,
     };
     let response_cell = client_a.send_command::<SendMessage, SendMessageResult>(&cmd);
     {
