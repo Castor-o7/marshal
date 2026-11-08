@@ -128,7 +128,7 @@ launcher.
   muster's terminal commands #168 doesn't cover is listed, and each item is ported or dropped with a
   reason. The list and Josh's choices (2026-11-06) are in `docs/muster-terminal-gap.md`: `doctor` is
   ported as MAR-36, and the rest is dropped or already covered.
-- [ ] **MAR-36: Goal 3: `marshal-shim doctor`, a read-only health check.** From muster's `doctor`
+- [x] **MAR-36: Goal 3: `marshal-shim doctor`, a read-only health check.** From muster's `doctor`
   (MUS-15), without its credential check. Done when: `marshal-shim doctor` reports, one line per
   check with a fix for each problem, whether the shim on `PATH` is this binary, whether the daemon
   accepts a connection, and whether Claude Code has the MCP server and every hook in
@@ -144,10 +144,10 @@ launcher.
 - [ ] **MAR-5: Supporting: Idle overnight wake verified, at most 2 model turns an hour.** From MUS-1, on
   Marshal's hooks. Done when: a Claude session idle overnight on Murph's daemon wakes on a message, and
   its idle turns are counted at 2 an hour or fewer. Needs a run: overnight, on Murph.
-- [ ] **MAR-9: Supporting: Stable nickname across a restart.** From MUS-3. Done when: a session
+- [x] **MAR-9: Supporting: Stable nickname across a restart.** From MUS-3. Done when: a session
   restarted in the same harness and directory keeps its nickname, a role declared by environment can be
   reached after a restart, and a test shows both.
-- [ ] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
+- [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
   `/hook/wait` survives its WS dropping past the grace, a test shows it, and the change is listed in
@@ -175,7 +175,7 @@ launcher.
 - [ ] **MAR-11: Later: Resuming wakes re-pushes held mail to push sessions.** From MUS-82. Done when:
   mail held while wakes were paused reaches a push session on resume, without waiting for its next
   turn, and a test shows it.
-- [ ] **MAR-13: Later: OpenCode plugin declares its channel.** From MUS-89. Done when: the plugin
+- [x] **MAR-13: Later: OpenCode plugin declares its channel.** From MUS-89. Done when: the plugin
   reports its channel state when it registers, and the roster's `wake` for it matches what it can do.
 
 ## Security: agree the shape with upstream first
@@ -192,13 +192,27 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   [upstream-auth-issue-draft.md](upstream-auth-issue-draft.md). Needs the operator: Josh files it.
   Done when: the issue is filed on ignition-is-go/marshal, and the gate stories are revised to
   match the maintainers' answers.
-- [ ] **MAR-39: Docs: README says the daemon binds 0.0.0.0, but it binds 127.0.0.1.** Found while
+- [x] **MAR-39: Docs: README says the daemon binds 0.0.0.0, but it binds 127.0.0.1.** Found while
   reading myko#129 for MAR-37: `DEFAULT_BIND` in `crates/daemon/src/main.rs` is `127.0.0.1:6155`,
   and the README says `0.0.0.0:6155` in two places. Additive and docs-only, so it can go upstream as
   it stands. Done when: the README matches the code, merged on the fork, and Josh has the branch to
   send upstream.
 
 MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
+
+## Cutover
+
+- [ ] **MAR-59: Cutover: a kit to prove one session on Marshal.** Step 1 of the cutover runbook
+  (rally's docs/cutover.md, RAL-119). Done when: [cutover-test-session.md](cutover-test-session.md)
+  gives the project-local wiring, the checks with their expected output, and teardown, checked
+  against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
+  doc is marked not yet run.
+- [ ] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
+  `marshal-shim doctor` reads only `~/.claude/settings.json` and `~/.claude.json`, so it can't check a
+  session wired by a project-local `.claude/settings.json` and `.mcp.json`, which is how the cutover
+  moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
+  `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
+  and its exit status unchanged, with tests.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
@@ -265,10 +279,11 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
   write until it's registered (MUS-72, 78, 79; built on the fork as MAR-43), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
-  predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), and
+  predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), a `MARSHAL_PERSIST` other than `file` stops startup (MAR-53: so a typo can't silently lose mail; before, the variable meant nothing), and
   optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
   (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
-  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. Done when: the draft is agreed with the
+  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
+  [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), unsent. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
@@ -294,7 +309,7 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
 - [ ] **MAR-18: Later: Stable error code for the unregistered refusal.** From MUS-80. The shim matches
   the refusal's text. Done when: the refusal carries a code, the shim matches the code, and a test
   covers both.
-- [ ] **MAR-19: Later: Drop ended sessions from rooms.** From MUS-58. Done when: a session that ends
+- [x] **MAR-19: Later: Drop ended sessions from rooms.** From MUS-58. Done when: a session that ends
   leaves every room it was in, and `everyone` lists only live sessions, with a test.
 - [ ] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
   branch unless the session set its own, with a test.
@@ -315,7 +330,7 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   error arriving within 200 ms, a timing assumption. Waits on the operator and upstream: an additive
   ask that myko-server accept a pre-bound listener, which Josh sends. Done when: myko-server accepts
   a pre-bound listener, and the remaining port-0 picks in the tests use it.
-- [ ] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
+- [x] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
 - [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
   myko#129 (its auth provider) and MAR-38 (upstream's answers decide the flag and shape). Done when: `--tls` serves pinned TLS, plain mode is unchanged, and the

@@ -483,7 +483,37 @@ async fn send_message(host: &ToolHost, args: &Value) -> Result<ToolOutcome, Tool
     let result = await_command(cell, REQUEST_TIMEOUT)
         .await
         .map_err(|e| ToolError::invalid_params(retry_hint(e, &key)))?;
-    Ok(ToolOutcome::Json(send_message_output(&result)))
+    let mut out = send_message_output(&result);
+    explain_inbox_delivery_once(
+        &mut out,
+        result.effective_live_push(),
+        &INBOX_DELIVERY_EXPLAINED,
+    );
+    Ok(ToolOutcome::Json(out))
+}
+
+/// Whether this shim has told its agent what `live_push: unavailable` means.
+static INBOX_DELIVERY_EXPLAINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+const INBOX_DELIVERY_NOTE: &str = "No live channel to this recipient, so the message waits in \
+     its inbox: it shows at the recipient's next tool call or prompt. An idle recipient is \
+     woken only when `wake` is `expected`; a busy one in a long command sees it when that \
+     command returns. Said once per session.";
+
+/// The first send that finds no live channel says what that means, so a
+/// sender isn't left guessing when a reply is slow (MAR-47, from muster's
+/// MUS-99). Only once per shim, to keep tool output small.
+fn explain_inbox_delivery_once(
+    out: &mut Value,
+    live_push: marshal_entities::LivePushStatus,
+    explained: &std::sync::atomic::AtomicBool,
+) {
+    if live_push == marshal_entities::LivePushStatus::Unavailable
+        && !explained.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        out["note"] = json!(INBOX_DELIVERY_NOTE);
+    }
 }
 
 /// `await_command`'s error when the response handler went away before a reply.
@@ -1014,9 +1044,16 @@ const UNBOUND_RETRY_AFTER: Duration = Duration::from_millis(750);
 
 /// Whether the daemon refused a write because this connection has no session
 /// bound to it (`resolve_caller`'s refusal), which re-sending the session fixes.
+/// Matched by the daemon's stable code (MAR-18). A daemon from before the code
+/// sends only the text, so that is accepted until every daemon carries the
+/// code; the code is what keeps a later rewording from stopping the retry.
 fn is_unbound_refusal(message: &str) -> bool {
-    message.contains("has no session on the roster")
+    marshal_entities::is_unregistered_refusal(message) || message.contains(LEGACY_UNREGISTERED_TEXT)
 }
+
+/// What a daemon before MAR-18 says instead of the code. Remove once no daemon
+/// runs a build older than MAR-18.
+const LEGACY_UNREGISTERED_TEXT: &str = "has no session on the roster";
 
 /// Run `call`; if the daemon refused it as unbound, `resend` the session, wait
 /// `settle`, and run it once more. Any other outcome is returned as it is.
@@ -1182,6 +1219,25 @@ mod tests {
     }
 
     #[test]
+    fn the_first_inbox_only_send_explains_itself_once() {
+        let explained = std::sync::atomic::AtomicBool::new(false);
+        let send = |live_push| {
+            let mut out = send_message_output(&result(live_push, WakeStatus::Unobserved, false));
+            explain_inbox_delivery_once(&mut out, live_push, &explained);
+            out
+        };
+        assert!(send(LivePushStatus::Delivered).get("note").is_none());
+        let first = send(LivePushStatus::Unavailable);
+        let note = first["note"].as_str().expect("the first one explains");
+        assert!(note.contains("next tool call"), "{note}");
+        assert!(note.contains("`expected`"), "{note}");
+        assert!(
+            send(LivePushStatus::Unavailable).get("note").is_none(),
+            "only once"
+        );
+    }
+
+    #[test]
     fn inbox_send_does_not_claim_wake_failure_or_future_delivery() {
         let output = send_message_output(&result(
             LivePushStatus::Unavailable,
@@ -1333,6 +1389,16 @@ mod tests {
 
     #[test]
     fn only_the_unbound_refusal_is_retried() {
+        // The daemon's own refusal, built by the function it uses (MAR-18).
+        assert!(is_unbound_refusal(&marshal_entities::unregistered_refusal(
+            "abc"
+        )));
+        // The code alone is enough, whatever the wording after it.
+        assert!(is_unbound_refusal(&format!(
+            "{} reworded in some later release",
+            marshal_entities::UNREGISTERED_CODE
+        )));
+        // A daemon from before the code.
         assert!(is_unbound_refusal(
             "caller (client abc) has no session on the roster — re-SET your Session and retry"
         ));
@@ -1411,14 +1477,13 @@ mod tests {
         }
     }
 
-    // MAR-43: the daemon's own refusal is what the retry matches. MAR-18 will
-    // give it a stable code; until then the text is pinned here.
+    // MAR-43 pinned the daemon's wording here until the refusal had a code.
+    // MAR-18 gave it one: the daemon builds its refusal with
+    // `unregistered_refusal`, and the retry matches the code that starts it.
     #[test]
     fn the_daemons_unbound_refusal_is_the_one_retried() {
-        let source = include_str!("../../entities/src/session.rs");
-        assert!(
-            source.contains("has no session on the roster — re-SET your Session and retry"),
-            "resolve_caller's refusal changed wording; update is_unbound_refusal"
-        );
+        let refusal = marshal_entities::unregistered_refusal("client-1");
+        assert!(refusal.starts_with(marshal_entities::UNREGISTERED_CODE));
+        assert!(is_unbound_refusal(&refusal));
     }
 }

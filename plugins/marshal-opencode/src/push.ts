@@ -19,8 +19,9 @@ export interface PushTarget {
   prompt(text: string): Promise<unknown>;
   /** Hold `messageId` out of inbox drains while it's being prompted, so the
    *  turn's own chat.message drain doesn't show it a second time. Returns the
-   *  release. */
-  hold(messageId: string): () => void;
+   *  release, or null when a pull already holds it, and then the push isn't
+   *  shown: the pull shows it. */
+  hold(messageId: string): (() => void) | null;
   /** Mark one message read. */
   ack(messageId: string): Promise<unknown>;
   /** Read, ack and render the unread inbox (older daemons' bodiless push). */
@@ -44,11 +45,38 @@ export async function deliverPush(meta: NotifyChannelMeta, who: string, target: 
   }
   const id = meta.message_id;
   const release = id ? target.hold(id) : undefined;
+  if (id && !release) return false;
   try {
     await target.prompt(pushText(who, meta));
     if (id) await target.ack(id);
   } finally {
     release?.();
   }
+  return true;
+}
+
+/** What showing mail that waited out a reconnect needs from the plugin. */
+export interface WaitingTarget {
+  /** Run `text` as a turn. Resolves once opencode has taken it. */
+  prompt(text: string): Promise<unknown>;
+  /** Read the unread inbox, unacked (`MarshalDaemon.pullInbox`). */
+  pull(): Promise<{ text: string; commit(): Promise<void>; release(): void } | null>;
+}
+
+/**
+ * On a reconnect, show the mail that waited out the drop as a turn, and ack it
+ * once opencode has taken it (MAR-48). If the prompt fails, the mail stays
+ * unread for the next turn's drain. Returns whether there was anything to show.
+ */
+export async function deliverWaiting(target: WaitingTarget): Promise<boolean> {
+  const pull = await target.pull().catch(() => null);
+  if (!pull) return false;
+  try {
+    await target.prompt(pull.text);
+  } catch (e) {
+    pull.release();
+    throw e;
+  }
+  await pull.commit().catch(() => pull.release());
   return true;
 }
