@@ -200,13 +200,19 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   optional inbox quoting. Needs the operator: Josh files it. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
-  runs in the fork's CI and passes, with each licence exception explained. Done: CI's
+  runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
   `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
   Eight advisories in the lockfile (rustls, rustls-webpki, tokio, ctutils, webpki-roots) were fixed
   by semver-compatible updates, and yanked chacha20 was bumped. myko's crates are AGPL by design and
   are listed by name. The web UI's four git crates (mullion, css-styled and two of its parts)
   declare no licence and are excluded by name: a real gap, which needs a licence upstream or their
   replacement.
+- [ ] **MAR-41: Later: The web UI's git crates carry a licence, or are replaced.** From MAR-16.
+  mullion, css-styled, css-styled-derive and css-spec-data (ignition-is-go's git repositories, for
+  marshal-ui) declare no licence, so there's no stated permission to use them; `deny.toml` excludes
+  them by name. Waits on the operator: licensing is Josh's to raise with upstream. Done when: the
+  four crates carry a licence upstream, or the UI drops or replaces them, and the exclusion comes
+  out of `deny.toml`.
 - [ ] **MAR-18: Later: Stable error code for the unregistered refusal.** From MUS-80. The shim matches
   the refusal's text. Done when: the refusal carries a code, the shim matches the code, and a test
   covers both.
