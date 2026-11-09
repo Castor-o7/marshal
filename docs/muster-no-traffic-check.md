@@ -17,6 +17,9 @@ Muster is quiet when all three hold:
 3. **No session registered.** Every `Session` row's latest event is a removal. A row that's still
    there is a session Muster still thinks it can reach, however quiet it is.
 
+A database with no messages or no session events at all, as after Muster's 14-day sweep has taken
+every message, passes that check: the query reads a missing time as `-infinity`.
+
 If any of the three fails, Muster isn't quiet, and step 7 waits. Leftover rows from crashed sessions
 fail check 3 until Muster's sweep removes them. Don't remove them by hand to pass the check.
 
@@ -34,9 +37,11 @@ with latest_session as (
   order by item_id, id desc),
 facts as (
   select
-    (select to_timestamp(max((event->'item'->>'sentAt')::bigint) / 1000)
+    -- None at all (the 14-day sweep took every message) counts as long ago.
+    (select coalesce(to_timestamp(max((event->'item'->>'sentAt')::bigint) / 1000), '-infinity')
        from myko_events where item_type = 'Message' and change_type = 'SET') as last_message,
-    (select max(created_at) from myko_events where item_type = 'Session') as last_session_event,
+    (select coalesce(max(created_at), '-infinity')
+       from myko_events where item_type = 'Session') as last_session_event,
     (select count(*) from latest_session where change_type = 'SET') as sessions_registered)
 select last_message, last_session_event, sessions_registered,
        case when last_message < now() - interval '24 hours'
