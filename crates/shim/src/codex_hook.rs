@@ -122,8 +122,17 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     );
 
     let deadline = Instant::now() + harness.timeout();
-    let Ok(reply) = http_post_why(&base, &path, &body, deadline) else {
-        return;
+    let reply = match http_post_why(&base, &path, &body, deadline) {
+        Ok(reply) => reply,
+        // A refusal by a daemon that checks tokens (MAR-81) is the operator's
+        // to fix, so it's said here, once per hook; these hooks run before
+        // logging starts and don't loop. (The waiter has its own
+        // once-per-cause rule for this.)
+        Err(failure @ PostFailure::Status(401 | 403)) => {
+            eprintln!("marshal-shim: {failure}");
+            return;
+        }
+        Err(_) => return,
     };
     let resp = reply.body.trim_end_matches(['\n', '\r', ' ']);
     if resp.is_empty() {
@@ -872,21 +881,7 @@ fn http_post_why(
         }
         bytes = &bytes[written..];
     }
-    let reply = crate::link::read_reply(&mut stream, deadline);
-    // A refusal by a daemon that checks tokens (MAR-81) is the operator's to
-    // fix, so it's said here, where the hooks run before logging starts.
-    match reply {
-        Err(PostFailure::Status(401)) => eprintln!(
-            "marshal-shim: the daemon's hook listener at {hostport} wants a token it knows: the \
-             daemon host's local-token (config directory) or this machine's pairing (marshal-shim pair)"
-        ),
-        Err(PostFailure::Status(403)) => eprintln!(
-            "marshal-shim: the daemon's hook listener at {hostport} says this session belongs to \
-             another machine"
-        ),
-        _ => {}
-    }
-    reply
+    crate::link::read_reply(&mut stream, deadline)
 }
 
 fn resolve_within(hostport: String, limit: Duration) -> Option<Vec<SocketAddr>> {
