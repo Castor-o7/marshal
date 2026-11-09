@@ -119,6 +119,7 @@ fn a_sender_sees_its_mail_went_unread_when_the_recipient_was_reaped() {
     AckMessages {
         message_ids: vec![marshal_entities::MessageId(Arc::from(seen.as_str()))],
         as_session: None,
+        phase: None,
     }
     .execute(as_client(&ctx, "c-recipient", "AckMessages"))
     .expect("ack");

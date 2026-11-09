@@ -19,6 +19,7 @@
 mod ack_messages;
 mod broadcast_message;
 mod message;
+mod message_offer;
 mod message_read;
 mod nickname;
 mod notify;
@@ -39,6 +40,7 @@ mod wake_watcher;
 pub use ack_messages::*;
 pub use broadcast_message::*;
 pub use message::*;
+pub use message_offer::*;
 pub use message_read::*;
 pub use nickname::*;
 pub use notify::*;

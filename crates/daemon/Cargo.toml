@@ -31,6 +31,10 @@ marshal-entities = { workspace = true }
 notify-debouncer-mini = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
+# myko#129's auth provider: auth::session_binding (MAR-80) is an Authorizer, and
+# myko129_threat_model.rs (MAR-37) switches the provider on. Same rev as the
+# workspace's myko pin; back to crates.io with it.
+myko-auth = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
 # Opt-in TLS (MAR-23), on the ring provider. rustls and tokio-rustls are already
 # in the tree through myko's telemetry; ring adds about 1.9 MB to a release
 # daemon (32.0 -> 33.9 MB on Linux x86-64), where the aws-lc-rs provider that
