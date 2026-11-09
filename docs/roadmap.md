@@ -289,7 +289,7 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
   `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
   and its exit status unchanged, with tests. Done (#58), merged in 2271713.
-- [ ] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
+- [x] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
   (2026-11-09) for rally's cutover.md step 1, with MAR-59's kit. Done when: a fresh session wired only
   to Marshal through project-local files shows on `marshal-shim roster`, wakes when idle on `tell`, and
   gets mail sent before a `marshal-daemon` restart after it, with nothing user-wide changed and
@@ -299,7 +299,9 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   (2026-11-09): that run's check 4 didn't test unread mail across a restart, because the held wait
   hook took the token 0.2 s after the send, before the restart. Done when, as well: mail is shown
   unread in the `marshal` database at a `marshal-daemon` restart (no `MessageRead` before it, read
-  only), and it reaches the session once afterwards.
+  only), and it reaches the session once afterwards. Done: the correction in #89 (92268bd), and
+  the rerun in #90, merged in 3435c9f (Message 1189 unread across the 15:31:58 restart, MessageRead
+  1230 after it).
 - [x] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
   step 7 retires Muster "only after a full day with no traffic", which nothing defined. Done when:
   [muster-no-traffic-check.md](muster-no-traffic-check.md) defines no traffic (no message and no
@@ -316,14 +318,14 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   empty or `/` path means `/myko`, no port means 5155), names that URL in its finding, and a test
   server that serves `/myko` only passes; doctor built from the branch, run against the live daemon on
   Murph, says `ok daemon`. Done (#79), merged in 98da488.
-- [ ] **MAR-73: Cutover: what "as reliable as Muster" means, measured on Murph.** Josh keeps both
+- [x] **MAR-73: Cutover: what "as reliable as Muster" means, measured on Murph.** Josh keeps both
   daemons running, each as the other's backup, until Marshal is as reliable as Muster (the watchman's
   assignment, 2026-11-09). Done when: [reliability-vs-muster.md](reliability-vs-muster.md) gives a few
   checkable measures (restarts and crashes, errors and refusals, mail taken and how fast, unread mail
   across a restart, sessions lost or duplicated), a read-only way to take each from both daemons on
   Murph (journal, and the `muster` and `marshal` databases with only `SELECT`s), one run over the last
   24 h for both with its outputs recorded, and a proposed bar for Josh to accept or change. Nothing on
-  either daemon changes.
+  either daemon changes. Done (#92), merged in f179bd9. The bar waits on Josh.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
@@ -423,14 +425,14 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   healthy one accepted, the retry landing on a fresh port, and all three lost. Assumes Codex fails
   its bind within the settle window; one that took longer would still be trusted. The proxy port
   the bridge binds itself fails clearly if lost, and isn't retried. Done (#72), merged in b9f3d26.
-- [ ] **MAR-74: Durability: Every CI job has a timeout, so a hung runner fails fast.** From the
+- [x] **MAR-74: Durability: Every CI job has a timeout, so a hung runner fails fast.** From the
   watchman (2026-11-09, issues log 4.4). windows-cross-check hung twice that day, once until its
   30-minute limit and once for 20 minutes until cancelled, and each rerun passed in under a minute.
   Every job already had a limit, but at 3–8x what was needed. Fork-only: upstream bounds its own jobs
   (30, 20 and 20 minutes) on self-hosted runners whose times the fork can't measure. Done when: each
   job's `timeout-minutes` is about 3–5x its slowest green run in the fork's last 60 runs, each with a
   comment giving those times (dependency-audit allows more, for a cold cache that builds cargo-deny),
-  and CI passes with the new limits.
+  and CI passes with the new limits. Done (#93), merged in 207ae4a.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
   `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
