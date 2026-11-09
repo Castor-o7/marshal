@@ -142,7 +142,11 @@ For Claude, as above, with these specifics:
 
 **Not yet:** Codex (its own story); a sender's `recipient.offered` in `read_messages`; splitting
 MAR-73's M3 into offered and seen; and MAR-79's live check 5 (kill a busy session mid-turn, start it
-again, and the mail arrives once), which needs this deployed on Murph. The matcher's tests use records
-shaped as observed in a live transcript, with synthetic content. A fixture captured from a
-disposable test session, like `crates/shim/tests/fixtures/claude-code-2.1.318`, would be stronger.
+again, and the mail arrives once), which needs this deployed on Murph. The matcher's tests include records
+recorded from a disposable test session on Claude Code 2.1.321 and scrubbed to their shapes
+(`crates/shim/tests/fixtures/claude-code-2.1.321`). They confirm the design: each delivery's first
+record is a `queue-operation` `enqueue`, written while the rewake is held, and the model-bound ones
+follow when the next turn starts (`api-request-blob` with `attachment`/`queued_command` for mail sent
+while busy, and `api-request-blob` with `user` for mail sent while idle). A test fails if Claude Code
+changes those shapes, which is the cue to re-record.
 

@@ -11,6 +11,9 @@
 //! `queue-operation` record (`"operation": "enqueue"`) while it's held, which
 //! is exactly the state this exists to tell apart, and again as a `user` or
 //! `attachment` record when it goes to the model. Only the second kind counts.
+//! (It also writes an `api-request-blob` then, which isn't counted: each
+//! delivery recorded so far also has a `user` or `attachment` record, and
+//! counting less can only leave mail offered, never lose it.)
 //!
 //! The transcript is Claude Code's own, undocumented format. Everything here
 //! fails safe: a file that can't be read, a line that isn't JSON, or a record
@@ -168,6 +171,64 @@ mod tests {
         ] {
             assert!(seen_in(&text, &ids(&[A])).is_empty(), "{text}");
         }
+    }
+
+    /// Records recorded from Claude Code 2.1.321 for two held rewakes, scrubbed
+    /// to their shapes (`tests/fixtures/claude-code-2.1.321/README.md`).
+    const RECORDED: &str =
+        include_str!("../tests/fixtures/claude-code-2.1.321/transcript-rewake.jsonl");
+
+    fn recorded(id: &str) -> Vec<String> {
+        RECORDED.lines().map(|l| l.replace("{ID}", id)).collect()
+    }
+
+    fn kind(line: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let t = v["type"].as_str().unwrap_or_default();
+        match t {
+            "queue-operation" => format!("{t}/{}", v["operation"].as_str().unwrap_or_default()),
+            "attachment" => format!(
+                "{t}/{}",
+                v["attachment"]["type"].as_str().unwrap_or_default()
+            ),
+            _ => t.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_recorded_records_are_the_shapes_the_matcher_expects() {
+        let kinds: Vec<String> = recorded(A).iter().map(|l| kind(l)).collect();
+        assert_eq!(
+            kinds,
+            [
+                "queue-operation/enqueue",
+                "queue-operation/remove",
+                "api-request-blob",
+                "attachment/queued_command",
+                "queue-operation/enqueue",
+                "api-request-blob",
+                "user",
+            ],
+            "Claude Code's records changed shape: re-record the fixture and check the matcher"
+        );
+    }
+
+    #[test]
+    fn a_recorded_held_rewake_is_not_seen() {
+        // Each delivery's first record is the enqueue, written while it's held.
+        let r = recorded(A);
+        assert!(seen_in(&r[0], &ids(&[A])).is_empty());
+        assert!(seen_in(&format!("{}\n{}", r[0], r[1]), &ids(&[A])).is_empty());
+        assert!(seen_in(&r[4], &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn a_recorded_delivery_to_the_model_is_seen() {
+        let r = recorded(A);
+        // Busy: enqueue, remove, request, then the queued_command attachment.
+        assert_eq!(seen_in(&r[..4].join("\n"), &ids(&[A])), ids(&[A]));
+        // Idle: enqueue, request, then the user record.
+        assert_eq!(seen_in(&r[4..].join("\n"), &ids(&[A])), ids(&[A]));
     }
 
     #[test]
