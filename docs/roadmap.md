@@ -324,6 +324,13 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   Murph (journal, and the `muster` and `marshal` databases with only `SELECT`s), one run over the last
   24 h for both with its outputs recorded, and a proposed bar for Josh to accept or change. Nothing on
   either daemon changes.
+- [ ] **MAR-75: Cutover: a soak kit for the MAR-73 bar.** Load option 1 of
+  [reliability-vs-muster.md](reliability-vs-muster.md) (d), ready but not run (the watchman, 2026-11-09).
+  Done when: [soak-kit.md](soak-kit.md) and `scripts/soak/` set up at least 3 test sessions wired only
+  to Marshal (as MAR-59's kit does), drive at least 100 direct messages over a window with an hourly
+  canary, include one planned restart with mail provably unread (MAR-70 run 2's method), take MAR-73's
+  measures at the end, and tear everything down, with a dry run of setup and teardown only (minutes,
+  not 24 h). The 24 h window waits for Josh to accept the bar and choose the load option.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
