@@ -362,7 +362,44 @@ fn claude_files() -> (Option<PathBuf>, Option<PathBuf>) {
     )
 }
 
-async fn daemon_check(url: &str) -> Finding {
+/// The URL the shim's myko client actually dials for `addr` (MAR-71), as
+/// myko 6.11's `normalize_myko_address` resolves it: no scheme means `ws://`,
+/// an empty or `/` path means `/myko`, and no port means 5155. Probing the
+/// address as written instead hit `/`, which a live daemon answers 404.
+fn handshake_url(addr: &str) -> String {
+    let (scheme, rest) = match addr.split_once("://") {
+        Some((s, r)) if s == "ws" || s == "wss" => (s, r),
+        _ => ("ws", addr),
+    };
+    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(split);
+    let has_port = match authority.strip_prefix('[') {
+        Some(v6) => v6
+            .split_once(']')
+            .and_then(|(_, s)| s.strip_prefix(':'))
+            .is_some_and(|p| p.parse::<u16>().is_ok()),
+        None => authority
+            .rsplit_once(':')
+            .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()),
+    };
+    let authority = if has_port {
+        authority.to_string()
+    } else {
+        format!("{authority}:5155")
+    };
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let (path, query) = tail.split_at(path_end);
+    let path = if path.is_empty() || path == "/" {
+        "/myko"
+    } else {
+        path
+    };
+    format!("{scheme}://{authority}{path}{query}")
+}
+
+async fn daemon_check(addr: &str) -> Finding {
+    let url = handshake_url(addr);
+    let url = url.as_str();
     let outcome =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(url)).await;
     match outcome {
@@ -789,6 +826,53 @@ mod tests {
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let _ = tokio_tungstenite::accept_async(tcp).await;
+        });
+        let f = daemon_check(&format!("ws://127.0.0.1:{port}")).await;
+        assert_eq!(f.level, Level::Ok, "{f:?}");
+        server.abort();
+    }
+
+    #[test]
+    fn the_handshake_url_is_the_one_mykos_client_dials() {
+        for (addr, want) in [
+            ("ws://127.0.0.1:6155", "ws://127.0.0.1:6155/myko"),
+            ("ws://127.0.0.1:6155/", "ws://127.0.0.1:6155/myko"),
+            ("ws://127.0.0.1:6155/myko", "ws://127.0.0.1:6155/myko"),
+            ("ws://127.0.0.1:6155/other", "ws://127.0.0.1:6155/other"),
+            ("127.0.0.1:6155", "ws://127.0.0.1:6155/myko"),
+            ("ws://localhost", "ws://localhost:5155/myko"),
+            (
+                "wss://marshal.example:443",
+                "wss://marshal.example:443/myko",
+            ),
+            ("ws://[::1]:6155", "ws://[::1]:6155/myko"),
+            ("ws://[::1]", "ws://[::1]:5155/myko"),
+        ] {
+            assert_eq!(handshake_url(addr), want, "{addr}");
+        }
+    }
+
+    /// A daemon serves its WebSocket at `/myko` only, as the live one does:
+    /// the address as configured, with no path, must still pass (MAR-71).
+    // tungstenite's handshake callback returns its own large ErrorResponse.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn the_daemon_check_passes_against_a_server_on_the_myko_path() {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let only_myko = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                if req.uri().path() == "/myko" {
+                    Ok(resp)
+                } else {
+                    let mut e = ErrorResponse::new(None);
+                    *e.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND;
+                    Err(e)
+                }
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(tcp, only_myko).await;
         });
         let f = daemon_check(&format!("ws://127.0.0.1:{port}")).await;
         assert_eq!(f.level, Level::Ok, "{f:?}");
