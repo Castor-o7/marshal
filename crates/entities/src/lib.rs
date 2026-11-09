@@ -23,6 +23,8 @@ mod message_offer;
 mod message_read;
 mod nickname;
 mod notify;
+/// Fork only (MAR-24): pairing codes and token hashes, shared by the daemon and the shim.
+pub mod pairing;
 mod read_messages;
 mod room;
 mod room_member;
