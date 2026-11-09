@@ -147,11 +147,13 @@ launcher.
 - [x] **MAR-9: Supporting: Stable nickname across a restart.** From MUS-3. Done when: a session
   restarted in the same harness and directory keeps its nickname, a role declared by environment can be
   reached after a restart, and a test shows both.
-- [ ] **MAR-42: Supporting: A restarted session's unread mail follows it.** From MUS-47, built on MAR-9.
+- [x] **MAR-42: Supporting: A restarted session's unread mail follows it.** From MUS-47, built on MAR-9.
   A takeover readdresses the predecessor's unread direct mail to the successor; mail it had read stays
   with it. Done when: the conformance cell `unread-mail-follows-a-restart` passes on claude and codex, a
   daemon test shows unread mail moving and read mail staying, and the change is listed in MAR-15.
-- [ ] **MAR-54: Supporting: Codex rows on the roster can count as dead, from the bridge's signal.**
+  Done (#43): `unread-mail-follows-a-restart` is off `MARSHAL_NOT_APPLICABLE` and passes on claude
+  and codex in CI; `crates/daemon/tests/identity_succession.rs` shows the mail moving.
+- [x] **MAR-54: Supporting: Codex rows on the roster can count as dead, from the bridge's signal.**
   Follow-up to MAR-9. Succession never treated a Codex row still on the roster as dead
   (`CODEX_PRESENT_ROWS_CAN_BE_DEAD`, "until MUS-77"), but MAR-12 has since given the roster the bridge's
   wake path. Scope agreed with the watchman (2026-11-08). Done when: a present Codex row counts as dead
@@ -160,7 +162,8 @@ launcher.
   tests including a 45 s bridge handover gap; succession finds waiters by `WakeWatcher::session()`, with
   a test; a daemon test shows a bridge-watched Codex sibling keeping its name and one whose record ended
   taken over with its unread mail; the codex conformance cells still pass; and `stable-identity.md`
-  says so.
+  says so. Done (#48): verdict tests in `crates/daemon/src/succession.rs`, daemon tests in
+  `crates/daemon/tests/identity_succession.rs`.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
@@ -325,8 +328,8 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   covers both.
 - [x] **MAR-19: Later: Drop ended sessions from rooms.** From MUS-58. Done when: a session that ends
   leaves every room it was in, and `everyone` lists only live sessions, with a test.
-- [ ] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
-  branch unless the session set its own, with a test.
+- [x] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
+  branch unless the session set its own, with a test. Done (#34), in `crates/shim/src/main.rs`.
 - [ ] **MAR-58: Later: The roster says when a session's activity last changed.** The roster's
   `activity` (`busy`, `idle` or `shell`, from Claude's per-PID manifest) says what a session is doing
   but not since when, so "idle for a minute" and "idle for an hour" look the same, and
