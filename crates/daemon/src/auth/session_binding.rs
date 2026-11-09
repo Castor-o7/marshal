@@ -27,6 +27,12 @@
 //! A refusal is [`AuthError::Forbidden`], which myko answers with a
 //! `command-error` "permission denied" and leaves the connection open.
 //!
+//! Revocation passes through: `revision` and `session_revision` are the
+//! inner authorizer's, so a bump there (MAR-24's unpair, a policy edit)
+//! still reaches open connections and live subscriptions through the
+//! wrapper. Reads (queries, views, reports) and subscriptions aren't checked
+//! here; what a principal may read is the inner authorizer's business.
+//!
 //! Sessions registered through the hook listener (Codex, and Claude's
 //! `/hook/session-start`) never pass through myko, so [`bind_local`] binds
 //! them to a configured *local principal*: the daemon host's own token. Any
@@ -258,6 +264,16 @@ impl<A: Authorizer> Authorizer for SessionBinding<A> {
     fn authorize_anonymous(&self, request: AuthorizationRequest<'_>) -> Result<(), AuthError> {
         self.inner.authorize_anonymous(request)?;
         self.check(None, request)
+    }
+
+    // The provider reads these on the outermost authorizer to revoke open
+    // connections and recheck subscriptions, so they must be the inner's.
+    fn revision(&self) -> u64 {
+        self.inner.revision()
+    }
+
+    fn session_revision(&self, identity: Option<&AuthenticatedIdentity>) -> u64 {
+        self.inner.session_revision(identity)
     }
 }
 
@@ -657,6 +673,38 @@ mod tests {
             Err(AuthError::Forbidden),
             "with no local principal, a hook-registered session is nobody's"
         );
+    }
+
+    #[test]
+    fn revocation_passes_through_the_wrapper() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Bumping(AtomicU64);
+        impl Authorizer for Bumping {
+            fn authorize(
+                &self,
+                _identity: &AuthenticatedIdentity,
+                _request: AuthorizationRequest<'_>,
+            ) -> Result<(), AuthError> {
+                Ok(())
+            }
+            fn revision(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn session_revision(&self, identity: Option<&AuthenticatedIdentity>) -> u64 {
+                // Not derived from revision(), so a forwarded value is told
+                // from the trait's default.
+                self.revision() + if identity.is_some() { 1000 } else { 2000 }
+            }
+        }
+        let binding = SessionBinding::new(Bumping(AtomicU64::new(7)), None);
+        let alice = identity("alice");
+        assert_eq!(binding.revision(), 7);
+        assert_eq!(binding.session_revision(Some(&alice)), 1007);
+        assert_eq!(binding.session_revision(None), 2007);
+        // An unpair or a policy edit bumps the inner; the wrapper shows it.
+        binding.inner.0.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(binding.revision(), 8);
+        assert_eq!(binding.session_revision(Some(&alice)), 1008);
     }
 
     // The one test of the process-wide install, so it can't race another.

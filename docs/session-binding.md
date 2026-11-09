@@ -58,6 +58,19 @@ A binding goes when its session does. The hook listener's `session-end`, the cle
 `marshal-daemon forget` and a client's own `Session` DEL all call `release`, so the table can't grow
 without bound. A re-registered id after a release is free to whoever registers it.
 
+## Limits
+
+- **Reads and subscriptions aren't covered.** The binding checks commands and client events. What a
+  principal may query, view, report on or subscribe to is the inner authorizer's rule. Revocation does
+  pass through: `revision` and `session_revision` are the inner's, so an unpair or a policy edit still
+  reaches open connections and live subscriptions.
+- **A daemon restart under file persistence empties the table while the store keeps its rows.** Until
+  a session's owner re-registers it (the shim does on reconnect), the id is unowned, and the first
+  principal to claim it wins. A session-end or sweep of a row with no binding is harmless.
+- **Succession isn't principal-aware.** A dead principal A's session can be succeeded by a session of
+  principal B with the same identity key, which takes its nickname and unread mail (MAR-9, MAR-42).
+  That's a follow-up story, reserved by the watchman.
+
 ## Tests
 
 - `crates/daemon/src/auth/session_binding.rs`: unit tests of each rule against the authorizer alone.
