@@ -32,6 +32,23 @@ fn wait_until(within: Duration, mut ok: impl FnMut() -> bool) -> bool {
     ok()
 }
 
+/// The daemon binary beside the shim, if this test run built it. `cargo test
+/// -p marshal-shim` alone (the Windows job) doesn't, and then these tests
+/// skip; the workspace run does, and they run there.
+fn daemon_bin() -> Option<std::path::PathBuf> {
+    let bin =
+        Path::new(SHIM).with_file_name(format!("marshal-daemon{}", std::env::consts::EXE_SUFFIX));
+    if bin.exists() {
+        Some(bin)
+    } else {
+        eprintln!(
+            "skipped: {} isn't built (run the workspace tests)",
+            bin.display()
+        );
+        None
+    }
+}
+
 /// A real `marshal-daemon --tls` in a temp state directory, on free loopback
 /// ports. Its ports are picked by binding 0 and closing, so a lost one means
 /// a restart on new ports (MAR-21).
@@ -46,10 +63,7 @@ struct Daemon {
 impl Daemon {
     fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        // Beside the shim; `.exe` on Windows.
-        let bin = Path::new(SHIM)
-            .with_file_name(format!("marshal-daemon{}", std::env::consts::EXE_SUFFIX));
-        assert!(bin.exists(), "{} is missing", bin.display());
+        let bin = daemon_bin().expect("checked by the test before starting");
         let log_path = dir.path().join("daemon.log");
         let mut lost = Vec::new();
         loop {
@@ -180,6 +194,9 @@ fn text(out: &Output) -> String {
 
 #[test]
 fn a_pinned_shim_joins_is_told_and_reads_its_mail_through_tls() {
+    let Some(_) = daemon_bin() else {
+        return;
+    };
     let daemon = Daemon::start();
     let pin = daemon.fingerprint.clone();
     std::fs::create_dir_all(daemon.dir.path().join("work")).unwrap();
@@ -222,6 +239,9 @@ fn a_pinned_shim_joins_is_told_and_reads_its_mail_through_tls() {
 
 #[test]
 fn a_wrong_or_missing_pin_is_refused() {
+    let Some(_) = daemon_bin() else {
+        return;
+    };
     let daemon = Daemon::start();
     std::fs::create_dir_all(daemon.dir.path().join("work")).unwrap();
     let wrong = "0".repeat(64);
