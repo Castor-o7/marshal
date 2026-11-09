@@ -46,7 +46,13 @@
 //!
 //! A binding goes when its session does: the hook listener's session-end,
 //! the cleanup sweep, `marshal-daemon forget` and a client's own `Session`
-//! DEL all call [`release`], so the table can't grow without bound.
+//! DEL all call [`release`], so the table can't grow without bound. A
+//! released session's principal is remembered for a day, because succession
+//! (MAR-83) asks about dead sessions: a successor takes over a predecessor
+//! only within one principal, and [`same_principal`] answers from the live
+//! and the remembered owners. Unknown on either side counts as different, so
+//! a predecessor that died before a daemon restart can't be succeeded under
+//! auth. Plain mode, with no binding installed, succeeds as before.
 
 use std::{
     collections::HashMap,
@@ -71,10 +77,14 @@ pub fn principal_key(principal: &Principal) -> String {
     format!("{}\u{0}{}", principal.issuer, principal.subject)
 }
 
-/// Which principal holds each session id.
+/// How long a released session's principal is remembered, for succession.
+const FORMER_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Which principal holds each session id, and held each released one.
 #[derive(Debug, Default)]
 pub struct Table {
     owners: Mutex<HashMap<Arc<str>, String>>,
+    former: Mutex<HashMap<Arc<str>, (String, i64)>>,
 }
 
 impl Table {
@@ -105,9 +115,42 @@ impl Table {
         }
     }
 
-    /// Forget who held `session`. True when someone did.
+    /// Forget who holds `session`, remembering who did for [`FORMER_MS`].
+    /// True when someone held it.
     pub fn release(&self, session: &str) -> bool {
-        self.lock().remove(session).is_some()
+        self.release_at(session, chrono::Utc::now().timestamp_millis())
+    }
+
+    fn release_at(&self, session: &str, now_ms: i64) -> bool {
+        let Some(owner) = self.lock().remove(session) else {
+            return false;
+        };
+        let mut former = self.former.lock().unwrap_or_else(PoisonError::into_inner);
+        former.retain(|_, (_, at)| now_ms - *at <= FORMER_MS);
+        former.insert(Arc::from(session), (owner, now_ms));
+        true
+    }
+
+    /// The key of whoever holds `session`, or held it within the last day.
+    #[must_use]
+    pub fn owner_or_former(&self, session: &str) -> Option<String> {
+        self.owner_of(session).or_else(|| {
+            self.former
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(session)
+                .map(|(owner, _)| owner.clone())
+        })
+    }
+
+    /// Whether `a` and `b` are, or were, one principal's. Unknown on either
+    /// side is false.
+    #[must_use]
+    pub fn same_principal(&self, a: &str, b: &str) -> bool {
+        matches!(
+            (self.owner_or_former(a), self.owner_or_former(b)),
+            (Some(x), Some(y)) if x == y
+        )
     }
 
     /// The key (see [`principal_key`]) of whoever holds `session`.
@@ -361,6 +404,15 @@ pub fn release(session: &str) -> bool {
     installed()
         .as_ref()
         .is_some_and(|Installed { table, .. }| table.release(session))
+}
+
+/// For succession (MAR-83): whether two sessions are, or were, one
+/// principal's. `None` with no binding installed (plain mode: succession is
+/// unrestricted); `Some(false)` when either is unknown.
+pub fn same_principal(a: &str, b: &str) -> Option<bool> {
+    installed()
+        .as_ref()
+        .map(|Installed { table, .. }| table.same_principal(a, b))
 }
 
 #[cfg(test)]
@@ -735,6 +787,52 @@ mod tests {
         assert_eq!(binding.session_revision(Some(&alice)), 1008);
     }
 
+    #[test]
+    fn a_released_sessions_principal_is_remembered_for_succession() {
+        let binding = SessionBinding::new(AllowAll, None);
+        let alice = identity("alice");
+        let bob = identity("bob");
+        assert!(
+            binding
+                .authorize(&alice, command("RegisterSession", &register("old")))
+                .is_ok()
+        );
+        assert!(
+            binding
+                .authorize(&alice, command("RegisterSession", &register("new")))
+                .is_ok()
+        );
+        assert!(
+            binding
+                .authorize(&bob, command("RegisterSession", &register("other")))
+                .is_ok()
+        );
+        let table = binding.table();
+        assert!(table.same_principal("old", "new"));
+        assert!(!table.same_principal("old", "other"));
+        // The sweep releases the dead one before the late recheck asks.
+        assert!(table.release_at("old", 1_000));
+        assert!(table.owner_of("old").is_none());
+        assert!(
+            table.same_principal("old", "new"),
+            "remembered after release"
+        );
+        assert!(!table.same_principal("old", "other"));
+        assert!(
+            !table.same_principal("old", "never-registered"),
+            "unknown is different"
+        );
+        // A day later it's forgotten, when something else is released.
+        assert!(
+            binding
+                .authorize(&bob, command("RegisterSession", &register("gone")))
+                .is_ok()
+        );
+        assert!(table.release_at("gone", 1_000 + FORMER_MS + 1));
+        assert!(table.owner_or_former("old").is_none());
+        assert!(table.owner_or_former("gone").is_some());
+    }
+
     // The one test of the process-wide install, so it can't race another.
     #[test]
     fn the_installed_binding_serves_the_hook_listener_and_cleanup() {
@@ -753,7 +851,14 @@ mod tests {
         );
         assert!(release("codex-3"));
         assert!(binding.table().is_empty());
+        assert_eq!(
+            same_principal("codex-3", "codex-3"),
+            Some(true),
+            "remembered"
+        );
+        assert_eq!(same_principal("codex-3", "nobody"), Some(false));
         *installed() = None;
+        assert_eq!(same_principal("codex-3", "codex-3"), None, "plain mode");
     }
 
     #[test]
