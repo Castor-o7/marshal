@@ -333,6 +333,13 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
   [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), unsent. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
+- [ ] **MAR-66: Later: List what the fork could offer upstream as small additive PRs.** Beside
+  MAR-15, which is the single issue for default changes. From the watchman (2026-11-09), for Josh's
+  upstream decisions; nothing is sent. Done when: [upstream-offers.md](upstream-offers.md) lists
+  each merged fork story that could go upstream with its upstream-shaped commits, whether they
+  cherry-pick cleanly onto upstream `main` (checked with `git cherry-pick --no-commit` in a
+  throwaway worktree), what it's stacked on, and its size; marks default changes as MAR-15's; and
+  names what's fork-only.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
   `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
