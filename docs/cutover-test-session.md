@@ -1,6 +1,9 @@
 # Cutover kit: prove one session on Marshal (MAR-59)
 
-**Run once, on Murph, 2026-11-09 (MAR-70): every check passed.** The record is under [(d) Run 1](#d-run-1-2026-11-09-mar-70), with what it changed in the steps below. This kit is for step 1 of the cutover
+**Run once, on Murph, 2026-11-09 (MAR-70): checks 1 to 3 passed, but check 4 as written doesn't test what it says.**
+The session's held wait hook took the token at once, so no mail was unread in the daemon when it
+restarted (see check 4 and [(d) Run 1](#d-run-1-2026-11-09-mar-70)). A check 4 with mail provably
+unread at the restart is MAR-70's rerun. This kit is for step 1 of the cutover
 runbook (rally's `docs/cutover.md`, RAL-119): "prove one session". Fork-only.
 
 The goal is one fresh Claude Code session wired only to Marshal, with nothing user-wide changed. It
@@ -147,6 +150,16 @@ removes on exit (`terminal_send.rs`). It isn't a peer, and the prefix is what te
 can't reply.
 
 **4. Mail survives a daemon restart.**
+
+> **This check, as written, doesn't leave mail unread in the daemon.** The `claude-hook wait` that
+> SessionStart and Stop start has `asyncRewake`, so it keeps running in the background while the
+> session works through a turn. It takes a message as soon as it's sent and acks it (Marshal records
+> a `MessageRead` within a second), and Claude Code holds the message until the turn ends. A busy
+> session therefore doesn't leave the token unread. What the steps below do show is that mail a hook
+> has already taken isn't lost or offered twice across a daemon restart, and that the nickname
+> survives the restart. Mail unread in the daemon across a restart needs a session with no client
+> holding its waiter when the token is sent. Check it in the `marshal` database, read-only: no
+> `MessageRead` for the token before the restart, and one after. MAR-70's rerun does this.
 This restarts the live Marshal daemon. On Murph only the test session should be on Marshal at this
 point; check `marshal-shim roster` first, and stop if anyone else is on it. Restarting the daemon is
 the lamplighter's job: ask them, and agree the moment, because the token has to go out first.
@@ -198,7 +211,7 @@ changed, and muster-daemon wasn't touched.
 | 1. Only Marshal wired | Pass. `/mcp`: `marshal` (6 tools) and Claude Code's built-in `claude-in-chrome`, and no `muster`. `/hooks`: "5 hooks on 4 events", all `[Project]` |
 | 2. On Marshal's roster | Pass. `elder-caracal /home/joshd/src/marshal-cutover-test waiting bound=True`; not on muster's roster (`muster-shim roster \| grep -c marshal-cutover-test` → 0) |
 | 3. Idle wake | Pass. 13:55:53, `tell` → `in inbox, wake expected but not observed`; the session woke by itself through its Stop hook in a few seconds, and said the message came from a terminal that can't receive replies |
-| 4. Mail survives a restart | Pass, on the second attempt. Token `cutover check: survives restart 1794250728` sent at 13:58:49 while the session was in the foreground loop; daemon restarted at 13:59:08 (PID 603362 → 1195712); after the loop ended at 14:05:01 the session showed the token once. Roster afterwards: `elder-caracal … waiting bound=True`, the same nickname |
+| 4. Mail survives a restart | **Not shown** (corrected 2026-11-09, found in MAR-73). Token `cutover check: survives restart 1794250728` sent at 13:58:49 while the session was in the foreground loop; daemon restarted at 13:59:08 (PID 603362 → 1195712); after the loop ended at 14:05:01 the session showed the token once. But the `marshal` db has its `MessageRead` (event 1008) at 13:58:49.070, 0.2 s after the send (event 1004) and 19 s *before* the restart: the held wait hook had taken it. So it was never unread in the daemon at the restart. What this does show: taken mail wasn't lost or offered twice across the restart, and the roster afterwards had `elder-caracal … waiting bound=True`, the same nickname |
 | 3 again | Pass. 14:05:55, the idle session woke on `tell` again |
 | Teardown | 14:07, `/exit`, tmux killed, directory removed; no `marshal-shim` processes left; Marshal's roster empty by 14:08:25 |
 
