@@ -686,6 +686,9 @@ fn http_post_why(
     let mut stream = if tls {
         crate::link::Stream::Tls(Box::new(crate::tls_link::connect_https(tcp).map_err(
             |e| {
+                // The hooks run before logging is set up, and a pin that's
+                // wrong or missing is the operator's to fix, so stderr too.
+                eprintln!("marshal-shim: TLS to the hook listener at {hostport}: {e}");
                 log::warn!("[marshal-shim] TLS to the hook listener at {hostport}: {e}");
                 PostFailure::Unreachable
             },

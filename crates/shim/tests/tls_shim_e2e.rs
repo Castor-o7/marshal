@@ -223,6 +223,7 @@ fn a_wrong_or_missing_pin_is_refused() {
     let daemon = Daemon::start();
     std::fs::create_dir_all(daemon.dir.path().join("work")).unwrap();
     let wrong = "0".repeat(64);
+    let right = daemon.fingerprint.clone();
 
     // myko, through the tunnel: the handshake fails, so the roster can't be read.
     let out = daemon.shim(Some(&wrong), &["roster"]).output().unwrap();
@@ -238,14 +239,27 @@ fn a_wrong_or_missing_pin_is_refused() {
         text(&out)
     );
 
-    // The hooks: nothing joins.
+    // The hooks: each refusal says why, and nothing joins.
     let out = daemon.hook(Some(&wrong), "session-start", "tls-session-wrong");
-    let right = daemon.fingerprint.clone();
-    let roster = daemon.shim(Some(&right), &["roster"]).output().unwrap();
     assert!(
-        !text(&roster).contains("tls-session-wrong"),
-        "a session joined with a wrong pin: {} / {}",
-        text(&out),
-        text(&roster)
+        text(&out).contains("TLS to the hook listener at"),
+        "a wrong pin's hook didn't say TLS failed: {}",
+        text(&out)
+    );
+    let out = daemon.hook(None, "session-start", "tls-session-nopin");
+    assert!(
+        text(&out).contains("needs the daemon's TLS fingerprint"),
+        "a missing pin's hook didn't ask for the fingerprint: {}",
+        text(&out)
+    );
+    // A join that did get through would show within the time the positive
+    // test allows, so wait that long before saying neither did.
+    std::thread::sleep(Duration::from_secs(3));
+    let roster = daemon.shim(Some(&right), &["roster"]).output().unwrap();
+    assert!(roster.status.success(), "roster: {}", text(&roster));
+    let seen = text(&roster);
+    assert!(
+        !seen.contains("tls-session-wrong") && !seen.contains("tls-session-nopin"),
+        "a session joined without the right pin: {seen}"
     );
 }

@@ -34,6 +34,11 @@ pub const PIN_FILE: &str = "tls-pin";
 /// is never checked; it matches the one the daemon puts in its certificate.
 const SERVER_NAME: &str = "marshal-daemon";
 
+/// Caps on each tunnel connection's dial and handshake, so a daemon that's
+/// gone quiet doesn't hold a task forever.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Make ring the process's default rustls provider. The shim's tree enables
 /// aws-lc-rs too, through myko, and with two providers enabled rustls's
 /// `builder()` panics unless one is installed. The first call wins.
@@ -167,7 +172,12 @@ fn split_wss(address: &str) -> Option<(String, String)> {
     if authority.is_empty() {
         return None;
     }
-    let authority = if authority.starts_with('[') || authority.rsplit_once(':').is_some() {
+    let has_port = if authority.starts_with('[') {
+        !authority.ends_with(']')
+    } else {
+        authority.contains(':')
+    };
+    let authority = if has_port {
         authority.to_string()
     } else {
         format!("{authority}:443")
@@ -240,26 +250,38 @@ fn start_tunnel(authority: String, pin: &str) -> io::Result<u16> {
                         Ok(pair) => pair,
                         Err(e) => {
                             log::warn!("[marshal-shim] TLS tunnel accept error: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             continue;
                         }
                     };
                     let (connector, authority) = (connector.clone(), authority.clone());
                     tokio::spawn(async move {
-                        let tcp = match tokio::net::TcpStream::connect(&authority).await {
-                            Ok(tcp) => tcp,
-                            Err(e) => {
+                        let connect = tokio::net::TcpStream::connect(&authority);
+                        let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+                            Ok(Ok(tcp)) => tcp,
+                            Ok(Err(e)) => {
                                 log::warn!("[marshal-shim] can't reach {authority}: {e}");
+                                return;
+                            }
+                            Err(_) => {
+                                log::warn!("[marshal-shim] can't reach {authority}: timed out");
                                 return;
                             }
                         };
                         let _ = tcp.set_nodelay(true);
-                        let mut remote = match connector.connect(server_name(), tcp).await {
-                            Ok(tls) => tls,
-                            Err(e) => {
-                                log::warn!("[marshal-shim] TLS to {authority} failed: {e}");
-                                return;
-                            }
-                        };
+                        let handshake = connector.connect(server_name(), tcp);
+                        let mut remote =
+                            match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                                Ok(Ok(tls)) => tls,
+                                Ok(Err(e)) => {
+                                    log::warn!("[marshal-shim] TLS to {authority} failed: {e}");
+                                    return;
+                                }
+                                Err(_) => {
+                                    log::warn!("[marshal-shim] TLS to {authority} timed out");
+                                    return;
+                                }
+                            };
                         let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
                     });
                 }
@@ -272,7 +294,8 @@ fn start_tunnel(authority: String, pin: &str) -> io::Result<u16> {
 /// handshake runs on first read or write, under `tcp`'s timeouts.
 pub type HttpsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
-/// Wrap `tcp` in pinned TLS. Fails at once when no pin is set.
+/// Wrap `tcp` in pinned TLS and complete the handshake. Fails at once when no
+/// pin is set, and with the certificate error when the pin doesn't match.
 pub fn connect_https(tcp: TcpStream) -> io::Result<HttpsStream> {
     let pin = pin().ok_or_else(|| {
         io::Error::other(format!(
@@ -281,7 +304,16 @@ pub fn connect_https(tcp: TcpStream) -> io::Result<HttpsStream> {
     })?;
     let connection = rustls::ClientConnection::new(client_config(&pin)?, server_name())
         .map_err(io::Error::other)?;
-    Ok(rustls::StreamOwned::new(connection, tcp))
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    // Finish the handshake here, so a wrong pin fails in this call with its
+    // reason, not later as an unexplained read error. The caller sets its own
+    // timeouts afterwards.
+    stream.sock.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    stream.sock.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    while stream.conn.is_handshaking() {
+        stream.conn.complete_io(&mut stream.sock)?;
+    }
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -305,6 +337,10 @@ mod tests {
         assert_eq!(
             split_wss("wss://[::1]:6155"),
             Some(("[::1]:6155".into(), String::new()))
+        );
+        assert_eq!(
+            split_wss("wss://[::1]/myko"),
+            Some(("[::1]:443".into(), "/myko".into()))
         );
         assert_eq!(
             split_wss("wss://murph/myko"),
