@@ -341,11 +341,12 @@ stays the default and behaves as it does today.
   daemon's tree, through myko's telemetry). Done in two parts: the daemon (#102, merged in
   d2925e1) and the shim's pinned link (#104, merged in a49ade4). Each binary grows by 1.9 MB, on
   ring. Off until the operator starts the daemon with `--tls`.
-- [ ] **MAR-24: Security: Gate: per-machine pairing.** Depends on MAR-23. A Marshal `Authenticator`
+- [x] **MAR-24: Security: Gate: per-machine pairing.** Depends on MAR-23. A Marshal `Authenticator`
   on #129. Done when: a machine pairs with a single-use, expiring code and gets a token kept in a
   pairing store; the shim presents it through #129's `CredentialProvider`; an unpaired or revoked
   machine is refused, and revoking closes its open connection; and with pairings and neither `--tls`
-  nor `--plain` the daemon refuses to start, as it does when the store can't be read.
+  nor `--plain` the daemon refuses to start, as it does when the store can't be read. Done (#106),
+  merged in 37f1003.
 - [x] **MAR-25: Dropped: Gate: myko's own listener behind the gate.** Superseded by #129 (MAR-76):
   with `with_auth_provider`, myko checks every connection's token itself, so no vendored
   `RequestFilter` is needed. Its remnant, binding myko to loopback behind TLS, is part of MAR-23.
