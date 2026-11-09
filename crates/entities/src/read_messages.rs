@@ -109,6 +109,23 @@ pub struct MessageView {
     /// return. `None` on anything else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient: Option<RecipientStatus>,
+    /// The sender's kind and machine as the daemon recorded them at send time
+    /// (`Message::from_kind`, MAR-78): `"terminal"` for a `tell` from a shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_machine: Option<String>,
+}
+
+impl MessageView {
+    /// How this message's sender is named to its recipient (MAR-78).
+    pub fn sender_label(&self, nickname: &str) -> String {
+        crate::message::sender_label(
+            self.from_kind.as_deref(),
+            self.from_machine.as_deref(),
+            nickname,
+        )
+    }
 }
 
 /// What the sender of a direct message can see about its recipient.
@@ -233,6 +250,8 @@ impl CommandHandler for ReadMessages {
                             .iter()
                             .any(|r| r.message_id == m.id && &r.session_id == to),
                     }),
+                from_kind: m.from_kind.clone(),
+                from_machine: m.from_machine.clone(),
             })
             .collect();
 

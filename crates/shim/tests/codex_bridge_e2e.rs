@@ -612,6 +612,8 @@ fn emit_message(ctx: &Arc<MykoServerContext>, id: &str, recipient: &str) {
             to_operator: None,
             body: format!("wake canary {id}"),
             sent_at: 2,
+            from_kind: None,
+            from_machine: None,
         })
         .expect("emit direct message");
 }
