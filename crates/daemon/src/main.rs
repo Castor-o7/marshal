@@ -160,9 +160,21 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("marshal-daemon --tls: no state directory (set HOME)"))?
             .with_local_token(&local);
         daemon::pairing::install(store.clone());
+        // MAR-80: a connection acts only as its own sessions, and sessions
+        // registered through the hook listener belong to the daemon host.
+        let local = myko_auth::Principal {
+            issuer: daemon::pairing::ISSUER.into(),
+            subject: daemon::pairing::LOCAL_NAME.into(),
+            kind: myko_auth::PrincipalKind::Agent,
+        };
+        let binding = Arc::new(daemon::auth::session_binding::SessionBinding::new(
+            daemon::pairing::AllowAll,
+            Some(&local),
+        ));
+        binding.install();
         let provider = myko_auth::MykoAuthProvider::new(
             Arc::new(daemon::pairing::PairingAuthenticator::new(store)),
-            Arc::new(daemon::pairing::AllowAll),
+            binding,
         );
         Some(Arc::new(provider))
     } else {

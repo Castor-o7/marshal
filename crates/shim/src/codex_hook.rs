@@ -842,10 +842,20 @@ fn http_post_why(
         crate::link::Stream::Plain(tcp)
     };
     // This machine's token, when it has one, for a daemon that checks it
-    // (MAR-81); a plain daemon ignores the header.
-    let authorization = crate::tls_link::bearer()
-        .map(|token| format!("Authorization: Bearer {token}\r\n"))
-        .unwrap_or_default();
+    // (MAR-81); a plain daemon ignores the header. Only where it can't be
+    // read off the wire: over TLS, or on this host.
+    let loopback = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(host == "localhost");
+    let authorization = if tls || loopback {
+        crate::tls_link::bearer()
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
          {authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",

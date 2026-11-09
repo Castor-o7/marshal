@@ -303,3 +303,113 @@ fn tls_and_plain_together_are_refused() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("can't both be given"));
 }
+
+/// Redeem `secret` at the daemon's `/pair` over pinned TLS; the token.
+async fn redeem(daemon: &Daemon, secret: &str) -> String {
+    let mut tls = tls_connect(daemon.hooks, &daemon.fingerprint)
+        .await
+        .unwrap();
+    let body = serde_json::json!({ "invite": secret }).to_string();
+    let request = format!(
+        "POST /pair HTTP/1.1\r\nHost: marshal\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tls.write_all(request.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut answer)).await;
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let json = &answer[answer.find("\r\n\r\n").unwrap() + 4..];
+    serde_json::from_str::<serde_json::Value>(json).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+type TlsWs =
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// A WebSocket to myko through TLS with `token` as the bearer.
+async fn ws_with_token(
+    daemon: &Daemon,
+    token: &str,
+) -> Result<TlsWs, tokio_tungstenite::tungstenite::Error> {
+    let tls = tls_connect(daemon.public, &daemon.fingerprint)
+        .await
+        .unwrap();
+    let mut request = format!("wss://{}/myko", daemon.public)
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::client_async(request, tls)
+        .await
+        .map(|(ws, _)| ws)
+}
+
+/// Whether `ws` closes within `wait`.
+async fn closes_within(ws: &mut TlsWs, wait: Duration) -> bool {
+    tokio::time::timeout(wait, async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_) | Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// MAR-24: a paired machine's open connection is cut when it's unpaired, and
+/// when it's paired again (a new token), not only refused next time.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpairing_or_repairing_a_machine_cuts_its_open_connection() {
+    let daemon = start();
+    // The running daemon reads the same files, within its one-second cache.
+    let store = daemon::pairing::Store::open(daemon._state.path());
+
+    let first = redeem(
+        &daemon,
+        &store.add_invite("laptop", Duration::from_secs(60)).unwrap(),
+    )
+    .await;
+    let mut old = ws_with_token(&daemon, &first)
+        .await
+        .expect("the paired token connects");
+    assert!(
+        ws_with_token(&daemon, "not-a-token").await.is_err(),
+        "a made-up token connected"
+    );
+
+    // Paired again: the old token's connection ends, the new one's works.
+    let second = redeem(
+        &daemon,
+        &store.add_invite("laptop", Duration::from_secs(60)).unwrap(),
+    )
+    .await;
+    assert!(
+        closes_within(&mut old, Duration::from_secs(5)).await,
+        "re-pairing left the old token connected"
+    );
+    assert!(
+        ws_with_token(&daemon, &first).await.is_err(),
+        "the old token still connects"
+    );
+    let mut current = ws_with_token(&daemon, &second)
+        .await
+        .expect("the new token connects");
+
+    // Unpaired: cut within the cache's second plus the recheck, and refused after.
+    assert!(store.remove("laptop").unwrap());
+    assert!(
+        closes_within(&mut current, Duration::from_secs(5)).await,
+        "unpair left the connection open"
+    );
+    assert!(
+        ws_with_token(&daemon, &second).await.is_err(),
+        "an unpaired token still connects"
+    );
+}

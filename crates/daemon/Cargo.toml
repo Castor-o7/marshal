@@ -49,7 +49,6 @@ sha2 = "0.10"
 # bearer-token side of myko#129's provider.
 getrandom = "0.3"
 base64 = "0.22"
-myko-auth = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
 futures-util = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

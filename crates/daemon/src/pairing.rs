@@ -2,7 +2,10 @@
 //!
 //! With `--tls`, myko's listener gets myko#129's auth provider with this
 //! module's [`PairingAuthenticator`], so every WebSocket and MCP connection
-//! needs a bearer token the daemon knows. Tokens come from pairing:
+//! needs a bearer token the daemon knows. The hook listener is outside myko
+//! and isn't gated by this: until MAR-81, `/hook/*` takes any request that
+//! reaches it (TLS keeps it private on the wire, nothing more). Tokens come
+//! from pairing:
 //!
 //! 1. On the daemon's host, `marshal-daemon pair-code <name>` writes a
 //!    single-use invite, good for a while, and prints an `Invite` code.
@@ -210,13 +213,21 @@ impl Store {
             .map(|(name, _)| name)
     }
 
-    /// Whether `name` is still paired (or is the local name).
-    fn still_known(&self, name: &str) -> bool {
+    /// Whether `name` is still paired with this very token (its hash), or is
+    /// the local name with the local token. A machine paired again has a new
+    /// token, so its old one stops here.
+    fn still_known(&self, name: &str, hash: &str) -> bool {
         if name == LOCAL_NAME {
-            return self.local_token_hash.is_some();
+            return self
+                .local_token_hash
+                .as_deref()
+                .is_some_and(|local| hashes_match(local, hash));
         }
-        self.tokens_cached()
-            .is_some_and(|entries| entries.iter().any(|(n, _)| n == name))
+        self.tokens_cached().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|(n, h)| n == name && hashes_match(h, hash))
+        })
     }
 
     fn tokens_cached(&self) -> Option<Vec<(String, String)>> {
@@ -248,7 +259,7 @@ impl PairingAuthenticator {
         Self { store }
     }
 
-    fn identity(name: String) -> Result<AuthenticatedIdentity, AuthError> {
+    fn identity(name: String, token_hash: String) -> Result<AuthenticatedIdentity, AuthError> {
         Ok(AuthenticatedIdentity {
             user_id: None,
             principal: Principal {
@@ -259,7 +270,9 @@ impl PairingAuthenticator {
             client_id: None,
             scopes: vec![],
             delegation: vec![],
-            claims: serde_json::json!({ "machine": name }),
+            // The token's hash, so a machine paired again (a new token) ends
+            // the old token's connections too, not only an unpaired one.
+            claims: serde_json::json!({ "machine": name, "token": token_hash }),
             // Tokens don't expire on their own; `unpair` ends them, through
             // `validate_identity`. The identity still needs a time.
             expires_at: SystemTime::now()
@@ -280,12 +293,17 @@ impl Authenticator for PairingAuthenticator {
                 .store
                 .verify(&bearer)
                 .ok_or(AuthError::Unauthenticated)?;
-            Self::identity(name)
+            Self::identity(name, token_hash(&bearer))
         })
     }
 
     fn validate_identity(&self, identity: &AuthenticatedIdentity) -> Result<(), AuthError> {
-        if self.store.still_known(&identity.principal.subject) {
+        let hash = identity
+            .claims
+            .get("token")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        if self.store.still_known(&identity.principal.subject, hash) {
             Ok(())
         } else {
             Err(AuthError::Revoked)
@@ -295,7 +313,7 @@ impl Authenticator for PairingAuthenticator {
 
 /// An `Authorizer` that allows every request from an authenticated caller.
 /// Who may connect is the authenticator's; what a connection may do as whom
-/// is MAR-80's `SessionBinding`, which wraps this.
+/// is MAR-80's `SessionBinding`, which wraps this at the install site.
 pub struct AllowAll;
 
 impl Authorizer for AllowAll {
@@ -463,6 +481,14 @@ mod tests {
         assert_eq!(store.verify(&token), Some("laptop".into()));
         assert_eq!(store.verify("not-it"), None);
         assert_eq!(store.names().unwrap(), vec!["laptop".to_string()]);
+        // Paired again: the old token is no longer this machine's.
+        let old_hash = token_hash(&token);
+        assert!(store.still_known("laptop", &old_hash));
+        let again = store.add_invite("laptop", Duration::from_secs(60)).unwrap();
+        let (_, new_token) = store.redeem(&again).unwrap().unwrap();
+        assert!(!store.still_known("laptop", &old_hash));
+        assert!(store.still_known("laptop", &token_hash(&new_token)));
+        assert_eq!(store.verify(&token), None);
         assert!(store.remove("laptop").unwrap());
         assert!(!store.remove("laptop").unwrap());
         assert_eq!(
@@ -506,8 +532,9 @@ mod tests {
         assert_eq!(ensure_local_token(dir.path()).unwrap(), token);
         let store = Store::open(dir.path()).with_local_token(&token);
         assert_eq!(store.verify(&token), Some(LOCAL_NAME.into()));
-        assert!(store.still_known(LOCAL_NAME));
-        assert!(!Store::open(dir.path()).still_known(LOCAL_NAME));
+        assert!(store.still_known(LOCAL_NAME, &token_hash(&token)));
+        assert!(!store.still_known(LOCAL_NAME, &token_hash("other")));
+        assert!(!Store::open(dir.path()).still_known(LOCAL_NAME, &token_hash(&token)));
     }
 
     #[cfg(unix)]

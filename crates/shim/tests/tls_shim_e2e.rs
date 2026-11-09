@@ -65,6 +65,9 @@ impl Daemon {
                 .env_remove("MARSHAL_PERSIST")
                 .env("HOME", dir.path().join("home"))
                 .env("MARSHAL_STATE_DIR", dir.path().join("state"))
+                // The local token (MAR-24) goes to the config dir: this
+                // home's, not the runner's XDG_CONFIG_HOME.
+                .env_remove("XDG_CONFIG_HOME")
                 .env("MARSHAL_BIND", format!("127.0.0.1:{ws}"))
                 .env("MARSHAL_HOOK_BIND", format!("127.0.0.1:{hook}"))
                 .env("MARSHAL_MYKO_BIND", format!("127.0.0.1:{myko}"))
