@@ -580,6 +580,25 @@ pub(crate) fn resolve_mention(
 /// policy is unit-testable without a live command context.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn pick_operator_session(sessions: &[Arc<Session>], op: &str) -> Option<Arc<Session>> {
+    pick_operator_session_at(sessions, op, Utc::now().timestamp_millis())
+}
+
+/// How far ahead of the daemon's clock a client's own can run and its `lastActivityAt` still count
+/// as activity (MAR-55): a machine whose clock is a few seconds fast, as another machine's may be
+/// against Murph's, is still live.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const CLOCK_TOLERANCE_MS: i64 = 60_000;
+
+/// [`pick_operator_session`] at `now_ms`. Clients report `lastActivityAt` themselves, so one later
+/// than now isn't activity: it ranks as none, or it would win the operator's mail for as long as
+/// it stays in the future (MAR-51, from muster's MUS-33). One less than [`CLOCK_TOLERANCE_MS`]
+/// ahead is a fast clock, and counts as activity now (MAR-55).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn pick_operator_session_at(
+    sessions: &[Arc<Session>],
+    op: &str,
+    now_ms: i64,
+) -> Option<Arc<Session>> {
     sessions
         .iter()
         .filter(|s| {
@@ -590,8 +609,67 @@ pub(crate) fn pick_operator_session(sessions: &[Arc<Session>], op: &str) -> Opti
         .cloned()
         .max_by_key(|s| {
             let live = s.client_id.is_some() && s.channels_enabled != Some(false);
-            (live as i64, s.last_activity_at.unwrap_or(s.connected_at))
+            let active = s.last_activity_at.unwrap_or(s.connected_at);
+            let active = if active > now_ms + CLOCK_TOLERANCE_MS {
+                0
+            } else {
+                active.min(now_ms)
+            };
+            (live as i64, active)
         })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod operator_routing_tests {
+    use super::*;
+
+    /// Built from JSON so only the fields routing reads are named.
+    fn session(id: &str, last_activity_at: i64) -> Arc<Session> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "pid": 0,
+                "cwd": "/repo",
+                "connectedAt": 0,
+                "lastActivityAt": last_activity_at,
+                "operator": "op@example.test",
+            }))
+            .expect("a session"),
+        )
+    }
+
+    #[test]
+    fn a_future_activity_time_does_not_win_operator_mail() {
+        let now = 10_000_000;
+        let sessions = [
+            session("honest", now - 1_000),
+            session("liar", now + 86_400_000),
+        ];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "honest");
+        // Without the future one, the most recently active still wins, as before.
+        let sessions = [session("older", now - 5_000), session("newer", now - 1_000)];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "newer");
+        // A clock a little fast is still live: it counts as activity now, ahead of an older one.
+        let sessions = [
+            session("older", now - 5_000),
+            session("fast-clock", now + 30_000),
+        ];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "fast-clock");
+        // Past the tolerance it's no activity at all.
+        let sessions = [
+            session("older", now - 5_000),
+            session("liar", now + CLOCK_TOLERANCE_MS + 1),
+        ];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "older");
+        // A time exactly now is real activity.
+        let sessions = [session("older", now - 5_000), session("now", now)];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "now");
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

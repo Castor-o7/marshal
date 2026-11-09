@@ -61,6 +61,13 @@ fork's `main`.
   self-hosted runners, which the fork has none of, so every fork run sat queued. Done when: `check` and
   `windows-cross-check` run on `ubuntu-latest` on the fork, Release stays untouched, and it's merged
   (Castor #3).
+- [ ] **MAR-61: Foundation: The wake-leader failover test polls with a delay.** Main's `check` job
+  failed twice in a row (runs 42544039558 and 42544694495) at
+  `bridges_elect_one_wake_leader_and_fail_over`'s "second acquires released wake-leader lock". The
+  test polled 100 times back to back, so a released lock still held for a moment (likely a child
+  another test forked holding a copy of the fd until its exec) outlasted every poll on a hosted
+  runner. Done when: the test sleeps between polls, bounded at about 5 s, and main's `check` job is
+  green on the merge.
 
 ## Goal 1: Codex live delivery
 
@@ -385,6 +392,9 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   them by name. Waits on the operator: licensing is Josh's to raise with upstream. Done when: the
   four crates carry a licence upstream, or the UI drops or replaces them, and the exclusion comes
   out of `deny.toml`.
+  Research (2026-11-09): [ui-crate-licences.md](ui-crate-licences.md). The READMEs do say MIT, but
+  with no LICENSE file, copyright notice or `license` field; it has a draft ask for upstream and
+  the replacement options.
 - [x] **MAR-43: Later: Hold a shim's first write until it's registered, and retry one refused as
   unregistered.** From MUS-72, MUS-78 and MUS-79. A default change, so it's in MAR-15 for upstream and
   built on the fork first. An agent's first write can beat the shim's registration, or land on a row
