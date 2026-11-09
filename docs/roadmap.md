@@ -275,26 +275,31 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   gives the project-local wiring, the checks with their expected output, and teardown, checked
   against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
   doc is marked not yet run. Done (#57), merged in 565688e.
-- [ ] **MAR-72: Cutover: a dry-run checklist for moving the watchman and the lamplighter.** Step 3 of the
+- [x] **MAR-72: Cutover: a dry-run checklist for moving the watchman and the lamplighter.** Step 3 of the
   cutover runbook. Step 1's kit launches with `--setting-sources project`, which drops all the user's
   settings (auto mode, permission rules, model), not just Muster's hooks, and the lamplighter's `~/src`
   is shared with other sessions. Done when: [cutover-step3-dry-run.md](cutover-step3-dry-run.md) gives
   the wiring for both directories, the dry-run checks with a stand-in per role, the move's order (drain
   and RAL-122's check, announce on Muster, restart, announce on Marshal, record the succession, check
-  again), and rollback. Marked not yet run.
+  again), and rollback. Marked not yet run. Done (#83), merged in aa8ffe1; the lamplighter's dry run
+  (checks 1–3 passed) is recorded by #86, merged in 0399b5b.
 - [x] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
   `marshal-shim doctor` reads only `~/.claude/settings.json` and `~/.claude.json`, so it can't check a
   session wired by a project-local `.claude/settings.json` and `.mcp.json`, which is how the cutover
   moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
   `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
   and its exit status unchanged, with tests. Done (#58), merged in 2271713.
-- [x] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
+- [ ] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
   (2026-11-09) for rally's cutover.md step 1, with MAR-59's kit. Done when: a fresh session wired only
   to Marshal through project-local files shows on `marshal-shim roster`, wakes when idle on `tell`, and
   gets mail sent before a `marshal-daemon` restart after it, with nothing user-wide changed and
   muster-daemon untouched; the run, its outputs and what went wrong are recorded in
   [cutover-test-session.md](cutover-test-session.md), and the kit is corrected where the run showed it
-  wrong. Found MAR-71. Done (#80), merged in 9ac68b6.
+  wrong. Found MAR-71. The first run's record was merged in #80 (9ac68b6). Reopened by the watchman
+  (2026-11-09): that run's check 4 didn't test unread mail across a restart, because the held wait
+  hook took the token 0.2 s after the send, before the restart. Done when, as well: mail is shown
+  unread in the `marshal` database at a `marshal-daemon` restart (no `MessageRead` before it, read
+  only), and it reaches the session once afterwards.
 - [x] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
   step 7 retires Muster "only after a full day with no traffic", which nothing defined. Done when:
   [muster-no-traffic-check.md](muster-no-traffic-check.md) defines no traffic (no message and no
