@@ -261,6 +261,8 @@ impl CommandHandler for SendMessage {
             to_operator: to_operator.clone(),
             body: self.body.clone(),
             sent_at: now,
+            from_kind: sender.kind.clone(),
+            from_machine: sender.host.as_ref().map(|h| h.name.clone()),
         };
 
         // Persist unconditionally: in the pull model the recipient reads
@@ -296,7 +298,7 @@ impl CommandHandler for SendMessage {
                     // banner). `meta.body` is a bounded model-context preview;
                     // the persisted Message retains the complete body.
                     direct_push_content(
-                        &from_nickname,
+                        &msg.sender_label(&from_nickname),
                         to_operator.as_deref(),
                         body_truncated.then_some(msg.id.0.as_ref()),
                     ),

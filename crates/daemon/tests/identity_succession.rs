@@ -347,6 +347,8 @@ fn unread_mail_is_handed_to_the_successor() {
         response_required: false,
         body: body.into(),
         sent_at: 1,
+        from_kind: None,
+        from_machine: None,
     };
     let unread = mail("unread");
     let read = mail("read");
@@ -477,6 +479,8 @@ fn a_codex_row_whose_bridge_record_ended_is_taken_over() {
         response_required: false,
         body: "while it was gone".into(),
         sent_at: now - 300_000,
+        from_kind: None,
+        from_machine: None,
     };
     ctx.set(&unread).expect("message SET");
 

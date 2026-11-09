@@ -145,6 +145,15 @@ launcher.
   `plugins/marshal-shim/hooks/hooks.json` once each; it changes nothing, and exits non-zero on any
   failure.
 
+- [ ] **MAR-78: Goal 3: A terminal's tell is named as a terminal on its machine.** Found in MAR-70:
+  a recipient saw each `tell` as "from gusty-dorado", a throwaway nickname that's new on every run,
+  and took it for a peer. Done when: the daemon records the sender's kind and machine on each message
+  from the sender's own roster row at send time (`Message::from_kind`, `from_machine`); the inbox, the
+  live push and the MCP messages view name a terminal's message "a terminal on <machine>"; it's never
+  derived from the body, and tests show a peer writing the terminal prefix is still named by its
+  nickname, and a sender's later re-registration doesn't relabel what it sent. Until the gate
+  (MAR-24), kind and host are declared by the sender's client, like every roster field.
+
 ## Supporting: Claude delivery
 
 - [x] **MAR-3: Supporting: Hook inbox never offers a message twice (lease race).** `surface_unread`

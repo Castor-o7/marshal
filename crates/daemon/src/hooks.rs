@@ -755,8 +755,11 @@ fn surface_unread(cmd_ctx: &CommandContext, sid: &str) -> (String, Vec<MessageId
             + 2,
     );
     let render_line = |m: &MessageView| -> String {
-        let sender = nickname_for(cmd_ctx, m.from_session_id.0.as_ref())
+        let nickname = nickname_for(cmd_ctx, m.from_session_id.0.as_ref())
             .unwrap_or_else(|_| marshal_entities::nickname(m.from_session_id.0.as_ref()));
+        // A terminal's `tell` is named by its machine, from what the daemon
+        // recorded at send time, never from the body (MAR-78).
+        let sender = m.sender_label(&nickname);
         let (preview, truncated) = context_preview(&m.body, per_message_chars);
         let head = format!(
             "- from {} [response_required={}]: ",

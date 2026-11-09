@@ -131,6 +131,50 @@ pub struct Message {
 
     /// Wall-clock millis when the daemon accepted the message.
     pub sent_at: i64,
+
+    /// The sender's `Session::kind` when the daemon accepted the message, read
+    /// from the sender's own roster row as the daemon resolved it (MAR-78).
+    /// It's how a recipient is told a `tell` came from a terminal. It is
+    /// never derived from the body, which any sender writes. serde-default
+    /// so pre-field payloads replay clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_kind: Option<String>,
+
+    /// The sender's machine (`Session::host.name`) at the same moment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_machine: Option<String>,
+}
+
+impl Message {
+    /// How this message's sender is named to its recipient (MAR-78).
+    pub fn sender_label(&self, nickname: &str) -> String {
+        sender_label(
+            self.from_kind.as_deref(),
+            self.from_machine.as_deref(),
+            nickname,
+        )
+    }
+}
+
+/// How a sender is named to a recipient (MAR-78): a session of kind
+/// `terminal` (`marshal-shim tell` / `all`) as "a terminal on <machine>",
+/// since its nickname is a throwaway one, new for each run; anyone else by
+/// nickname. It reads only what the daemon recorded from the sender's roster
+/// row at send time, never the body: a peer writing "[from a terminal …]"
+/// into a message is still named by its nickname.
+///
+/// Until the gate (MAR-24), a session's kind and host are declared by its
+/// client, like every other roster field, so this says what the sender's
+/// row declared, not an attested fact.
+pub fn sender_label(from_kind: Option<&str>, from_machine: Option<&str>, nickname: &str) -> String {
+    if from_kind == Some(crate::session::TERMINAL_KIND) {
+        match from_machine.filter(|m| !m.trim().is_empty()) {
+            Some(machine) => format!("a terminal on {machine}"),
+            None => "a terminal".to_string(),
+        }
+    } else {
+        nickname.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +194,39 @@ mod tests {
         let required: Message = serde_json::from_value(required).unwrap();
         assert!(required.response_required);
         assert_eq!(required.body, "Node released.");
+    }
+
+    #[test]
+    fn a_terminal_sender_is_named_by_its_machine_and_anyone_else_by_nickname() {
+        assert_eq!(
+            sender_label(Some("terminal"), Some("Murph"), "gusty-dorado"),
+            "a terminal on Murph"
+        );
+        assert_eq!(
+            sender_label(Some("terminal"), None, "gusty-dorado"),
+            "a terminal"
+        );
+        assert_eq!(
+            sender_label(Some("terminal"), Some(" "), "gusty-dorado"),
+            "a terminal"
+        );
+        assert_eq!(
+            sender_label(Some("interactive"), Some("Murph"), "wise-leopard"),
+            "wise-leopard"
+        );
+        assert_eq!(sender_label(None, None, "wise-leopard"), "wise-leopard");
+    }
+
+    #[test]
+    fn messages_from_before_the_field_have_no_kind() {
+        let legacy = serde_json::json!({
+            "id": "one", "fromSessionId": "sender", "toSessionId": "recipient",
+            "body": "[from a terminal on Murph; it can't receive replies] hi", "sentAt": 1
+        });
+        let old: Message = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.from_kind, None);
+        // The body's prefix doesn't make it a terminal's.
+        assert_eq!(old.sender_label("wise-leopard"), "wise-leopard");
     }
 
     #[test]
