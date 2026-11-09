@@ -6,7 +6,9 @@
 //! Checks, in order: this binary is the `marshal-shim` on `PATH`; the daemon
 //! accepts a WebSocket handshake; and Claude Code is wired to Marshal, with the
 //! MCP server and every hook in `plugins/marshal-shim/hooks/hooks.json`, once
-//! each.
+//! each. The wiring is read from the user's files and, when doctor runs in a
+//! project, that project's `.claude/settings.json`, `.claude/settings.local.json`
+//! and `.mcp.json` too (MAR-60).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -135,78 +137,158 @@ fn hook_commands<'a>(settings: &'a Value, event: &str) -> Vec<(&'a str, bool)> {
         .collect()
 }
 
-fn plugin_enabled(settings: Option<&Value>) -> bool {
-    settings.is_some_and(|s| s["enabledPlugins"][PLUGIN_ID].as_bool() == Some(true))
+/// One config file doctor read, and what it says.
+pub struct Source<'a> {
+    /// How the finding names it, such as `~/.claude/settings.json`.
+    pub label: String,
+    pub value: &'a Value,
 }
 
-/// Claude Code's wiring, from `settings.json` and `.claude.json` (either may be
-/// missing). Pure, so it's tested without a home directory.
-pub fn claude_wiring(settings: Option<&Value>, claude_json: Option<&Value>) -> Vec<Finding> {
+impl<'a> Source<'a> {
+    pub fn new(label: impl Into<String>, value: &'a Value) -> Self {
+        Source {
+            label: label.into(),
+            value,
+        }
+    }
+}
+
+/// Whether the plugin is on. Each settings scope can set it, and a later scope
+/// (user, then project, then local) wins.
+fn plugin_enabled(settings: &[Source]) -> bool {
+    settings
+        .iter()
+        .rev()
+        .find_map(|s| s.value["enabledPlugins"][PLUGIN_ID].as_bool())
+        .unwrap_or(false)
+}
+
+fn joined(labels: &[&str]) -> String {
+    match labels {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Claude Code's wiring from the user's two files alone (either may be
+/// missing): [`claude_wiring_from`] with no project files.
+#[cfg(test)]
+fn claude_wiring(settings: Option<&Value>, claude_json: Option<&Value>) -> Vec<Finding> {
+    let settings: Vec<Source> = settings
+        .map(|v| Source::new("~/.claude/settings.json", v))
+        .into_iter()
+        .collect();
+    let mcp: Vec<Source> = claude_json
+        .map(|v| Source::new("~/.claude.json", &v["mcpServers"]))
+        .into_iter()
+        .collect();
+    claude_wiring_from(&settings, &mcp)
+}
+
+/// Claude Code's wiring across every file it reads (MAR-60): `settings` are
+/// the scopes' settings files, user first, and `mcp` the `mcpServers` maps
+/// (user, this project in `~/.claude.json`, and `.mcp.json`). Hooks from every
+/// scope run, so a hook in two of them runs twice. Each finding names the
+/// files it came from.
+pub fn claude_wiring_from(settings: &[Source], mcp: &[Source]) -> Vec<Finding> {
     let mut out = Vec::new();
     let plugin = plugin_enabled(settings);
 
-    // The MCP server: the plugin, or a user-scope `mcpServers` entry.
-    let has_server = claude_json
-        .and_then(|c| c["mcpServers"].as_object())
-        .is_some_and(|m| {
-            m.values().any(|v| {
-                v["command"]
-                    .as_str()
-                    .is_some_and(|c| is_shim(split_command(c).0))
+    // The MCP server: the plugin, or an `mcpServers` entry in one of the files.
+    let servers: Vec<&str> = mcp
+        .iter()
+        .filter(|m| {
+            m.value.as_object().is_some_and(|m| {
+                m.values().any(|v| {
+                    v["command"]
+                        .as_str()
+                        .is_some_and(|c| is_shim(split_command(c).0))
+                })
             })
-        });
-    out.push(match (plugin, has_server) {
-        (true, true) => Finding::warn(
+        })
+        .map(|m| m.label.as_str())
+        .collect();
+    out.push(match (plugin, servers.as_slice()) {
+        (true, []) => Finding::ok("claude mcp", format!("from the {PLUGIN_ID} plugin")),
+        (true, found) => Finding::warn(
             "claude mcp",
-            "the marshal MCP server is configured twice: by the plugin and in ~/.claude.json",
-            "keep one: `claude mcp remove -s user marshal`, or uninstall the plugin",
+            format!(
+                "the marshal MCP server is configured twice: by the plugin and in {}",
+                joined(found)
+            ),
+            "keep one: remove the `marshal` server from those files, or uninstall the plugin",
         ),
-        (true, false) => Finding::ok("claude mcp", format!("from the {PLUGIN_ID} plugin")),
-        (false, true) => Finding::ok("claude mcp", "marshal-shim in ~/.claude.json"),
-        (false, false) => Finding::fail(
+        (false, [one]) => Finding::ok("claude mcp", format!("marshal-shim in {one}")),
+        (false, []) => Finding::fail(
             "claude mcp",
             "no marshal MCP server for Claude Code",
             "install the plugin (`/plugin install marshal-shim@marshal`), or \
              `claude mcp add -s user marshal marshal-shim`",
         ),
+        (false, found) => Finding::warn(
+            "claude mcp",
+            format!(
+                "the marshal MCP server is in {} places: {}",
+                found.len(),
+                joined(found)
+            ),
+            "keep one: Claude Code may start a shim for each",
+        ),
     });
 
     // The hooks. The plugin supplies them, so with the plugin on, any copy in
-    // settings.json runs twice.
+    // a settings file runs twice.
     let mut hook_problem = false;
+    let mut hook_files: Vec<&str> = Vec::new();
     for &(event, command, rewake) in CLAUDE_HOOKS {
-        let found: Vec<bool> = settings
-            .map(|s| hook_commands(s, event))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(c, _)| same_hook(c, command))
-            .map(|(_, r)| r)
+        let found: Vec<(&str, bool)> = settings
+            .iter()
+            .flat_map(|s| {
+                hook_commands(s.value, event)
+                    .into_iter()
+                    .filter(|(c, _)| same_hook(c, command))
+                    .map(move |(_, r)| (s.label.as_str(), r))
+            })
             .collect();
+        for (label, _) in &found {
+            if !hook_files.contains(label) {
+                hook_files.push(label);
+            }
+        }
+        let files: Vec<&str> = found.iter().map(|(l, _)| *l).collect();
         let check = "claude hook";
         let name = format!("{event}: {command}");
         let finding = match (plugin, found.as_slice()) {
             (true, []) => continue,
-            (false, [r]) if *r == rewake => continue,
+            (false, [(_, r)]) if *r == rewake => continue,
             (true, _) => Finding::warn(
                 check,
-                format!("{name} is in settings.json and also comes from the plugin"),
-                "remove it from ~/.claude/settings.json; the plugin runs it",
+                format!(
+                    "{name} is in {} and also comes from the plugin",
+                    joined(&files)
+                ),
+                "remove it from there; the plugin runs it",
             ),
             (false, []) => Finding::fail(
                 check,
                 format!("{name} is missing"),
-                "install the plugin, or add it to ~/.claude/settings.json as \
-                 plugins/marshal-shim/hooks/hooks.json has it",
+                "install the plugin, or add it to ~/.claude/settings.json (or the project's \
+                 .claude/settings.json) as plugins/marshal-shim/hooks/hooks.json has it",
             ),
-            (false, [r]) => Finding::fail(
+            (false, [(file, r)]) => Finding::fail(
                 check,
-                format!("{name} has asyncRewake {r}, needs {rewake}"),
+                format!("{name} in {file} has asyncRewake {r}, needs {rewake}"),
                 "fix it to match plugins/marshal-shim/hooks/hooks.json",
             ),
             (false, more) => Finding::warn(
                 check,
-                format!("{name} is there {} times", more.len()),
-                "keep one in ~/.claude/settings.json",
+                format!(
+                    "{name} is there {} times, in {}",
+                    more.len(),
+                    joined(&files)
+                ),
+                "keep one: Claude Code runs every copy",
             ),
         };
         hook_problem = true;
@@ -216,9 +298,9 @@ pub fn claude_wiring(settings: Option<&Value>, claude_json: Option<&Value>) -> V
         out.push(Finding::ok(
             "claude hook",
             if plugin {
-                "from the plugin"
+                "from the plugin".to_string()
             } else {
-                "all five in ~/.claude/settings.json"
+                format!("all five in {}", joined(&hook_files))
             },
         ));
     }
@@ -335,10 +417,41 @@ pub async fn run() -> Result<()> {
     )];
     findings.push(daemon_check(&crate::daemon_address()).await);
     let (settings, claude_json) = claude_files();
-    findings.extend(claude_wiring(
-        settings.as_deref().and_then(read_json).as_ref(),
-        claude_json.as_deref().and_then(read_json).as_ref(),
-    ));
+    let cwd = std::env::current_dir().ok();
+    let user_settings = settings.as_deref().and_then(read_json);
+    let claude_json = claude_json.as_deref().and_then(read_json);
+    // This project's own files (MAR-60): Claude Code adds them to the user's.
+    let project = |rel: &str| cwd.as_ref().and_then(|d| read_json(&d.join(rel)));
+    let project_settings = project(".claude/settings.json");
+    let local_settings = project(".claude/settings.local.json");
+    let mcp_json = project(".mcp.json");
+    let project_entry = cwd.as_ref().and_then(|d| {
+        claude_json
+            .as_ref()
+            .map(|c| &c["projects"][d.to_string_lossy().as_ref()]["mcpServers"])
+            .filter(|v| v.is_object())
+    });
+    let mut settings_sources = Vec::new();
+    if let Some(v) = &user_settings {
+        settings_sources.push(Source::new("~/.claude/settings.json", v));
+    }
+    if let Some(v) = &project_settings {
+        settings_sources.push(Source::new(".claude/settings.json", v));
+    }
+    if let Some(v) = &local_settings {
+        settings_sources.push(Source::new(".claude/settings.local.json", v));
+    }
+    let mut mcp_sources = Vec::new();
+    if let Some(c) = &claude_json {
+        mcp_sources.push(Source::new("~/.claude.json", &c["mcpServers"]));
+    }
+    if let Some(v) = project_entry {
+        mcp_sources.push(Source::new("~/.claude.json (this project)", v));
+    }
+    if let Some(v) = &mcp_json {
+        mcp_sources.push(Source::new(".mcp.json", &v["mcpServers"]));
+    }
+    findings.extend(claude_wiring_from(&settings_sources, &mcp_sources));
     for f in &findings {
         println!("{}", render(f));
     }
@@ -521,6 +634,128 @@ mod tests {
         ));
         assert!(!is_shim("marshal-shim-old"));
         assert!(is_shim("./marshal-shim"));
+    }
+
+    /// The MAR-59 cutover kit's project-local wiring: the five hooks by absolute
+    /// path in the project's settings, and the server in `.mcp.json`.
+    fn kit() -> (Value, Value) {
+        let shim = "/home/joshd/.cargo/bin/marshal-shim";
+        let mut settings = hooks_json();
+        for groups in settings["hooks"].as_object_mut().unwrap().values_mut() {
+            for g in groups.as_array_mut().unwrap() {
+                for h in g["hooks"].as_array_mut().unwrap() {
+                    let cmd = h["command"]
+                        .as_str()
+                        .unwrap()
+                        .replacen("marshal-shim", shim, 1);
+                    h["command"] = json!(cmd);
+                }
+            }
+        }
+        let mcp = json!({ "marshal": { "command": shim, "env": { "MARSHAL_DAEMON_ADDRESS": "ws://127.0.0.1:6155" } } });
+        (settings, mcp)
+    }
+
+    #[test]
+    fn a_project_wired_on_its_own_passes_and_names_its_files() {
+        let (settings, mcp) = kit();
+        // The user's own files have muster's wiring, nothing of Marshal's.
+        let user = json!({ "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "muster-shim claude-hook wait", "asyncRewake": true } ] } ] } });
+        let user_mcp = json!({ "muster": { "command": "muster-shim" } });
+        let f = claude_wiring_from(
+            &[
+                Source::new("~/.claude/settings.json", &user),
+                Source::new(".claude/settings.json", &settings),
+            ],
+            &[
+                Source::new("~/.claude.json", &user_mcp),
+                Source::new(".mcp.json", &mcp),
+            ],
+        );
+        assert!(f.iter().all(|f| f.level == Level::Ok), "{:?}", levels(&f));
+        assert!(
+            f.iter().any(|f| f.detail == "marshal-shim in .mcp.json"),
+            "{:?}",
+            levels(&f)
+        );
+        assert!(
+            f.iter()
+                .any(|f| f.detail == "all five in .claude/settings.json"),
+            "{:?}",
+            levels(&f)
+        );
+    }
+
+    #[test]
+    fn a_hook_in_both_the_users_and_the_projects_settings_warns_naming_both() {
+        let (settings, mcp) = kit();
+        let user = hooks_json();
+        let f = claude_wiring_from(
+            &[
+                Source::new("~/.claude/settings.json", &user),
+                Source::new(".claude/settings.json", &settings),
+            ],
+            &[Source::new(".mcp.json", &mcp)],
+        );
+        let twice: Vec<_> = f.iter().filter(|f| f.detail.contains("2 times")).collect();
+        assert_eq!(twice.len(), CLAUDE_HOOKS.len(), "{:?}", levels(&f));
+        assert!(
+            twice.iter().all(|f| f
+                .detail
+                .contains("~/.claude/settings.json and .claude/settings.json")),
+            "{:?}",
+            levels(&f)
+        );
+    }
+
+    #[test]
+    fn a_server_in_two_files_warns_naming_both() {
+        let (settings, mcp) = kit();
+        let user_mcp = json!({ "marshal": { "command": "marshal-shim" } });
+        let f = claude_wiring_from(
+            &[Source::new(".claude/settings.json", &settings)],
+            &[
+                Source::new("~/.claude.json", &user_mcp),
+                Source::new(".mcp.json", &mcp),
+            ],
+        );
+        assert!(
+            f.iter().any(|f| f.level == Level::Warn
+                && f.detail.contains("2 places")
+                && f.detail.contains("~/.claude.json and .mcp.json")),
+            "{:?}",
+            levels(&f)
+        );
+    }
+
+    #[test]
+    fn a_later_scope_decides_whether_the_plugin_is_on() {
+        let on = json!({ "enabledPlugins": { PLUGIN_ID: true } });
+        let off = json!({ "enabledPlugins": { PLUGIN_ID: false } });
+        let f = claude_wiring_from(
+            &[
+                Source::new("~/.claude/settings.json", &on),
+                Source::new(".claude/settings.json", &off),
+            ],
+            &[],
+        );
+        assert!(
+            f.iter().any(|f| f.level == Level::Fail),
+            "the project turned it off: {:?}",
+            levels(&f)
+        );
+        let f = claude_wiring_from(
+            &[
+                Source::new("~/.claude/settings.json", &off),
+                Source::new(".claude/settings.local.json", &on),
+            ],
+            &[],
+        );
+        assert!(
+            f.iter().all(|f| f.level == Level::Ok),
+            "the local scope turned it on: {:?}",
+            levels(&f)
+        );
     }
 
     #[test]

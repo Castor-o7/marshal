@@ -20,6 +20,19 @@ use myko::{
 use myko_server::{BlackholePersister, MykoServer};
 use uuid::Uuid;
 
+/// `succession`'s observations are one process-wide static, and the sweeper's
+/// calls are written for one caller: `observe_bridges` marks every session it
+/// has seen and isn't given as lapsed, and `observe` replaces the live clients
+/// and known rows. Tests that feed it run in parallel, so one test's call can
+/// mark another's session lapsed at the wrong time (MAR-62). Each of them holds
+/// this from its first observation to its last assertion.
+static OBSERVATIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn observations() -> std::sync::MutexGuard<'static, ()> {
+    // A failed test poisons it; the next one still runs.
+    OBSERVATIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn setup() -> MykoServerContext {
     marshal_entities::link();
     daemon::link();
@@ -114,6 +127,7 @@ fn a_restarted_session_takes_over_and_the_record_says_why() {
 
 #[test]
 fn a_role_is_not_taken_over_while_its_holder_is_live() {
+    let _observations = observations();
     let ctx = setup();
     let client = Uuid::new_v4().to_string();
     let holder = session(&unique_cwd(), Some("watchman"), Some(&client));
@@ -414,6 +428,7 @@ fn quiet_codex(cwd: &str) -> Session {
 #[test]
 fn a_bridge_watched_codex_sibling_keeps_its_name() {
     use marshal_entities::{WakeWatcher, WakeWatcherId};
+    let _observations = observations();
     let ctx = setup();
     let cwd = unique_cwd();
     let old = quiet_codex(&cwd);
@@ -443,6 +458,7 @@ fn a_bridge_watched_codex_sibling_keeps_its_name() {
 #[test]
 fn a_codex_row_whose_bridge_record_ended_is_taken_over() {
     use marshal_entities::{GetAllMessages, Message, MessageId};
+    let _observations = observations();
     let ctx = setup();
     let cwd = unique_cwd();
     let old = quiet_codex(&cwd);
