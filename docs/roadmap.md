@@ -210,7 +210,7 @@ launcher.
 - [x] **MAR-10: Later: Plugins ack a push only after the harness takes it.** From MUS-81. Pi, opencode
   and Prime Agent mark a push read as soon as it reaches the connection. Overlaps lobo235's upstream
   plugin PRs: coordinate, don't race. Done when: a push the harness didn't take stays unread for the
-  next drain, in each of the three plugins, with a test each. Done (#37), merged in 8a1582e.
+  next drain, in each of the three plugins, with a test each. Done (#33, #36, #37), last merged in 8a1582e.
 - [x] **MAR-11: Dropped: Resuming wakes re-pushes held mail to push sessions.** From MUS-82. Dropped
   with the wake pause ([muster-terminal-gap.md](muster-terminal-gap.md)); reopens only if the pause
   is ported. Marshal has no pause to resume, so there's nothing to fix.
