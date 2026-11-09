@@ -1278,7 +1278,7 @@ pub async fn run(args: &[String]) -> Result<()> {
     let sessions = client.watch_query::<GetAllSessions>(GetAllSessions {});
     let messages = client.watch_query::<GetAllMessages>(GetAllMessages {});
     let reads = client.watch_query::<GetAllMessageReads>(GetAllMessageReads {});
-    client.set_address(Some(args.daemon.clone()));
+    client.set_address(Some(crate::tls_link::myko_address(args.daemon.clone())));
 
     log::info!(
         "[codex-bridge] watching host={local_host} daemon={} app_server={}",
