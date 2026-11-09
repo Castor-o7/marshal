@@ -74,3 +74,5 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Draft branch only (MAR-37): myko#129 pinned by rev. Never merged.
+allow-git = ["https://github.com/ignition-is-go/myko"]
