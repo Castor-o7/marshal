@@ -196,6 +196,7 @@ impl Cell {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: chrono::Utc::now().timestamp_millis(),
             last_activity_at: None,
@@ -458,11 +459,15 @@ fn nothing_is_started_when_the_daemon_cant_be_reached() {
     if !have_tmux() {
         return;
     }
-    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // A port bound but never listened on, held for the whole test (MAR-67).
+    // Connecting to it is refused, as a daemon that isn't running would be,
+    // and while it's bound no parallel test's daemon can take it. Without
+    // SO_REUSEADDR, so no other socket can share the bind. Dropping a
+    // listener to find a free port left it for anyone to take first.
+    let dead = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    dead.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let port = dead.local_addr().unwrap().as_socket().unwrap().port();
     let rig = Rig::new(RECORDING_HARNESS);
     let out = finish(rig.spawn(
         &format!("ws://127.0.0.1:{port}"),
@@ -476,6 +481,7 @@ fn nothing_is_started_when_the_daemon_cant_be_reached() {
     );
     assert!(!rig.has_session("e2e-nodaemon"));
     assert!(!rig.marker().exists());
+    drop(dead);
 }
 
 #[test]

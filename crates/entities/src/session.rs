@@ -53,6 +53,49 @@ mod tests {
         assert!(serde_json::to_value(s).unwrap().get("agentId").is_none());
     }
 
+    /// MAR-58: `activity_at` is camelCase on the wire, survives the round
+    /// trip a re-register's SET makes, and is absent (not null) when unset.
+    #[test]
+    fn activity_at_round_trips_and_is_omitted_when_unset() {
+        let mut s = Session {
+            id: SessionId(Arc::from("sess-mar58")),
+            client_id: None,
+            agent_id: None,
+            pid: 1,
+            cwd: "/repo".into(),
+            git_branch: None,
+            current_task: None,
+            session_name: None,
+            activity: Some("idle".into()),
+            activity_at: Some(1_794_186_070_745_i64),
+            kind: None,
+            connected_at: 1_700_000_000_000_i64,
+            last_activity_at: None,
+            last_tool: None,
+            last_tool_at: None,
+            operator: None,
+            host: None,
+            project: None,
+            channels_enabled: None,
+            acks_pushes: None,
+            harness: None,
+            identity: None,
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["activityAt"], 1_794_186_070_745_i64);
+        let back: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(back.activity_at, Some(1_794_186_070_745_i64));
+
+        s.activity = None;
+        s.activity_at = None;
+        assert!(
+            serde_json::to_value(&s)
+                .unwrap()
+                .get("activityAt")
+                .is_none()
+        );
+    }
+
     #[test]
     fn session_with_liveness_round_trips() {
         let s = Session {
@@ -65,6 +108,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 1_700_000_000_000_i64,
             last_activity_at: Some(1_700_000_005_000_i64),
@@ -100,6 +144,7 @@ mod tests {
             current_task: None,
             session_name: Some("auth refactor".into()),
             activity: Some("busy".into()),
+            activity_at: None,
             kind: Some("interactive".into()),
             connected_at: 1_700_000_000_000_i64,
             last_activity_at: None,
@@ -197,6 +242,17 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[myko_setter]
     pub activity: Option<String>,
+
+    /// Wall-clock millis when `activity` last changed, so a reader can tell
+    /// "idle for a minute" from "idle for an hour". Taken from the manifest's
+    /// `statusUpdatedAt` when it has one, so a shim restart or a re-register
+    /// keeps the real time; otherwise the shim's clock when it saw the change.
+    /// `None` whenever `activity` is `None` (Codex, older Claude builds).
+    /// Pushed by its own setter right after `activity`'s, so the two can
+    /// briefly disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[myko_setter]
+    pub activity_at: Option<i64>,
 
     /// Session kind, from the manifest `kind`: `"interactive"` (a human at a
     /// terminal) or `"bg"` (a background / headless agent). Set once at
