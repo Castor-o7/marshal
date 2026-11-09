@@ -47,15 +47,15 @@ pub fn seen(transcript: &Path, ids: &[String]) -> Vec<String> {
 pub fn seen_in(text: &str, ids: &[String]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for line in text.lines() {
-        // Cheap test first: most lines name none of the ids.
-        let named: Vec<&String> = ids
-            .iter()
-            .filter(|id| !found.contains(id) && line.contains(id.as_str()))
-            .collect();
-        if named.is_empty() || !went_to_model(line) {
+        // Cheap test first: most lines name none of the ids, or no inbox.
+        if !line.contains("marshal_inbox") || !ids.iter().any(|id| line.contains(id.as_str())) {
             continue;
         }
-        found.extend(named.into_iter().cloned());
+        for id in delivered_ids(line) {
+            if ids.contains(&id) && !found.contains(&id) {
+                found.push(id);
+            }
+        }
         if found.len() == ids.len() {
             break;
         }
@@ -63,15 +63,68 @@ pub fn seen_in(text: &str, ids: &[String]) -> Vec<String> {
     found
 }
 
-/// Whether a transcript line is a record of content sent to the model.
-fn went_to_model(line: &str) -> bool {
+/// The ids named by inbox blocks that one transcript line shows went to the
+/// model: the `ids` attribute of each `<marshal_inbox …>` opening tag in the
+/// record's text, outside any tool result. Only the daemon writes that tag:
+/// it escapes `<` in every body and handle, so a message can't forge one.
+/// A tool result can hold one, though (a session that reads a log or a
+/// transcript), and that isn't delivery, so tool results are skipped.
+fn delivered_ids(line: &str) -> Vec<String> {
     let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
+        return Vec::new();
     };
-    record
+    let model_bound = record
         .get("type")
         .and_then(|t| t.as_str())
-        .is_some_and(|t| MODEL_BOUND.contains(&t))
+        .is_some_and(|t| MODEL_BOUND.contains(&t));
+    if !model_bound {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    walk_text(&record, &mut |text| ids.extend(tag_ids(text)));
+    ids
+}
+
+/// Every string in `value`, leaving out tool calls and their results.
+fn walk_text(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
+    match value {
+        serde_json::Value::String(s) => visit(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| walk_text(v, visit)),
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(|t| t.as_str());
+            if matches!(kind, Some("tool_result" | "tool_use")) || map.contains_key("toolUseResult")
+            {
+                return;
+            }
+            map.values().for_each(|v| walk_text(v, visit));
+        }
+        _ => {}
+    }
+}
+
+/// The ids in each `<marshal_inbox …>` opening tag's `ids="a,b"` attribute,
+/// each exactly as written, so one id can't match another it's a prefix of.
+fn tag_ids(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<marshal_inbox") {
+        let after = &rest[start + "<marshal_inbox".len()..];
+        let Some(end) = after.find('>') else { break };
+        let tag = &after[..end];
+        if let Some(attr) = tag.find(" ids=\"") {
+            let value = &tag[attr + " ids=\"".len()..];
+            if let Some(close) = value.find('"') {
+                ids.extend(
+                    value[..close]
+                        .split(',')
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string),
+                );
+            }
+        }
+        rest = &after[end..];
+    }
+    ids
 }
 
 /// The last `TAIL_BYTES` of the file, from the first whole line on.
@@ -229,6 +282,52 @@ mod tests {
         assert_eq!(seen_in(&r[..4].join("\n"), &ids(&[A])), ids(&[A]));
         // Idle: enqueue, request, then the user record.
         assert_eq!(seen_in(&r[4..].join("\n"), &ids(&[A])), ids(&[A]));
+    }
+
+    #[test]
+    fn an_inbox_block_in_a_tool_result_is_not_delivery() {
+        // A session that `cat`s a log or a transcript gets inbox blocks back
+        // as tool output, in a `user` record. That isn't the model being
+        // handed the mail.
+        let inbox = serde_json::to_string(&format!(
+            "<marshal_inbox count=\"1\" ids=\"{A}\">\n- from x: hi\n</marshal_inbox>"
+        ))
+        .unwrap();
+        for line in [
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":{inbox}}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","content":[{{"type":"text","text":{inbox}}}]}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"ok"}},"toolUseResult":{{"stdout":{inbox}}}}}"#
+            ),
+        ] {
+            assert!(seen_in(&line, &ids(&[A])).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_id_outside_an_inbox_tag_is_not_delivery() {
+        // In a body, a reply, or anywhere but the daemon's opening tag.
+        let text = serde_json::to_string(&format!(
+            "marshal_inbox mentioned; the message {A} and ids=\"{A}\" in prose"
+        ))
+        .unwrap();
+        let line = format!(r#"{{"type":"user","message":{{"role":"user","content":{text}}}}}"#);
+        assert!(seen_in(&line, &ids(&[A])).is_empty(), "{line}");
+    }
+
+    #[test]
+    fn an_id_matches_only_itself_not_one_it_begins() {
+        let longer = format!("{A}0");
+        let inbox = serde_json::to_string(&format!(
+            "<marshal_inbox count=\"1\" ids=\"{longer},{B}\">\n</marshal_inbox>"
+        ))
+        .unwrap();
+        let line = format!(r#"{{"type":"user","message":{{"role":"user","content":{inbox}}}}}"#);
+        assert_eq!(seen_in(&line, &ids(&[A, B])), ids(&[B]));
     }
 
     #[test]

@@ -44,6 +44,10 @@ pub struct AckMessages {
 
 /// `AckMessages::phase` for mail handed on but not yet seen (MAR-82).
 pub const ACK_OFFERED: &str = "offered";
+/// `AckMessages::phase` to take back offers the session never saw, as when it
+/// starts again after a crash (MAR-82): the offers go, and the mail is unread
+/// and offered afresh.
+pub const ACK_WITHDRAWN: &str = "withdrawn";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +112,13 @@ impl CommandHandler for AckMessages {
             .filter(|o| o.session_id == me.id && acked.contains(&o.message_id))
         {
             ctx.emit_del(&**offer)?;
+        }
+        if self.phase.as_deref() == Some(ACK_WITHDRAWN) {
+            return Ok(AckMessagesResult {
+                newly_acked: 0,
+                already_acked: 0,
+                newly_offered: 0,
+            });
         }
         let mut newly_acked = 0u32;
         let mut already_acked = 0u32;

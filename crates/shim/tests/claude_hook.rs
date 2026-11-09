@@ -673,12 +673,127 @@ fn a_held_rewake_in_the_transcript_is_not_confirmed() {
 
     let seen = requests(&seen);
     assert!(
+        seen.iter()
+            .any(|s| s.request_line.starts_with("POST /hook/offers")),
+        "it must have looked, or this passes with confirming switched off"
+    );
+    assert!(
         !seen
             .iter()
             .any(|s| s.request_line.starts_with("POST /hook/ack")),
         "confirmed a held rewake"
     );
     assert!(offered_marker(&config).exists());
+}
+
+/// Run a waiter with `input` on stdin, as Claude Code starts one.
+fn spawn_waiter_with(base: &str, config: &std::path::Path, input: &str) -> std::process::Child {
+    let mut child = support::shim(support::shared_home())
+        .args(["claude-hook", "wait"])
+        .env("MARSHAL_BASE_URL", base)
+        .env("XDG_CONFIG_HOME", config)
+        .env("APPDATA", config)
+        .env("MARSHAL_WAITER_LOCK_WAIT_SECS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn marshal-shim claude-hook wait");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child
+}
+
+fn wait_input(event: &str, transcript: &std::path::Path) -> String {
+    serde_json::json!({
+        "session_id": "itest-claude",
+        "cwd": "/tmp/proj",
+        "hook_event_name": event,
+        "transcript_path": transcript,
+    })
+    .to_string()
+}
+
+#[test]
+fn a_new_session_start_takes_back_offers_its_transcript_doesnt_show() {
+    // A crash or kill left an offer standing for this session id: on its
+    // next SessionStart, mail its transcript doesn't show is withdrawn, to be
+    // offered again now rather than in 6 h.
+    let (base, seen) = routed_listener(3, "", &[OFFERED_ID]);
+    let config = temp_config("withdraw-on-start");
+    std::fs::create_dir_all(config.join("marshal")).unwrap();
+    std::fs::write(offered_marker(&config), "").unwrap();
+    let transcript = transcript_with(&config, "enqueue");
+
+    let mut waiter = spawn_waiter_with(&base, &config, &wait_input("SessionStart", &transcript));
+    let seen = requests(&seen);
+    let _ = waiter.kill();
+    let _ = waiter.wait();
+
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("a withdrawal");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert_eq!(ack["phase"], "withdrawn", "{ack}");
+    assert_eq!(ack["message_ids"][0], OFFERED_ID);
+}
+
+#[test]
+fn a_stop_waiter_doesnt_take_back_offers() {
+    // At Stop the session is the same process: an unseen offer may still be
+    // held for its next turn, so it stays.
+    let (base, seen) = routed_listener(3, "", &[OFFERED_ID]);
+    let config = temp_config("no-withdraw-on-stop");
+    std::fs::create_dir_all(config.join("marshal")).unwrap();
+    std::fs::write(offered_marker(&config), "").unwrap();
+    let transcript = transcript_with(&config, "enqueue");
+
+    let mut waiter = spawn_waiter_with(&base, &config, &wait_input("Stop", &transcript));
+    let seen = requests(&seen);
+    let _ = waiter.kill();
+    let _ = waiter.wait();
+
+    assert!(
+        seen.iter()
+            .any(|s| s.request_line.starts_with("POST /hook/offers"))
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|s| s.request_line.starts_with("POST /hook/ack"))
+    );
+}
+
+#[test]
+fn the_waiter_doesnt_hand_on_mail_its_transcript_already_shows() {
+    // An offer whose `seen` was lost: the transcript has it, so it's
+    // confirmed, and the session isn't shown it twice.
+    let inbox = "<marshal_inbox count=\"1\">\n- from peer: hi\n</marshal_inbox>\n";
+    let (base, seen) = routed_listener(3, inbox, &[OFFERED_ID]);
+    let config = temp_config("waiter-precheck");
+    let transcript = transcript_with(&config, "user");
+
+    let mut waiter = spawn_waiter_with(&base, &config, &wait_input("Stop", &transcript));
+    let seen = requests(&seen);
+    let _ = waiter.kill();
+    let out = waiter.wait_with_output().unwrap();
+
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("a seen ack");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert!(ack.get("phase").is_none(), "{ack}");
+    assert_ne!(out.status.code(), Some(2), "it handed the mail on again");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("from peer"),
+        "it handed the mail on again"
+    );
 }
 
 #[test]

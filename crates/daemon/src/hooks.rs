@@ -36,9 +36,9 @@ use myko::{
 use serde_json::Value;
 
 use marshal_entities::{
-    ACK_OFFERED, AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllMessageOffers, GetAllSessions,
-    GetAllWakeWatchers, HostInfo, MessageId, MessageView, ReadMessages, Session, SessionId,
-    WakeWatcher, WakeWatcherId, context_preview, nickname_for,
+    ACK_OFFERED, ACK_WITHDRAWN, AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllMessageOffers,
+    GetAllSessions, GetAllWakeWatchers, HostInfo, MessageId, MessageView, ReadMessages, Session,
+    SessionId, WakeWatcher, WakeWatcherId, context_preview, nickname_for,
 };
 
 const AUTO_INBOX_BODY_BUDGET_CHARS: usize = 8_000;
@@ -261,13 +261,13 @@ fn handle_ack(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
     let phase = parsed
         .as_ref()
         .and_then(|b| b.get("phase")?.as_str())
-        .filter(|p| *p == ACK_OFFERED);
+        .filter(|p| *p == ACK_OFFERED || *p == ACK_WITHDRAWN);
     if let Some(session) = session {
         if !ids.is_empty() {
             log::info!(
                 "[hook] {}: client {} {} message(s)",
                 session.0.as_ref(),
-                if phase.is_some() { "offered" } else { "acked" },
+                phase.unwrap_or("acked"),
                 ids.len()
             );
         }

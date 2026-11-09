@@ -93,7 +93,7 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
 
     let base = resolve_base(base_override);
     if matches!(harness, Harness::Claude) {
-        confirm_seen(&base, sid, transcript_path(&v).as_deref());
+        let _ = confirm_seen(&base, sid, transcript_path(&v).as_deref());
     }
     let host = short_host();
     let op = operator();
@@ -199,7 +199,13 @@ pub fn wait_hook(base_override: Option<&str>) {
         return;
     };
     let transcript = transcript_path(&v);
-    confirm_seen(&resolve_base(base_override), sid, transcript.as_deref());
+    let base = resolve_base(base_override);
+    let unseen = confirm_seen(&base, sid, transcript.as_deref());
+    // A new process for this session: anything still offered and not in its
+    // transcript was lost with the old one (MAR-82).
+    if v.get("hook_event_name").and_then(|e| e.as_str()) == Some("SessionStart") {
+        withdraw(&base, sid, &unseen);
+    }
     let delivered = wait_for_mail(
         sid,
         cwd,
@@ -418,31 +424,58 @@ fn ack_seen(base: &str, session_id: &str, ids: &[String]) {
 }
 
 /// Confirm whichever of this session's offered mail its transcript shows went
-/// to the model (MAR-82). Quiet and fail-safe: anything that goes wrong leaves
-/// the mail offered, and the daemon offers it again after its timeout.
-fn confirm_seen(base: &str, session_id: &str, transcript: Option<&std::path::Path>) {
+/// to the model (MAR-82), and return the offers it doesn't show. Quiet and
+/// fail-safe: anything that goes wrong leaves the mail offered, and the daemon
+/// offers it again after its timeout.
+fn confirm_seen(base: &str, session_id: &str, transcript: Option<&std::path::Path>) -> Vec<String> {
     let (Some(marker), Some(transcript)) = (offered_marker(session_id), transcript) else {
-        return;
+        return Vec::new();
     };
     if !marker.exists() {
-        return;
+        return Vec::new();
     }
+    // A waiter can write the marker for a new offer while this runs. Only a
+    // marker older than this request may be removed, or that offer would wait
+    // out the whole timeout unconfirmed.
+    let asked = std::time::SystemTime::now();
     let body = serde_json::json!({ "session_id": session_id }).to_string();
     let Ok(reply) = http_post_why(base, "/hook/offers", &body, Instant::now() + ACK_TIMEOUT) else {
-        return;
+        return Vec::new();
     };
     let offered: Vec<String> = serde_json::from_str(reply.body.trim()).unwrap_or_default();
-    if offered.is_empty() {
-        let _ = std::fs::remove_file(&marker);
-        return;
-    }
     let seen = crate::transcript::seen(transcript, &offered);
     if !seen.is_empty() {
         ack_seen(base, session_id, &seen);
-        if seen.len() == offered.len() {
+    }
+    let unseen: Vec<String> = offered
+        .into_iter()
+        .filter(|id| !seen.contains(id))
+        .collect();
+    if unseen.is_empty() {
+        let older = std::fs::metadata(&marker)
+            .and_then(|m| m.modified())
+            .is_ok_and(|written| written < asked);
+        if older {
             let _ = std::fs::remove_file(&marker);
         }
     }
+    unseen
+}
+
+/// At SessionStart, after a crash or kill the session never ended cleanly
+/// from: offers its transcript doesn't show were never seen, so take them
+/// back and the mail is offered afresh now, not in 6 h (MAR-82).
+fn withdraw(base: &str, session_id: &str, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let ack = serde_json::json!({
+        "session_id": session_id,
+        "message_ids": ids,
+        "phase": "withdrawn",
+    })
+    .to_string();
+    let _ = http_post_why(base, "/hook/ack", &ack, Instant::now() + ACK_TIMEOUT);
 }
 
 fn refusal_marker(session_id: &str) -> Option<std::path::PathBuf> {

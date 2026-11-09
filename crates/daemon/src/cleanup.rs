@@ -28,7 +28,8 @@ use std::{
 use chrono::Utc;
 use hyphae::{Gettable, Materialize};
 use marshal_entities::{
-    AutoSource, Message, MessageRead, Room, RoomKind, RoomMember, Session, WakeWatcher,
+    AutoSource, Message, MessageOffer, MessageRead, Room, RoomKind, RoomMember, Session,
+    WakeWatcher,
 };
 use myko::{core::item::Eventable, server::MykoServerContext, utils::downcast_item};
 
@@ -238,6 +239,7 @@ fn sweep_wake_watchers(ctx: &MykoServerContext) {
 fn sweep_messages(ctx: &MykoServerContext) {
     prune_old_messages(ctx);
     sweep_orphan_reads(ctx);
+    sweep_offers(ctx);
 }
 
 fn prune_old_messages(ctx: &MykoServerContext) {
@@ -310,6 +312,54 @@ fn sweep_orphan_reads(ctx: &MykoServerContext) {
     for id in to_delete {
         if let Err(e) = ctx.del_by_id(MessageRead::ENTITY_NAME_STATIC, &id) {
             log::warn!("[cleanup] drop read mark {} failed: {}", id, e);
+        }
+    }
+}
+
+/// DEL every `MessageOffer` that no longer does anything (MAR-82): its message
+/// is gone, or it's older than the offer timeout, after which it no longer
+/// holds the mail back. That bounds the offers a prune, a succession (which
+/// moves the mail and leaves the old session's offer) or a session that never
+/// came back leave behind.
+fn sweep_offers(ctx: &MykoServerContext) {
+    let Some(offer_store) = ctx.registry.get(MessageOffer::ENTITY_NAME_STATIC) else {
+        return;
+    };
+    // Offers first, then messages, as for reads.
+    let offers = offer_store.entries().materialize().get();
+    let messages: HashSet<Arc<str>> = ctx
+        .registry
+        .get(Message::ENTITY_NAME_STATIC)
+        .map(|store| {
+            store
+                .entries()
+                .materialize()
+                .get()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let expired_before =
+        chrono::Utc::now().timestamp_millis() - marshal_entities::offer_timeout_ms();
+    let mut to_delete: Vec<Arc<str>> = Vec::new();
+    for (id, item) in offers {
+        if let Some(offer) = downcast_item::<MessageOffer>(&item)
+            && (!messages.contains(&offer.message_id.0) || offer.offered_at <= expired_before)
+        {
+            to_delete.push(id);
+        }
+    }
+    if to_delete.is_empty() {
+        return;
+    }
+    log::info!(
+        "[cleanup] dropping {} offer(s) whose message is gone or that have lapsed",
+        to_delete.len()
+    );
+    for id in to_delete {
+        if let Err(e) = ctx.del_by_id(MessageOffer::ENTITY_NAME_STATIC, &id) {
+            log::warn!("[cleanup] drop offer {} failed: {}", id, e);
         }
     }
 }
@@ -1002,6 +1052,61 @@ mod tests {
 
         assert_eq!(
             read_ids(&ctx),
+            HashSet::from(["recent::recipient".to_string()])
+        );
+    }
+
+    fn set_offer(ctx: &MykoServerContext, message_id: &str, session_id: &str, offered_at: i64) {
+        let offer = marshal_entities::MessageOffer {
+            id: marshal_entities::MessageOfferId(Arc::from(
+                marshal_entities::MessageOffer::make_id(message_id, session_id),
+            )),
+            message_id: MessageId(Arc::from(message_id)),
+            session_id: SessionId(Arc::from(session_id)),
+            offered_at,
+        };
+        let ev = MEvent::from_item(&offer, MEventType::SET, &Uuid::new_v4().to_string());
+        ctx.apply_event_batch(vec![ev])
+            .expect("apply MessageOffer SET");
+    }
+
+    fn offer_ids(ctx: &MykoServerContext) -> HashSet<String> {
+        ctx.registry
+            .get(marshal_entities::MessageOffer::ENTITY_NAME_STATIC)
+            .map(|s| {
+                s.entries()
+                    .materialize()
+                    .get()
+                    .into_iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// MAR-82: an offer is swept once its message is gone, or once it's older
+    /// than the offer timeout, when it no longer holds the mail back. The one
+    /// a succession leaves on the old session goes the same way.
+    #[test]
+    fn sweep_messages_drops_offers_that_no_longer_do_anything() {
+        let ctx = setup();
+        let now = chrono::Utc::now().timestamp_millis();
+        set_message(&ctx, "old", now - MESSAGE_TTL.as_millis() as i64 - 1);
+        set_message(&ctx, "recent", now - 1_000);
+        set_offer(&ctx, "old", "recipient", now - 1_000);
+        set_offer(&ctx, "never-existed", "recipient", now - 1_000);
+        set_offer(
+            &ctx,
+            "recent",
+            "lapsed",
+            now - marshal_entities::offer_timeout_ms() - 1,
+        );
+        set_offer(&ctx, "recent", "recipient", now - 1_000);
+
+        sweep_messages(&ctx);
+
+        assert_eq!(
+            offer_ids(&ctx),
             HashSet::from(["recent::recipient".to_string()])
         );
     }

@@ -741,3 +741,18 @@ fn an_ack_with_no_phase_still_marks_mail_read() {
     assert_eq!(daemon.reads("waiter"), 1);
     assert!(daemon.offers("waiter").is_empty());
 }
+
+#[test]
+fn a_withdrawn_offer_leaves_the_mail_unread_and_offered_again_now() {
+    // After a crash, the session's next start takes back offers its
+    // transcript doesn't show, rather than wait out the 6 h (MAR-82).
+    let daemon = daemon();
+    let id = offered_once(&daemon);
+
+    daemon.ack("waiter", &[&id], Some("withdrawn"));
+
+    assert_eq!(daemon.reads("waiter"), 0);
+    assert!(daemon.offers("waiter").is_empty());
+    let again = daemon.fetch_for_client("waiter");
+    assert!(again.contains("two-phase check"), "{again}");
+}

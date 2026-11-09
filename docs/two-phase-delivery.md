@@ -129,16 +129,38 @@ For Claude, as above, with these specifics:
   session younger than 6 h (`MARSHAL_OFFER_SECS` overrides it, for tests). The inbox opening tag
   carries `ids="…"`, naming ids that are plain (hex and `-`, up to 64, as `SendMessage` mints them);
   any other id stays offered until the 6 h re-offer. `/hook/offers` returns a session's standing
-  offers as a JSON list. SessionEnd drops the session's offers.
+  offers as a JSON list. SessionEnd drops the session's offers, and `phase: "withdrawn"` drops the
+  named ones, with no read either way. The cleanup sweeper removes offers whose message is gone or
+  that are past the 6 h, when they no longer hold anything back, including the one a succession
+  leaves on the old session.
 - **Shim.** The waiter (`claude-hook wait`, and `watch`) acks `offered` and writes a marker,
   `offered-<session>`, in its config directory. Every Claude hook (`claude-hook prompt-submit`,
   `post-tool-use`, `pre-tool-use`) and each new waiter, at Stop or SessionStart, then confirms. Only
   when the marker is there does it ask `/hook/offers`, look for those ids in the transcript, and ack
-  the ones found as seen. The marker goes once nothing is outstanding. Before handing mail on, the
-  waiter checks the transcript too: mail already seen is acked and not shown again.
-- **The matcher** (`crates/shim/src/transcript.rs`) reads the last 4 MB of `transcript_path`. It counts
-  an id only on a JSON line whose top-level `type` is `user` or `attachment`, never `queue-operation`,
-  and anything it can't read or parse counts as not seen.
+  the ones found as seen. The marker goes once nothing is outstanding, and only if it's older than
+  that `/hook/offers` request, so an offer a waiter wrote meanwhile isn't left unconfirmed. Before
+  handing mail on, the waiter checks the transcript too: mail already seen is acked and not shown
+  again.
+- **A crash, then the same session again.** A `kill -9` or an OOM sends no SessionEnd, so its offers
+  stand. The waiter that SessionStart starts in the new process confirms what the transcript shows
+  and **withdraws** the rest, so that mail is offered at once, not in 6 h. A waiter started at Stop
+  doesn't withdraw anything, since it's the same process and an unseen offer may still be held.
+- **The matcher** (`crates/shim/src/transcript.rs`) reads the last 4 MB of `transcript_path`. It takes
+  ids only from the `ids="…"` attribute of a `<marshal_inbox …>` opening tag, split on `,` and matched
+  exactly, in a JSON line whose top-level `type` is `user` or `attachment`, never `queue-operation`.
+  It skips anything inside a tool call or tool result (`tool_use`, `tool_result`, `toolUseResult`),
+  since a session that reads a log or a transcript gets inbox blocks back as tool output, and that
+  isn't delivery. Only the daemon can write that tag: it escapes `<` in every body and handle.
+  Anything it can't read or parse counts as not seen.
+
+**Deploying and rolling back.** Deploy the daemon and the shim together; either order is safe. An old
+shim sends no phase, which is today's read. A new shim with an old daemon gets its phase ignored, which
+is also today's read. Rolling the daemon back past MAR-82 on Postgres, as Murph runs, is safe: myko
+skips an item type it has no parser for (`No parser for entity type: MessageOffer`, a warning), so
+offered mail is just unread to the old daemon and is offered again. That can mean a duplicate, never a
+loss. With the file store (`MARSHAL_PERSIST`) an older daemon refuses to start on a kind it doesn't
+know, so remove the offers from `store.jsonl` first (`grep -v '"MessageOffer"'` to a new file, then
+move it into place, with the daemon stopped).
 
 **Not yet:** Codex (its own story); a sender's `recipient.offered` in `read_messages`; splitting
 MAR-73's M3 into offered and seen; and MAR-79's live check 5 (kill a busy session mid-turn, start it
