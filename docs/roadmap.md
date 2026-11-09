@@ -164,6 +164,18 @@ launcher.
   taken over with its unread mail; the codex conformance cells still pass; and `stable-identity.md`
   says so. Done (#48): verdict tests in `crates/daemon/src/succession.rs`, daemon tests in
   `crates/daemon/tests/identity_succession.rs`.
+- [ ] **MAR-62: Supporting: MAR-54's succession tests don't race on the shared bridge observations.**
+  Found on #58's check job (run 42640488345): `a_codex_row_whose_bridge_record_ended_is_taken_over`
+  failed at "the new session takes the name". The race: `succession`'s observations are one
+  process-wide static, and `observe_bridges(current, now)` marks every session it has seen but isn't
+  given as lapsed at `now`, with `or_insert`. The takeover test calls it twice, to see its session
+  with a bridge record and then without one ten minutes ago. If the parallel
+  `a_bridge_watched_codex_sibling_keeps_its_name` calls it with only its own session in between, the
+  takeover test's session is marked lapsed just now. The later call can't move that back, so the
+  grace hasn't passed and there's no takeover. The reverse can happen too: the takeover test's empty
+  call marks the sibling lapsed. A forced interleaving fails the same way. Done when: the tests in
+  that file that feed the observations hold one test-only mutex, daemon code is unchanged, and the
+  file passes repeatedly with `--test-threads` up to 32.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
