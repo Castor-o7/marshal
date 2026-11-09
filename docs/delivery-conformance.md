@@ -14,9 +14,7 @@ that ran:
 - `operator-pause-stops-wakes` and `resume-wakes-held-mail`: Marshal has no
   operator pause;
 - `unread-mail-follows-a-restart`: Marshal hands a restarted session its
-  predecessor's nickname (MAR-9) but not its mail yet (muster's MUS-47);
-- `restart-keeps-unread-mail-file`: Marshal has no file-backed store; the
-  Postgres cells cover restarts.
+  predecessor's nickname (MAR-9) but not its mail yet (muster's MUS-47).
 
 The sections below describe the whole suite as muster built it, including the
 columns stage 1 doesn't run.
@@ -55,7 +53,7 @@ checked as well as what the recipient sees.
 | 5b (pg) | `restart-keeps-unread-mail` | Mail sent while the session is busy, then a restart against Postgres: the mail is kept, and wakes the session once it goes idle. n/a for the push plugins, which take the push into their running turn. |
 | 5c (pg) | `restart-burst-shown-once-pg` | After a restart against Postgres, 14 messages sent 350 ms apart, spanning the plugin's reconnect: some while it's away, some racing its reconnect pull, some pushed live after. Each is shown exactly once, including past the hold lease (MUS-90). |
 | 5d (pg) | `restart-without-mail-stays-idle-pg` | A restart against Postgres with no mail doesn't wake an idle session: the reconnect's pull of an empty inbox stays quiet (MUS-90). |
-| 5e (file) | `restart-keeps-unread-mail-file` | The same with no Postgres and `MARSHAL_PERSIST=file` (MUS-17): the store is the file in the daemon's state directory. Needs no database, so it always runs. n/a for the push plugins, as 5b. |
+| 5e (file) | `restart-keeps-unread-mail-file` | The same with no Postgres and `MARSHAL_PERSIST=file` (MUS-17, MAR-53 on Marshal): the store is the file in the daemon's state directory. Needs no database, so it always runs. n/a for the push plugins, as 5b. |
 | 6 | `operator-pause-stops-wakes` | With `marshal-daemon pause`, mail doesn't wake an idle session but still arrives at the next hook. |
 | 6b | `resume-wakes-held-mail` | Mail sent while wakes are paused doesn't wake the session, and resuming alone wakes it with that mail, with no new message. |
 | 7 | `broadcast-never-wakes` | A room broadcast neither wakes the session nor is injected. |

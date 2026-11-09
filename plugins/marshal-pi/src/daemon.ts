@@ -41,7 +41,7 @@ import {
   type SessionNicknameItem,
 } from "./entities.ts";
 import type { Identity } from "./identity.ts";
-import { InboxPuller, type InboxPull } from "./inbox-pull.ts";
+import { InboxPuller, holdLeaseFromEnv, type InboxPull, type PushHold } from "./inbox-pull.ts";
 
 const LIVENESS_INTERVAL_MS = 5_000;
 const INBOX_PULL_LIMIT = 20;
@@ -87,13 +87,16 @@ export class MarshalDaemon {
     read: (sessionId) => this.readUnread(sessionId),
     ack: async (sessionId, messageIds) => { await this.sendForInbox(ackMessages(sessionId, messageIds)); },
     render: (messages) => this.renderInbox(messages),
-  });
+  }, { leaseMs: holdLeaseFromEnv() });
   private notifyHandler: NotifyHandler | null = null;
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
   private connected = false;
   private rosterChangedHandler: (() => void) | null = null;
   private connectionChangedHandler: ((connected: boolean) => void) | null = null;
+  /** Whether a connection has been up before, so the next one is a reconnect. */
+  private everConnected = false;
+  private reconnectHandler: ((sessionIds: string[]) => void) | null = null;
 
   constructor(cfg: DaemonConfig) {
     this.cfg = cfg;
@@ -110,6 +113,13 @@ export class MarshalDaemon {
       if (status === ConnectionStatus.Connected) {
         this.connected = true;
         for (const item of this.sessions.values()) this.emitSet(item);
+        // MAR-48 (from muster's MUS-90): mail sent while the connection was
+        // down couldn't be pushed, since the daemon still had each session
+        // bound to the old, dead client, and nothing offers it again. So a
+        // reconnect asks each session to show what waited. The SETs above go
+        // first on this socket, so anything sent after them is pushed live.
+        if (this.everConnected) this.reconnectHandler?.([...this.sessions.keys()]);
+        this.everConnected = true;
         this.connectionChangedHandler?.(true);
       } else if (status === ConnectionStatus.Disconnected) {
         this.connected = false;
@@ -147,6 +157,9 @@ export class MarshalDaemon {
   onNotify(handler: NotifyHandler): void { this.notifyHandler = handler; }
   onRosterChanged(handler: () => void): void { this.rosterChangedHandler = handler; }
   onConnectionChanged(handler: (connected: boolean) => void): void { this.connectionChangedHandler = handler; }
+  /** Called on each reconnect, after the sessions are registered again, with
+   *  their ids, so each can show the mail that waited out the drop (MAR-48). */
+  onReconnect(handler: (sessionIds: string[]) => void): void { this.reconnectHandler = handler; }
   isConnected(): boolean { return this.connected; }
 
   // ── Session management ─────────────────────────────────────────────────
@@ -168,6 +181,10 @@ export class MarshalDaemon {
       // Pi can render custom messages and start/steer turns through its
       // extension API, so identify the harness and advertise that capability.
       channelsEnabled: true,
+      // The daemon leaves a pushed message unread until this extension acks
+      // it, once pi has taken it, so a push pi fails to take reaches the next
+      // turn's pull instead of being lost (MAR-10).
+      acksPushes: true,
       kind: "pi",
     } as SessionItem;
     (item as any).lastActivityAt = now;
@@ -270,13 +287,10 @@ export class MarshalDaemon {
     return this.inbox.pull(sessionId).catch(() => null);
   }
 
-  /** Pull and commit in one step: the messages are acked before the caller
-   *  shows them. Only the live-push path still uses it. */
-  async drainInbox(sessionId: string): Promise<string | null> {
-    const pull = await this.pullInbox(sessionId);
-    if (!pull) return null;
-    await pull.commit().catch(() => this.log("inbox ack failed"));
-    return pull.text;
+  /** Hold one pushed message while pi takes it, so a turn's pull doesn't
+   *  show it too. Null when a pull already holds it. */
+  holdPush(sessionId: string, messageId: string): PushHold | null {
+    return this.inbox.holdPush(sessionId, messageId);
   }
 
   nicknameFor(sessionId: string): string {

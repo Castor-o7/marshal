@@ -25,6 +25,8 @@
 //! to fail and is reported as such; if one starts passing, the suite fails so
 //! the list gets updated.
 
+mod support;
+
 use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
@@ -441,7 +443,7 @@ struct Mcp {
 
 impl Mcp {
     fn start(daemon: &Daemon, session_id: &str) -> Self {
-        let mut child = Command::new(SHIM)
+        let mut child = support::shim(support::shared_home())
             .env_remove("MARSHAL_BASE_URL")
             .env_remove("MYKO_ADDRESS")
             .env("XDG_CONFIG_HOME", daemon.config_dir())
@@ -666,7 +668,7 @@ impl FakeClaude {
     }
 
     fn hook(&self, event: &str) -> Command {
-        let mut cmd = Command::new(SHIM);
+        let mut cmd = support::shim(support::shared_home());
         cmd.args(["claude-hook", event])
             .env_remove("MARSHAL_DAEMON_ADDRESS")
             .env_remove("MYKO_ADDRESS")
@@ -1013,7 +1015,7 @@ impl FakeCodex {
     /// Run a Codex command hook and return what it injected.
     fn run_hook(&self, event: &str, fixture: &str) -> Option<String> {
         let input = codex_fixture(fixture, &self.thread_id, &self.cwd).to_string();
-        let mut child = Command::new(SHIM)
+        let mut child = support::shim(support::shared_home())
             .args(["codex-hook", event, &self.hook_base])
             .env_remove("MARSHAL_DAEMON_ADDRESS")
             .env_remove("MYKO_ADDRESS")
@@ -1057,7 +1059,7 @@ impl FakeHarness for FakeCodex {
         let app = FakeAppServer::start(self.thread_id.clone(), self.cwd.clone());
         let ready = daemon.dir.path().join("bridge.ready");
         let log = std::fs::File::create(daemon.dir.path().join("bridge.log")).unwrap();
-        let bridge = Command::new(SHIM)
+        let bridge = support::shim(support::shared_home())
             .args([
                 "codex-bridge",
                 "--endpoint",
@@ -1134,7 +1136,7 @@ impl FakeHarness for FakeCodex {
         // idle Codex thread, as far as the daemon can tell.
         let id = uuid::Uuid::new_v4().to_string();
         let input = codex_fixture("user-prompt-submit", &id, &self.cwd).to_string();
-        let mut child = Command::new(SHIM)
+        let mut child = support::shim(support::shared_home())
             .args(["codex-hook", "session-start", &self.hook_base])
             .env_remove("MARSHAL_DAEMON_ADDRESS")
             .env_remove("MYKO_ADDRESS")
@@ -1393,7 +1395,7 @@ impl Cell {
     /// A sender session, registered as a Claude session's hook would, with
     /// its MCP shim.
     fn sender(daemon: &Daemon, sender_id: &str) -> Mcp {
-        let mut hook = Command::new(SHIM)
+        let mut hook = support::shim(support::shared_home())
             .args(["claude-hook", "session-start"])
             .env("XDG_CONFIG_HOME", daemon.config_dir())
             .env("HOME", daemon.dir.path().join("home"))
@@ -1908,10 +1910,6 @@ const MARSHAL_NOT_APPLICABLE: &[(&str, &str)] = &[
     (
         "unread-mail-follows-a-restart",
         "Marshal doesn't hand a successor its predecessor's mail yet (muster's MUS-47)",
-    ),
-    (
-        "restart-keeps-unread-mail-file",
-        "Marshal has no file-backed store (muster's MUS-17); the Postgres cells cover restarts",
     ),
 ];
 
@@ -2512,4 +2510,198 @@ fn delivery_conformance() {
         let _ = std::fs::write(path, &table);
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// The members of `room_id` as `marshal://rooms` shows them to `mcp`.
+fn room_members(mcp: &mut Mcp, room_id: &str) -> Vec<String> {
+    let Ok(r) = mcp.rpc("resources/read", json!({"uri": "marshal://rooms"})) else {
+        return Vec::new();
+    };
+    let text = r["contents"][0]["text"].as_str().unwrap_or_default();
+    let rooms: Value = serde_json::from_str(text).unwrap_or_default();
+    rooms["rooms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|room| room["room_id"] == json!(room_id))
+        .flat_map(|room| room["members"].as_array().cloned().unwrap_or_default())
+        .filter_map(|m| m["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn log_tail(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    lines[lines.len().saturating_sub(80)..].join("\n")
+}
+
+/// MAR-19: an adhoc membership survives a restart on the same Postgres. The
+/// sweeper drops memberships whose session isn't on the roster, so it must
+/// start only once myko has replayed the store; started before that, a boot
+/// sweep could find the membership before its session and drop it. That
+/// window is too narrow to hit on purpose (myko fills its stores one entity
+/// type at a time), so this pins the outcome; the order itself is pinned by
+/// `cleanup::tests::the_sweeper_waits_for_the_store_to_load`.
+#[test]
+#[ignore = "needs `cargo build --workspace` and CONFORMANCE_POSTGRES_URL; run with --ignored"]
+fn adhoc_membership_survives_a_postgres_restart() {
+    let Some(url) = std::env::var("CONFORMANCE_POSTGRES_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+    else {
+        assert!(
+            std::env::var_os("CONFORMANCE_REQUIRE_POSTGRES").is_none(),
+            "no postgres (set CONFORMANCE_POSTGRES_URL)"
+        );
+        eprintln!("adhoc_membership_survives_a_postgres_restart: no postgres, skipped");
+        return;
+    };
+    const ROOM: &str = "mar19-adhoc";
+    let mut daemon = Daemon::start(Mode::Plain, Some(&url), false);
+    let member_id = uuid::Uuid::new_v4().to_string();
+    let mut member = Cell::sender(&daemon, &member_id);
+    // Its shim's writes are refused until its session is on the roster.
+    let joined = wait_until(Duration::from_secs(15), || {
+        member.tool("join_room", json!({"name": ROOM})).is_ok()
+    });
+    assert!(joined, "join_room never succeeded");
+    assert!(
+        wait_until(Duration::from_secs(10), || room_members(&mut member, ROOM)
+            .contains(&member_id)),
+        "the join never showed in marshal://rooms"
+    );
+
+    daemon.restart();
+    let loaded = "the store is loaded; starting the cleanup sweeper";
+    // The member's shim redials. Wait for the sweeper, then past a few of its
+    // ticks (3 s each): any boot sweep that was going to drop it has run.
+    assert!(
+        wait_until(Duration::from_secs(20), || daemon
+            .log()
+            .matches(loaded)
+            .count()
+            >= 2),
+        "the restarted daemon never started its sweeper; log:\n{}",
+        log_tail(&daemon.log())
+    );
+    thread::sleep(Duration::from_secs(10));
+    let observer_id = uuid::Uuid::new_v4().to_string();
+    let mut observer = Cell::sender(&daemon, &observer_id);
+    let mut seen = Vec::new();
+    let kept = wait_until(Duration::from_secs(10), || {
+        seen = room_members(&mut observer, ROOM);
+        seen.contains(&member_id)
+    });
+    assert!(
+        kept,
+        "the adhoc membership didn't survive the restart; {ROOM} has {seen:?}; log:\n{}",
+        log_tail(&daemon.log())
+    );
+}
+
+/// The bodies of `mcp`'s unread direct messages, with their ids.
+fn unread_bodies(mcp: &mut Mcp) -> Option<Vec<(String, String)>> {
+    let r = mcp
+        .rpc(
+            "resources/read",
+            json!({"uri": "marshal://messages?inbox=true&unread=true"}),
+        )
+        .ok()?;
+    let text = r["contents"][0]["text"].as_str()?;
+    let result: Value = serde_json::from_str(text).ok()?;
+    Some(
+        result["messages"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| {
+                Some((
+                    m["messageId"].as_str()?.to_string(),
+                    m["body"].as_str()?.to_string(),
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// What a restart kept: whether the adhoc membership, the unread message and
+/// the read state all came back.
+struct Kept {
+    membership: bool,
+    unread: bool,
+    read_stays_read: bool,
+}
+
+/// A session joins an adhoc room and gets two messages, and reads and acks
+/// one. Then the daemon restarts, with or without `MARSHAL_PERSIST=file`.
+fn restart_with_rooms_and_read_state(persist_file: bool) -> Kept {
+    const ROOM: &str = "mar53-adhoc";
+    let mut daemon = Daemon::start(Mode::Plain, None, persist_file);
+    let member_id = uuid::Uuid::new_v4().to_string();
+    let mut member = Cell::sender(&daemon, &member_id);
+    // Its shim's writes are refused until its session is on the roster.
+    assert!(
+        wait_until(Duration::from_secs(15), || member
+            .tool("join_room", json!({"name": ROOM}))
+            .is_ok()),
+        "join_room never succeeded"
+    );
+    let sender_id = uuid::Uuid::new_v4().to_string();
+    let mut sender = Cell::sender(&daemon, &sender_id);
+    assert!(sender.row(&member_id, Duration::from_secs(15)).is_some());
+    let (read, unread) = (token("read-before"), token("unread-before"));
+    for body in [&read, &unread] {
+        sender.send(&member_id, body, None).expect("send");
+    }
+    let mut inbox = Vec::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            inbox = unread_bodies(&mut member).unwrap_or_default();
+            inbox.len() == 2
+        }),
+        "both messages never showed unread: {inbox:?}"
+    );
+    let read_id = inbox
+        .iter()
+        .find(|(_, body)| body == &read)
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    member
+        .tool("ack_messages", json!({"message_ids": [read_id]}))
+        .expect("ack");
+
+    daemon.restart();
+    // The member's shim redials; give the sweeper a few ticks too.
+    thread::sleep(Duration::from_secs(8));
+    let mut observer = Cell::sender(&daemon, &uuid::Uuid::new_v4().to_string());
+    let membership = wait_until(Duration::from_secs(10), || {
+        room_members(&mut observer, ROOM).contains(&member_id)
+    });
+    let mut after = None;
+    wait_until(Duration::from_secs(10), || {
+        after = unread_bodies(&mut member);
+        after.as_ref().is_some_and(|a| !a.is_empty())
+    });
+    let after = after.unwrap_or_default();
+    Kept {
+        membership,
+        unread: after.iter().any(|(_, body)| body == &unread),
+        read_stays_read: !after.iter().any(|(_, body)| body == &read),
+    }
+}
+
+/// MAR-53: with `MARSHAL_PERSIST=file` and no Postgres, an adhoc membership,
+/// an unread message and the read state of another all survive a restart.
+/// Without the setting, a restart still loses them: the default is unchanged.
+#[test]
+#[ignore = "needs `cargo build --workspace` first; run with --ignored"]
+fn the_file_store_keeps_rooms_and_read_state_across_a_restart() {
+    let kept = restart_with_rooms_and_read_state(true);
+    assert!(kept.membership, "the adhoc membership didn't survive");
+    assert!(kept.unread, "the unread message didn't survive");
+    assert!(kept.read_stays_read, "a read message came back unread");
+
+    let lost = restart_with_rooms_and_read_state(false);
+    assert!(
+        !lost.membership && !lost.unread,
+        "without MARSHAL_PERSIST=file a restart kept state: the default changed"
+    );
 }
