@@ -195,7 +195,7 @@ pub async fn run(target: Target, body: String) -> Result<()> {
     let client = Arc::new(MykoClient::new());
     let sessions = client.watch_query::<GetAllSessions>(GetAllSessions {});
     let nicknames = client.watch_query::<GetAllSessionNicknames>(GetAllSessionNicknames {});
-    client.set_address(Some(crate::tls_link::myko_address(address)));
+    crate::tls_link::connect(&client, address);
 
     // Our row showing up proves the connection and a primed roster at once. Repeating the SET until then is harmless.
     let started = Instant::now();

@@ -38,6 +38,24 @@ The daemon binds `127.0.0.1:6155` by default, so only this machine can reach it.
 
 To put TLS on those ports, start it with `marshal-daemon --tls`. On first start it makes a self-signed certificate in the state directory (`tls/`, key readable by your user only) and logs its SHA-256 fingerprint, also written to `tls/fingerprint`. Behind the TLS listeners, myko and the hook listener move to loopback (`MARSHAL_MYKO_BIND`, default `127.0.0.1:6157`). Clients then use a `wss://` address and pin the fingerprint: set `MARSHAL_TLS_PIN`, or put it in `tls-pin` beside `daemon-address` in the shim's config directory. A wrong pin is refused by the shim's own check of the certificate. With no pin, the shim leaves TLS to the system's certificate authorities, which a self-signed daemon fails, so neither connects insecurely. Without `--tls` nothing changes. TLS alone only keeps the bytes private on the wire; who may connect is still decided behind it.
 
+With `--tls`, who may connect to myko (the WebSocket and MCP routes) is decided by pairing. The hook listener (`/hook/*`) is not gated yet: until MAR-81 lands, anything that can reach that port with a client that skips certificate checks can post hooks for any session id, so keep `MARSHAL_HOOK_BIND` on a network you trust meanwhile. Every myko connection needs a token: the daemon host's own shims and tools read the local token the daemon writes to the config directory (`local-token`, readable by your user only), and other machines pair once:
+
+```bash
+# on the daemon's host: a one-time code, good for 15 minutes
+marshal-daemon pair-code laptop --address murph.example:6155
+
+# on the laptop: exchange it for a token and keep the pairing
+marshal-shim pair marshal-invite-v1:...
+marshal-shim pairing    # shows it, token masked
+marshal-shim unpair     # forgets it
+
+# on the daemon's host
+marshal-daemon paired          # who is paired
+marshal-daemon unpair laptop   # their connections close within a second
+```
+
+`pair` also writes `daemon-address` and `tls-pin`, so nothing else on the machine needs configuring. Until MAR-81 lands, a session that a paired machine registers through its Claude Code or Codex hooks belongs to the daemon's host, not to that machine: the machine can read the roster and send from its terminal, but its own shim can't act as that session (set its status, or send as it). Only hashes of tokens are kept on the daemon (`pairing/` in the state directory). Once machines are paired, the daemon won't start without being told how to run: `--tls` to serve them, or `--plain` to run open.
+
 By default the daemon keeps its store in memory, so a restart loses messages, read state and rooms. To keep them, give it Postgres with `MYKO_POSTGRES_URL`, or, with no Postgres, set `MARSHAL_PERSIST=file`: the store goes to `store.jsonl` in the state directory (`MARSHAL_STATE_DIR`, else `$XDG_STATE_HOME/marshal`, else `~/.local/state/marshal`), private to your user. The daemon refuses a second daemon on the same directory, and any `MARSHAL_PERSIST` value other than `file`.
 
 ### 3. Add the plugin in Claude Code

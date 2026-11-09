@@ -58,6 +58,9 @@ struct Daemon {
     hook: u16,
     child: Child,
     fingerprint: String,
+    /// The daemon host's own token (MAR-24): with `--tls`, myko admits
+    /// nothing without a token, and these tests are about TLS, not pairing.
+    local_token: String,
 }
 
 impl Daemon {
@@ -76,6 +79,9 @@ impl Daemon {
                 .env_remove("MARSHAL_PERSIST")
                 .env("HOME", dir.path().join("home"))
                 .env("MARSHAL_STATE_DIR", dir.path().join("state"))
+                // The local token (MAR-24) goes to the config dir: this
+                // home's, not the runner's XDG_CONFIG_HOME.
+                .env_remove("XDG_CONFIG_HOME")
                 .env("MARSHAL_BIND", format!("127.0.0.1:{ws}"))
                 .env("MARSHAL_HOOK_BIND", format!("127.0.0.1:{hook}"))
                 .env("MARSHAL_MYKO_BIND", format!("127.0.0.1:{myko}"))
@@ -91,11 +97,16 @@ impl Daemon {
                 exited(&mut child) || TcpStream::connect(("127.0.0.1", myko)).is_ok()
             });
             let fp_path = dir.path().join("state/tls/fingerprint");
-            if up && !exited(&mut child) && fp_path.exists() {
+            let token_path = dir.path().join("home/.config/marshal/local-token");
+            if up && !exited(&mut child) && fp_path.exists() && token_path.exists() {
                 std::thread::sleep(Duration::from_millis(300));
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
                 if !exited(&mut child) && !log.contains("in use") {
                     let fingerprint = std::fs::read_to_string(&fp_path)
+                        .unwrap()
+                        .trim()
+                        .to_string();
+                    let local_token = std::fs::read_to_string(&token_path)
                         .unwrap()
                         .trim()
                         .to_string();
@@ -105,6 +116,7 @@ impl Daemon {
                         hook,
                         child,
                         fingerprint,
+                        local_token,
                     };
                 }
             }
@@ -127,6 +139,7 @@ impl Daemon {
                 "MARSHAL_BASE_URL",
                 format!("https://127.0.0.1:{}", self.hook),
             )
+            .env("MARSHAL_TOKEN", &self.local_token)
             .env("MARSHAL_HOST", "tls-e2e");
         match pin {
             Some(pin) => {

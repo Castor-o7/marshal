@@ -218,7 +218,7 @@ async fn start_team(team: &Team, shim: &Path, timeout: Duration) -> Result<()> {
     let sessions = client.watch_query::<GetAllSessions>(GetAllSessions {});
     let nicknames = client.watch_query::<GetAllSessionNicknames>(GetAllSessionNicknames {});
     let address = crate::daemon_address();
-    client.set_address(Some(crate::tls_link::myko_address(address.clone())));
+    crate::tls_link::connect(&client, address.clone());
     let started = Instant::now();
     while !matches!(
         client.connection_status_sync(),

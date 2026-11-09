@@ -2977,9 +2977,11 @@ name = "marshal-daemon"
 version = "0.58.1"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "env_logger",
  "futures-util",
+ "getrandom 0.3.4",
  "hyphae",
  "libc",
  "log",
@@ -3003,12 +3005,14 @@ dependencies = [
 name = "marshal-entities"
 version = "0.58.1"
 dependencies = [
+ "base64",
  "chrono",
  "log",
  "myko",
  "myko-macros",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "ts-rs",
  "uuid",
 ]
