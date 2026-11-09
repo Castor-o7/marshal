@@ -271,6 +271,39 @@ pub(crate) fn activity_at(
     Some(status_updated_at.unwrap_or(now_ms))
 }
 
+/// What the publish loop should push for a session's activity (MAR-58).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ActivityPush {
+    /// Nothing changed.
+    Nothing,
+    /// The activity changed: push it, then this `activity_at`.
+    ActivityAndTime(Option<i64>),
+    /// The activity reads the same but the manifest's `statusUpdatedAt`
+    /// moved, as a busy→idle→busy flip between two reads leaves it: push
+    /// only `activity_at`, so the roster doesn't keep the older time.
+    TimeOnly(i64),
+}
+
+/// Decide [`ActivityPush`] from what was last pushed (`pushed_activity`,
+/// `pushed_activity_at`) and what the manifest says now. Without a
+/// `statusUpdatedAt` only a change of activity counts, since the shim's own
+/// clock moves every read.
+pub(crate) fn activity_push(
+    pushed_activity: Option<&str>,
+    pushed_activity_at: Option<i64>,
+    activity: Option<&str>,
+    status_updated_at: Option<i64>,
+    now_ms: i64,
+) -> ActivityPush {
+    if pushed_activity != activity {
+        return ActivityPush::ActivityAndTime(activity_at(activity, status_updated_at, now_ms));
+    }
+    match (activity, status_updated_at) {
+        (Some(_), Some(at)) if pushed_activity_at != Some(at) => ActivityPush::TimeOnly(at),
+        _ => ActivityPush::Nothing,
+    }
+}
+
 /// Parse the live fields from the per-PID manifest. Full JSON parse (not the
 /// `sessionId` cheap-scan above): `name` is arbitrary human text that can
 /// contain quotes, escapes, or `}` — a substring scan would mis-slice it. The
@@ -777,6 +810,51 @@ mod tests {
     fn no_activity_has_no_activity_at() {
         assert_eq!(activity_at(None, Some(1_000), 9_000), None);
         assert_eq!(activity_at(None, None, 9_000), None);
+    }
+
+    #[test]
+    fn a_changed_activity_pushes_it_and_its_time() {
+        assert_eq!(
+            activity_push(Some("idle"), Some(1_000), Some("busy"), Some(2_000), 9_000),
+            ActivityPush::ActivityAndTime(Some(2_000))
+        );
+        assert_eq!(
+            activity_push(Some("idle"), Some(1_000), Some("busy"), None, 9_000),
+            ActivityPush::ActivityAndTime(Some(9_000))
+        );
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), None, None, 9_000),
+            ActivityPush::ActivityAndTime(None)
+        );
+    }
+
+    #[test]
+    fn a_flip_and_back_between_reads_still_moves_activity_at() {
+        // busy at 1_000, idle at 1_500, busy again at 2_000, all between two
+        // reads: the string is the same, but the time the roster shows must not
+        // stay at 1_000.
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), Some("busy"), Some(2_000), 9_000),
+            ActivityPush::TimeOnly(2_000)
+        );
+    }
+
+    #[test]
+    fn an_unchanged_activity_and_time_push_nothing() {
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), Some("busy"), Some(1_000), 9_000),
+            ActivityPush::Nothing
+        );
+        // No manifest time: the shim's clock alone never re-pushes.
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), Some("busy"), None, 9_000),
+            ActivityPush::Nothing
+        );
+        // No activity: nothing to date, whatever the manifest's time says.
+        assert_eq!(
+            activity_push(None, None, None, Some(2_000), 9_000),
+            ActivityPush::Nothing
+        );
     }
 
     // ── Tier 0: Claude's per-PID sessions manifest ────────────────────
