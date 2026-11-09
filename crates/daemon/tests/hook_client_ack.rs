@@ -235,6 +235,8 @@ fn store_message(ctx: &MykoServerContext, id: &str, body: &str, sent_at: i64) {
         response_required: true,
         body: body.into(),
         sent_at,
+        from_kind: None,
+        from_machine: None,
     };
     let event = MEvent::from_item(&message, MEventType::SET, &Uuid::new_v4().to_string());
     ctx.apply_event_batch(vec![event]).unwrap();

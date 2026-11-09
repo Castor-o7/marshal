@@ -380,6 +380,10 @@ pub struct Session {
 ///
 /// Errors with an actionable message if neither resolves to a roster
 /// session.
+/// `Session::kind` of the short-lived session `marshal-shim tell` and `all`
+/// register to send from a terminal (MAR-78 names its mail by this).
+pub const TERMINAL_KIND: &str = "terminal";
+
 pub fn resolve_caller(
     ctx: &CommandContext,
     sessions: &[Arc<Session>],
