@@ -362,6 +362,14 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   rather than resetting it; a session with no `activity` (Codex, older Claude builds) has none;
   everywhere the shim shows `activity` shows `activity_at` beside it (`marshal://roster`, the
   `marshal-shim roster` command and `marshal://whoami`); and tests cover each of those cases.
+- [ ] **MAR-64: Later: `activity_at` moves when the manifest's time does, not only its activity.**
+  Follow-up to MAR-58, found reading #62. The publish loop pushed `activity_at` only when the
+  `activity` string changed, so a busy→idle→busy flip between two manifest reads kept the older
+  time. Additive, on MAR-58's upstream commit. Done when: the loop also pushes `activity_at`, on
+  its own, when the manifest's `statusUpdatedAt` moves under an unchanged `activity`, tracking the
+  last pushed value beside `pushed_activity`; without a `statusUpdatedAt`, or with no `activity`,
+  nothing is re-pushed; and unit tests cover a changed activity, a flip and back, and each case that
+  pushes nothing.
 - [x] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: every in-process
   hook listener in the tests takes a socket the test bound to port 0; every port a test's myko
   server or daemon still picks is retried on a lost bind instead of failing; and the e2e and
