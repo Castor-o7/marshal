@@ -399,6 +399,9 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   them by name. Waits on the operator: licensing is Josh's to raise with upstream. Done when: the
   four crates carry a licence upstream, or the UI drops or replaces them, and the exclusion comes
   out of `deny.toml`.
+  Research (2026-11-09): [ui-crate-licences.md](ui-crate-licences.md). The READMEs do say MIT, but
+  with no LICENSE file, copyright notice or `license` field; it has a draft ask for upstream and
+  the replacement options.
 - [x] **MAR-43: Later: Hold a shim's first write until it's registered, and retry one refused as
   unregistered.** From MUS-72, MUS-78 and MUS-79. A default change, so it's in MAR-15 for upstream and
   built on the fork first. An agent's first write can beat the shim's registration, or land on a row
