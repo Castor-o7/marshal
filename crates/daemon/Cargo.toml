@@ -42,3 +42,7 @@ chrono = { workspace = true }
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 hyphae = { workspace = true }
+# Draft branch only (MAR-37): the threat-model test switches on myko#129's provider.
+myko-auth = { git = "https://github.com/ignition-is-go/myko", rev = "f60281252c32919d149c6bc94e42d0469c396f20", version = "6.11.6" }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
