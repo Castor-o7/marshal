@@ -39,6 +39,10 @@ gethostname = "1"
 notify-debouncer-mini = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# Opt-in TLS to a `marshal-daemon --tls` (MAR-23): pinned rustls on ring, the
+# daemon's provider too. Neither is used for a plain `ws://` daemon.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

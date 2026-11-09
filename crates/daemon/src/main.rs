@@ -87,6 +87,8 @@ async fn main() -> Result<()> {
         }
     }
     let tls = tls.unwrap_or(false);
+    // Before anything builds a rustls config (see `tls::install_provider`).
+    daemon::tls::install_provider();
 
     init_logging();
 
@@ -335,7 +337,9 @@ impl TlsFront {
         };
         let hook_listener = tokio::net::TcpListener::bind(loopback)
             .await
-            .context("marshal-daemon --tls: the loopback hook listener")?;
+            .with_context(|| {
+                format!("marshal-daemon --tls: binding the loopback hook listener on {loopback}")
+            })?;
         let hooks_inner = hook_listener.local_addr()?;
         let public_listener = tokio::net::TcpListener::bind(bind)
             .await
@@ -345,7 +349,13 @@ impl TlsFront {
             .with_context(|| format!("marshal-daemon --tls: binding {hook_bind}"))?;
         let public = public_listener.local_addr()?;
         let public_hooks = public_hooks_listener.local_addr()?;
-        tokio::spawn(daemon::tls::serve(public_listener, acceptor.clone(), myko));
+        // The public listener is bound now, so a taken port stops startup, but
+        // it forwards only once myko answers on its loopback port.
+        let myko_acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            daemon::tls::wait_for_upstream(myko).await;
+            daemon::tls::serve(public_listener, myko_acceptor, myko).await;
+        });
         tokio::spawn(daemon::tls::serve(
             public_hooks_listener,
             acceptor,

@@ -409,7 +409,7 @@ async fn launch_and_wait(
     let sessions = client.watch_query::<GetAllSessions>(GetAllSessions {});
     let nicknames = client.watch_query::<GetAllSessionNicknames>(GetAllSessionNicknames {});
     let address = crate::daemon_address();
-    client.set_address(Some(address.clone()));
+    client.set_address(Some(crate::tls_link::myko_address(address.clone())));
 
     // Start nothing unless the daemon can be reached, so a failure to reach it
     // is said plainly rather than as a session that never joined.
