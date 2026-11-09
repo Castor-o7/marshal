@@ -284,6 +284,20 @@ mod tests {
         assert_eq!(seen_in(&r[4..].join("\n"), &ids(&[A])), ids(&[A]));
     }
 
+    /// A `user` record Claude Code 2.1.321 wrote for a Bash tool result whose
+    /// output was an inbox block (a file `cat`), recorded in MAR-82's check 5
+    /// session and scrubbed: the block is in `message.content[].tool_result`
+    /// and again in `toolUseResult.stdout`.
+    const RECORDED_TOOL_RESULT: &str =
+        include_str!("../tests/fixtures/claude-code-2.1.321/transcript-tool-result.jsonl");
+
+    #[test]
+    fn a_recorded_tool_result_holding_an_inbox_block_is_not_delivery() {
+        let line = RECORDED_TOOL_RESULT.trim().replace("{ID}", A);
+        assert!(line.contains(&format!(r#"ids=\"{A}\""#)), "fixture names the id");
+        assert!(seen_in(&line, &ids(&[A])).is_empty(), "{line}");
+    }
+
     #[test]
     fn an_inbox_block_in_a_tool_result_is_not_delivery() {
         // A session that `cat`s a log or a transcript gets inbox blocks back
