@@ -120,6 +120,7 @@ fn make_session(id: &str) -> Session {
         current_task: None,
         session_name: None,
         activity: None,
+        activity_at: None,
         kind: None,
         connected_at: chrono::Utc::now().timestamp_millis(),
         last_activity_at: None,

@@ -176,6 +176,7 @@ fn read_whoami(
                             "nickname": handle_for(host, s.id.0.as_ref()),
                             "session_name": s.session_name,
                             "activity": s.activity,
+                            "activity_at": s.activity_at,
                             "kind": s.kind,
                             "pid": s.pid,
                             "cwd": s.cwd,
@@ -223,6 +224,7 @@ fn read_whoami(
             "nickname": handle_for(host, snapshot.id.0.as_ref()),
             "session_name": snapshot.session_name,
             "activity": snapshot.activity,
+            "activity_at": snapshot.activity_at,
             "kind": snapshot.kind,
             "pid": host.pid,
             "cwd": host.cwd,
@@ -257,6 +259,7 @@ fn read_roster(host: &ToolHost, uri: &str) -> ResourceContent {
                 "current_task": s.current_task,
                 "session_name": s.session_name,
                 "activity": s.activity,
+                "activity_at": s.activity_at,
                 "kind": s.kind,
                 "operator": s.operator,
                 "agent_id": s.agent_id,
@@ -910,6 +913,51 @@ mod tests {
         }
     }
 
+    /// MAR-58: whoami and the roster show `activity_at` beside `activity`,
+    /// and a session with no activity (Codex, older Claude) shows neither.
+    #[test]
+    fn whoami_and_roster_show_when_activity_last_changed() {
+        let mut busy = (*session("busy-one")).clone();
+        busy.activity = Some("busy".into());
+        busy.activity_at = Some(1_794_186_070_745);
+        let quiet = session("no-activity");
+        let host = ToolHost {
+            client: Arc::new(MykoClient::new()),
+            pid: 1,
+            cwd: "/repo".into(),
+            is_codex: false,
+            session: Arc::new(Mutex::new(busy.clone())),
+            sessions_cell: Cell::new(vec![Arc::new(busy), quiet]).lock(),
+            rooms_cell: Cell::new(vec![]).lock(),
+            members_cell: Cell::new(vec![]).lock(),
+            nicknames_cell: Cell::new(vec![]).lock(),
+            wake_watchers_cell: Cell::new(vec![]).lock(),
+        };
+
+        let parsed = ParsedUri::parse("marshal://whoami").unwrap();
+        let whoami: Value =
+            serde_json::from_str(&read_whoami(&host, "marshal://whoami", &parsed.query).text)
+                .unwrap();
+        assert_eq!(whoami["activity"], "busy");
+        assert_eq!(whoami["activity_at"], 1_794_186_070_745_i64);
+
+        let roster: Value =
+            serde_json::from_str(&read_roster(&host, "marshal://roster").text).unwrap();
+        let row = |id: &str| {
+            roster["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["session_id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row("busy-one")["activity"], "busy");
+        assert_eq!(row("busy-one")["activity_at"], 1_794_186_070_745_i64);
+        assert!(row("no-activity")["activity"].is_null());
+        assert!(row("no-activity")["activity_at"].is_null());
+    }
+
     #[test]
     fn response_requirement_defaults_and_rejects_non_booleans() {
         assert!(!response_required(&json!({})).unwrap());
@@ -934,6 +982,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 0,
             last_activity_at: None,

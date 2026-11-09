@@ -126,6 +126,7 @@ impl Cell {
                 current_task: None,
                 session_name: None,
                 activity: None,
+                activity_at: None,
                 kind: None,
                 connected_at: 1,
                 last_activity_at: Some(1),

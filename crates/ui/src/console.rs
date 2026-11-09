@@ -66,6 +66,7 @@ impl Console {
             current_task: Some("operator console".to_string()),
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: self.connected_at.get_untracked(),
             last_activity_at: Some(now),
