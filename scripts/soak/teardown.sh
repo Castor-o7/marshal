@@ -18,9 +18,9 @@ if [ -d "$STATE" ]; then
   keep=$SOAK_RESULTS/$(date +%Y%m%dT%H%M%S)
   mkdir -p "$keep" && cp -r "$STATE"/. "$keep"/ && log "state kept in $keep"
 fi
-# Only ever remove a directory setup.sh made.
-if [ -e "$SOAK_DIR" ] && [ ! -d "$SOAK_DIR/state" ] && [ ! -e "$SOAK_DIR/s1/.mcp.json" ]; then
-  log "$SOAK_DIR doesn't look like a soak kit directory; not removing it"; exit 1
+# Only ever remove a directory setup.sh made: it holds setup's marker file.
+if [ -e "$SOAK_DIR" ] && [ ! -f "$MARKER" ]; then
+  log "$SOAK_DIR has no $(basename "$MARKER"), so setup.sh didn't make it; not removing it"; exit 1
 fi
 rm -rf "$SOAK_DIR" && log "removed $SOAK_DIR"
 left=0

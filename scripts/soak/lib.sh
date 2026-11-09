@@ -10,6 +10,7 @@ PG_SOCKET=${PG_SOCKET:-/run/user/$(id -u)/marshal-pg}
 export MARSHAL_DAEMON_ADDRESS
 
 STATE=$SOAK_DIR/state
+MARKER=$SOAK_DIR/.marshal-soak-kit                  # setup writes it; teardown removes only a directory that has it
 SESSIONS=$STATE/sessions.tsv                       # i, dir, nickname, session_id
 KIT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 

@@ -13,6 +13,7 @@ others=$(roster | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)
 log "Marshal's roster has $others session(s) before setup"
 
 mkdir -p "$STATE"
+echo "made by scripts/soak/setup.sh at $(date -Is)" > "$MARKER"
 : > "$SESSIONS"
 for i in $(seq 1 "$N"); do
   d=$SOAK_DIR/s$i
