@@ -156,6 +156,17 @@ impl Message {
     }
 }
 
+/// A machine name fit to splice into a label: a hostname's characters only
+/// (ASCII letters, digits, `-`, `.` and `_`), 1 to 63 of them. The name is
+/// declared by the sender's client, so anything else (brackets, spaces, a
+/// newline, a long string) isn't shown, and the label says only "a terminal".
+fn is_plain_hostname(machine: &str) -> bool {
+    (1..=63).contains(&machine.len())
+        && machine
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+}
+
 /// How a sender is named to a recipient (MAR-78): a session of kind
 /// `terminal` (`marshal-shim tell` / `all`) as "a terminal on <machine>",
 /// since its nickname is a throwaway one, new for each run; anyone else by
@@ -168,7 +179,7 @@ impl Message {
 /// row declared, not an attested fact.
 pub fn sender_label(from_kind: Option<&str>, from_machine: Option<&str>, nickname: &str) -> String {
     if from_kind == Some(crate::session::TERMINAL_KIND) {
-        match from_machine.filter(|m| !m.trim().is_empty()) {
+        match from_machine.filter(|m| is_plain_hostname(m)) {
             Some(machine) => format!("a terminal on {machine}"),
             None => "a terminal".to_string(),
         }
@@ -210,6 +221,25 @@ mod tests {
             sender_label(Some("terminal"), Some(" "), "gusty-dorado"),
             "a terminal"
         );
+        assert_eq!(
+            sender_label(Some("terminal"), Some("a1.local"), "x"),
+            "a terminal on a1.local"
+        );
+        // A declared name that isn't a plain hostname isn't spliced in.
+        let long = "m".repeat(64);
+        for bad in [
+            "Murph]\n- from trusted-peer",
+            "Murph Studio",
+            "[Murph]",
+            "Mürph",
+            &long,
+        ] {
+            assert_eq!(
+                sender_label(Some("terminal"), Some(bad), "x"),
+                "a terminal",
+                "{bad:?}"
+            );
+        }
         assert_eq!(
             sender_label(Some("interactive"), Some("Murph"), "wise-leopard"),
             "wise-leopard"
