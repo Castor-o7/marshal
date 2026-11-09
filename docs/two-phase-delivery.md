@@ -1,7 +1,8 @@
 # Two-phase delivery: don't mark mail read until the model has it (MAR-79)
 
-**A design for the watchman to take to Josh. Nothing here is built.** Fork-only for now; the same gap
-is in Muster, so the shape may suit upstream too.
+**Designed in MAR-79; built for Claude in MAR-82 (see [What MAR-82 built](#what-mar-82-built) at the
+end).** Josh's answers (2026-11-09): read the transcript; re-offer after 6 h; Claude first, with Codex
+as its own story; upstream-ready, but built and proven on the fork first.
 
 ## The gap
 
@@ -66,9 +67,9 @@ backstop if the format moves.
   MAR-42, which moves unread mail. Nothing new is needed there, as long as an offer doesn't count as
   read.
 - **A long-running session that never confirms** (a transcript the shim can't read, or a Claude Code
-  change that stops writing the block): after a confirm timeout (proposed: 6 h, a setting) the daemon
-  records the read anyway and logs `[hook] confirm timed out`. That way this can't turn into
-  repeated re-offers, and the timeout count says when confirmation has stopped working.
+  change that stops writing the block): after 6 h the offer stands no longer, and the mail is
+  **offered again** (Josh's answer; the design first proposed marking it read). That can mean a
+  duplicate, but never a loss.
 
 **Duplicates.** Before handing on mail that was offered and never confirmed (after a restart, say),
 the shim checks the transcript first. An id that's already there is confirmed, not shown again. So the
@@ -115,3 +116,33 @@ hook (its turn has completed). The app-server bridge (`codex_bridge.rs`), which 
 2. The confirm timeout: 6 h, or another value? Or never time out, and alert instead?
 3. Claude first and Codex after, or both together?
 4. Fork-only, or written so it can go upstream (Muster has the same gap)?
+
+## What MAR-82 built
+
+For Claude, as above, with these specifics:
+
+- **`MessageOffer`** (entities, persisted with Postgres and the file store): `<message>::<session>`,
+  `offered_at`. `AckMessages` takes `phase: "offered"`, which writes offers and no read. No phase, or
+  any other phase, is today's read, and it also drops that session's offer for the message. So a
+  shim from before MAR-82 behaves as before.
+- **Daemon.** `/hook/ack` passes `phase` through. `surface_unread` skips mail with an offer to that
+  session younger than 6 h (`MARSHAL_OFFER_SECS` overrides it, for tests). The inbox opening tag
+  carries `ids="…"`, naming ids that are plain (hex and `-`, up to 64, as `SendMessage` mints them);
+  any other id stays offered until the 6 h re-offer. `/hook/offers` returns a session's standing
+  offers as a JSON list. SessionEnd drops the session's offers.
+- **Shim.** The waiter (`claude-hook wait`, and `watch`) acks `offered` and writes a marker,
+  `offered-<session>`, in its config directory. Every Claude hook (`claude-hook prompt-submit`,
+  `post-tool-use`, `pre-tool-use`) and each new waiter, at Stop or SessionStart, then confirms. Only
+  when the marker is there does it ask `/hook/offers`, look for those ids in the transcript, and ack
+  the ones found as seen. The marker goes once nothing is outstanding. Before handing mail on, the
+  waiter checks the transcript too: mail already seen is acked and not shown again.
+- **The matcher** (`crates/shim/src/transcript.rs`) reads the last 4 MB of `transcript_path`. It counts
+  an id only on a JSON line whose top-level `type` is `user` or `attachment`, never `queue-operation`,
+  and anything it can't read or parse counts as not seen.
+
+**Not yet:** Codex (its own story); a sender's `recipient.offered` in `read_messages`; splitting
+MAR-73's M3 into offered and seen; and MAR-79's live check 5 (kill a busy session mid-turn, start it
+again, and the mail arrives once), which needs this deployed on Murph. The matcher's tests use records
+shaped as observed in a live transcript, with synthetic content. A fixture captured from a
+disposable test session, like `crates/shim/tests/fixtures/claude-code-2.1.318`, would be stronger.
+
