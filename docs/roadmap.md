@@ -507,6 +507,11 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   `MykoServer::run_with_socket(TcpSocket)`, so `run()` keeps myko#33's late `listen`.
 - [x] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
+- [ ] **MAR-76: Security: Map the gate stories onto myko#129's hooks.** From the watchman
+  (2026-11-09). Docs only. Done when: [gate-on-myko-129.md](gate-on-myko-129.md) says, for each piece
+  of muster's gate and for MAR-23, 24, 25 and 8, which #129 hook at `f6028125` it would use, what
+  Marshal still writes, and which of MAR-38's questions it waits on, with proposed revisions to the
+  gate stories that aren't applied until MAR-38 is answered.
 - [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
   myko#129 (its auth provider) and MAR-38 (upstream's answers decide the flag and shape). Done when: `--tls` serves pinned TLS, plain mode is unchanged, and the
   gate's e2e checks for TLS pass.
