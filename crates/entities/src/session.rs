@@ -459,8 +459,71 @@ impl myko::command::CommandHandler for RegisterSession {
     #[cfg(not(target_arch = "wasm32"))]
     fn execute(mut self, ctx: CommandContext) -> Result<(), CommandError> {
         self.session.client_id = ctx.client_id().map(|id| ClientId(Arc::from(id)));
+        // A paired machine's host is its pairing's name, whatever it declares
+        // (MAR-85): under auth the declared host was the forgeable field left.
+        self.session.host =
+            attested_host(self.session.host.take(), paired_machine(&ctx).as_deref());
         let id = self.session.id.clone();
         update_registered_session(&ctx, &id, |_| self.session)
+    }
+}
+
+/// The paired machine behind a request, from the identity myko#129's provider
+/// attached (MAR-24 puts the pairing's name in its `machine` claim). `None`
+/// in plain mode, and for the daemon host's own local token.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn paired_machine(ctx: &CommandContext) -> Option<String> {
+    let identity = ctx.req.auth.as_ref()?.identity()?;
+    let machine = identity.claims.get("machine")?.as_str()?;
+    (!machine.is_empty() && machine != "(local)").then(|| machine.to_string())
+}
+
+/// The host a session is recorded with: `declared` as it is, unless the
+/// request came from a paired machine, whose name then replaces the declared
+/// name (the declared OS and architecture stay, since the pairing doesn't
+/// know them). A paired machine that declared no host gets one with its name.
+pub fn attested_host(declared: Option<HostInfo>, machine: Option<&str>) -> Option<HostInfo> {
+    match (declared, machine) {
+        (declared, None) => declared,
+        (Some(mut host), Some(machine)) => {
+            host.name = machine.to_string();
+            Some(host)
+        }
+        (None, Some(machine)) => Some(HostInfo {
+            name: machine.to_string(),
+            os: String::new(),
+            arch: String::new(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod attested_host_tests {
+    use super::*;
+
+    fn declared(name: &str) -> Option<HostInfo> {
+        Some(HostInfo {
+            name: name.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        })
+    }
+
+    #[test]
+    fn a_paired_machines_name_replaces_the_declared_one_and_keeps_the_rest() {
+        let host = attested_host(declared("forged"), Some("laptop")).unwrap();
+        assert_eq!((host.name.as_str(), host.os.as_str()), ("laptop", "linux"));
+        let bare = attested_host(None, Some("laptop")).unwrap();
+        assert_eq!((bare.name.as_str(), bare.os.as_str()), ("laptop", ""));
+    }
+
+    #[test]
+    fn without_a_paired_machine_the_declared_host_stands() {
+        assert_eq!(
+            attested_host(declared("murph"), None).unwrap().name,
+            "murph"
+        );
+        assert!(attested_host(None, None).is_none());
     }
 }
 
