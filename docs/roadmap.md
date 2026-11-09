@@ -158,6 +158,15 @@ launcher.
   can't pose as a terminal by writing the prefix; and a sender that changes kind later doesn't relabel
   earlier mail, with tests through the real hook listener (#99).
 
+- [ ] **MAR-78: Goal 3: A terminal's tell is named as a terminal on its machine.** Found in MAR-70:
+  a recipient saw each `tell` as "from gusty-dorado", a throwaway nickname that's new on every run,
+  and took it for a peer. Done when: the daemon records the sender's kind and machine on each message
+  from the sender's own roster row at send time (`Message::from_kind`, `from_machine`); the inbox, the
+  live push and the MCP messages view name a terminal's message "a terminal on <machine>"; it's never
+  derived from the body, and tests show a peer writing the terminal prefix is still named by its
+  nickname, and a sender's later re-registration doesn't relabel what it sent. Until the gate
+  (MAR-24), kind and host are declared by the sender's client, like every roster field.
+
 ## Supporting: Claude delivery
 
 - [x] **MAR-3: Supporting: Hook inbox never offers a message twice (lease race).** `surface_unread`
@@ -265,6 +274,15 @@ launcher.
   unconfirmed for 6 h is offered again; a shim that sends no phase keeps today's behaviour (the ack
   marks it read); and a test kills a session mid-turn and its mail is still unread (MAR-79's check
   5).
+
+- [ ] **MAR-79: Supporting: Design two-phase delivery, so mail taken mid-turn isn't lost.** Found in
+  MAR-70 and MAR-73: a Claude session's background `claude-hook wait` takes a message as soon as it's
+  sent, and the daemon records it read then, but Claude Code holds it until the turn ends. If the
+  session crashes or exits first, the message is marked read and never seen. Muster has the same
+  design. Done when: [two-phase-delivery.md](two-phase-delivery.md) proposes offering mail first and confirming it only at the
+  session's next hook (or another way to know the model saw it), covering Claude and Codex, MAR-3's
+  "never offered twice", restarts and succession (MAR-42), with what changes in the daemon and the
+  shim, for the watchman to take to Josh. Design only: no code.
 
 ## Later: other harnesses
 

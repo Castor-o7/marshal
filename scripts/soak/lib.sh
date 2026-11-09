@@ -14,6 +14,11 @@ MARKER=$SOAK_DIR/.marshal-soak-kit                  # setup writes it; teardown 
 SESSIONS=$STATE/sessions.tsv                       # i, dir, nickname, session_id
 KIT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
+# The kit's own tmux server (socket "$SOAK_TMUX"), so its windows never join
+# another tmux server on the machine, such as the lamplighter's, and the server
+# and every session in it run under whatever memory cap setup.sh was started in.
+tmux() { command tmux -L "$SOAK_TMUX" "$@"; }
+
 now_ms() { date +%s%3N; }
 log() { printf '%s %s\n' "$(date +%T)" "$*" >&2; }
 
