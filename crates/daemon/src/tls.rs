@@ -71,6 +71,10 @@ pub fn identity_dir(state_dir: &Path) -> PathBuf {
 pub fn load_or_create_identity(dir: &Path) -> io::Result<Identity> {
     let (cert_path, key_path) = (dir.join(CERT_FILE), dir.join(KEY_FILE));
     let identity = if cert_path.exists() && key_path.exists() {
+        // Made by an earlier start, or copied in by hand: make sure they're
+        // still owner-only, since a looser key is a key anyone on the host has.
+        restrict(dir, 0o700)?;
+        restrict(&key_path, 0o600)?;
         Identity {
             cert_der: std::fs::read(&cert_path)?,
             key_der: std::fs::read(&key_path)?,
@@ -125,7 +129,10 @@ pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, upstream: Socke
         let (tcp, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
+                // A listener that keeps failing (out of descriptors, say)
+                // shouldn't spin.
                 log::warn!("[tls] accept error: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -150,16 +157,65 @@ async fn forward(tcp: TcpStream, acceptor: TlsAcceptor, upstream: SocketAddr) ->
 }
 
 /// Refuse an internal address that isn't loopback: behind TLS, the plain
-/// listeners must not be reachable from the network.
+/// listeners must not be reachable from the network. Port 0 is refused too:
+/// myko binds that port itself and doesn't say which it got, so the TLS
+/// listener could never find it.
 pub fn require_loopback(name: &str, addr: SocketAddr) -> io::Result<()> {
-    if addr.ip().is_loopback() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    if !addr.ip().is_loopback() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{name} must be a loopback address with --tls, got {addr}"),
-        ))
+        ));
     }
+    if addr.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} needs a fixed port with --tls, not 0: myko binds it itself"),
+        ));
+    }
+    Ok(())
+}
+
+/// Make ring the process's default rustls provider. The daemon links both
+/// ring (for this module) and aws-lc-rs (named by myko's telemetry), and with
+/// two providers rustls's `builder()` panics unless one is installed. Safe to
+/// call more than once; the first call wins.
+pub fn install_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Resolve once `upstream` accepts a connection, polling every 100 ms. The
+/// TLS listener in front of myko waits on this before forwarding, so a
+/// connection that arrives before myko has bound its port isn't dropped, or
+/// handed to whatever took the port first in that window (MAR-40 covers the
+/// window itself; myko binds the port, so this can only observe it).
+pub async fn wait_for_upstream(upstream: SocketAddr) {
+    loop {
+        if TcpStream::connect(upstream).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Set `path`'s mode to `mode` if it's wider, and say so. Unix only.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if current & !mode != 0 {
+        log::warn!(
+            "[tls] {} was mode {current:03o}; set to {mode:03o}",
+            path.display()
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -176,7 +232,9 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 /// can't leave half a key. `private` makes it owner-only.
 fn write_file(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
+    // Named by pid, so two daemons started on one directory by mistake don't
+    // write over each other's half-written file.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -220,6 +278,14 @@ mod tests {
         };
         assert_eq!(mode(KEY_FILE), 0o600);
         assert_eq!(mode(""), 0o700);
+        // Loosened by hand, it's tightened again on the next load.
+        std::fs::set_permissions(
+            dir.path().join("tls").join(KEY_FILE),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        load_or_create_identity(&dir.path().join("tls")).unwrap();
+        assert_eq!(mode(KEY_FILE), 0o600);
     }
 
     #[test]
@@ -227,5 +293,6 @@ mod tests {
         assert!(require_loopback("MARSHAL_MYKO_BIND", "127.0.0.1:6157".parse().unwrap()).is_ok());
         assert!(require_loopback("MARSHAL_MYKO_BIND", "[::1]:6157".parse().unwrap()).is_ok());
         assert!(require_loopback("MARSHAL_MYKO_BIND", "0.0.0.0:6157".parse().unwrap()).is_err());
+        assert!(require_loopback("MARSHAL_MYKO_BIND", "127.0.0.1:0".parse().unwrap()).is_err());
     }
 }

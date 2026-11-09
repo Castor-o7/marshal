@@ -361,7 +361,8 @@ stays the default and behaves as it does today.
   can't act for it, and with no local principal they're unowned and refused; a principal's entries go
   when its session ends or is forgotten; plain mode is unchanged; in-process tests as in #84 for
   each. The doc says plainly that the hook listener itself isn't covered (MAR-81), and that the local
-  token is a loopback trust boundary: on a shared machine its file must be owner-only (0600).
+  token is a loopback trust boundary: on a shared machine its file must be owner-only (0600). The
+  doc is [session-binding.md](session-binding.md).
 - [ ] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
   listener is outside myko, so #129 doesn't cover it. Done when: with a provider on, every `/hook/*`
   request must carry the daemon host's local token or a paired machine's token as
