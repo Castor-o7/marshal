@@ -24,10 +24,20 @@ Every setting can be overridden from the environment (`scripts/soak/lib.sh`): `S
 
 ## Running the 24 h window, once Josh says go
 
+The kit runs its own tmux server (`tmux -L marshal-soak`, so `tmux -L marshal-soak attach` to watch),
+apart from any other on the machine. Start it under a memory cap, so the three sessions and the driver
+can't crowd out the daemons. For example, run setup inside a scope, and run the driver in a window of
+the kit's own server, which is inside that scope:
+
+```sh
+systemd-run --user --scope -p MemoryMax=6G -p MemoryHigh=5G --unit=marshal-soak scripts/soak/setup.sh 3
+tmux -L marshal-soak new-window -d -n drive "scripts/soak/drive.sh 24 2>&1 | tee -a ~/src/marshal-soak/state/drive.log"
+```
+
 1. Check `marshal-shim roster`, and tell whoever is on Marshal (the lamplighter, since step 3) that a
    soak is starting and one restart will come.
 2. `scripts/soak/setup.sh 3`
-3. In its own tmux window: `scripts/soak/drive.sh 24`. With the defaults that's 72 load and 72 canary
+3. In its own window of the kit's tmux server (above): `scripts/soak/drive.sh 24`. With the defaults that's 72 load and 72 canary
    messages, 144 direct messages in all, which clears the bar's 100. It's one short model turn per
    message, so about 144 turns across the three sessions.
 4. Some hours in, while `drive.sh` runs: `scripts/soak/restart-check.sh s1`, and ask the lamplighter
