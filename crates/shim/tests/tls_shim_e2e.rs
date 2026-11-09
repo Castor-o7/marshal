@@ -46,7 +46,9 @@ struct Daemon {
 impl Daemon {
     fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let bin = Path::new(SHIM).with_file_name("marshal-daemon");
+        // Beside the shim; `.exe` on Windows.
+        let bin = Path::new(SHIM)
+            .with_file_name(format!("marshal-daemon{}", std::env::consts::EXE_SUFFIX));
         assert!(bin.exists(), "{} is missing", bin.display());
         let log_path = dir.path().join("daemon.log");
         let mut lost = Vec::new();
