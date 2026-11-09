@@ -52,6 +52,7 @@ impl Authenticator for Tokens {
                 .filter(|token| token == "alice" || token == "bob")
                 .ok_or(AuthError::Unauthenticated)?;
             Ok(AuthenticatedIdentity {
+                user_id: None,
                 principal: Principal {
                     issuer: "mar-37-fixture".into(),
                     subject,
