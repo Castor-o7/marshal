@@ -251,6 +251,13 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
   `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
   and its exit status unchanged, with tests.
+- [ ] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
+  step 7 retires Muster "only after a full day with no traffic", which nothing defined. Done when:
+  [muster-no-traffic-check.md](muster-no-traffic-check.md) defines no traffic (no message and no
+  session event for 24 h, and no session registered) and gives a read-only query on the `muster`
+  database, with SELECTs only, for the latest message, the latest session event and the registered
+  sessions; the query has been run once on Murph with its output recorded; and cutover.md links it
+  (RAL-127).
 
 ## Parity with muster (gap survey, 2026-11-08)
 
