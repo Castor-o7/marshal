@@ -320,6 +320,34 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
         "the paired machine's session never showed: {seen}"
     );
 
+    // The paired machine writes as itself: its terminal's tell reaches its
+    // session, and the session's next hook shows it. (Acting *as* the
+    // hook-registered session from that machine's MCP shim is what MAR-80
+    // refuses until MAR-81 binds hook sessions to the machine that sent them;
+    // no CLI command does that, so it isn't driven here.)
+    let told = rig
+        .remote_shim(None, &["tell", "paired-session", "hello from the laptop"])
+        .output()
+        .unwrap();
+    assert!(
+        told.status.success(),
+        "the paired machine's tell: {}",
+        text(&told)
+    );
+    let mut shown = String::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let out = rig.hook(
+                rig.remote_shim(None, &[]),
+                "prompt-submit",
+                "paired-session",
+            );
+            shown = text(&out);
+            shown.contains("hello from the laptop")
+        }),
+        "the tell never showed in the paired session's hook: {shown}"
+    );
+
     // Unpaired, it's out within the token cache's second, and stays out.
     let out = rig.daemon_cmd(&["unpair", "laptop"]).output().unwrap();
     assert!(out.status.success(), "unpair: {}", text(&out));

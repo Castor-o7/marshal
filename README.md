@@ -54,7 +54,7 @@ marshal-daemon paired          # who is paired
 marshal-daemon unpair laptop   # their connections close within a second
 ```
 
-`pair` also writes `daemon-address` and `tls-pin`, so nothing else on the machine needs configuring. Only hashes of tokens are kept on the daemon (`pairing/` in the state directory). Once machines are paired, the daemon won't start without being told how to run: `--tls` to serve them, or `--plain` to run open.
+`pair` also writes `daemon-address` and `tls-pin`, so nothing else on the machine needs configuring. Until MAR-81 lands, a session that a paired machine registers through its Claude Code or Codex hooks belongs to the daemon's host, not to that machine: the machine can read the roster and send from its terminal, but its own shim can't act as that session (set its status, or send as it). Only hashes of tokens are kept on the daemon (`pairing/` in the state directory). Once machines are paired, the daemon won't start without being told how to run: `--tls` to serve them, or `--plain` to run open.
 
 By default the daemon keeps its store in memory, so a restart loses messages, read state and rooms. To keep them, give it Postgres with `MYKO_POSTGRES_URL`, or, with no Postgres, set `MARSHAL_PERSIST=file`: the store goes to `store.jsonl` in the state directory (`MARSHAL_STATE_DIR`, else `$XDG_STATE_HOME/marshal`, else `~/.local/state/marshal`), private to your user. The daemon refuses a second daemon on the same directory, and any `MARSHAL_PERSIST` value other than `file`.
 
