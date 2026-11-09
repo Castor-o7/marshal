@@ -189,7 +189,7 @@ launcher.
   and Prime Agent mark a push read as soon as it reaches the connection. Overlaps lobo235's upstream
   plugin PRs: coordinate, don't race. Done when: a push the harness didn't take stays unread for the
   next drain, in each of the three plugins, with a test each.
-- [x] **MAR-11: Later: Resuming wakes re-pushes held mail to push sessions.** From MUS-82. Dropped
+- [x] **MAR-11: Dropped: Resuming wakes re-pushes held mail to push sessions.** From MUS-82. Dropped
   with the wake pause ([muster-terminal-gap.md](muster-terminal-gap.md)); reopens only if the pause
   is ported. Marshal has no pause to resume, so there's nothing to fix.
 - [x] **MAR-13: Later: OpenCode plugin declares its channel.** From MUS-89. Done when: the plugin
