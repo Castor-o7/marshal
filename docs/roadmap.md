@@ -254,10 +254,12 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   `2d997b3`). Write tools fail one missing field at a time. Done when: one error names every missing or
   mistyped field (Codex's `asSession` too) and the keys given, the common aliases muster accepts stand
   in, the canonical name wins over an alias, the advertised schemas are unchanged, with tests.
-- [ ] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
-  (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the old
-  one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is only in
-  its current `op:` room, with a test.
+- [x] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
+  (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the
+  old one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is
+  only in its current `op:` room, with a test. Done (#42): each auto-rooms dispatch removes the
+  session from other operators' `op:` rooms; a SET naming no operator leaves them.
+  `crates/daemon/tests/auto_rooms_operator.rs` shows it.
 - [ ] **MAR-51: Parity: A future lastActivityAt doesn't win operator mail.** The plain-mode part of
   MUS-33 (muster `9a0b61c`). Mail to an operator goes to their most active session, and a session can
   claim a far-future `lastActivityAt`. Done when: a `lastActivityAt` later than now doesn't outrank a
