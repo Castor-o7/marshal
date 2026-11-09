@@ -465,6 +465,7 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
         // Seen go now, not on the next tick's observation, so this tick's
         // membership sweep already knows it may be taken over (MAR-19).
         crate::succession::record_removed(&id, now_ms);
+        crate::auth::session_binding::release(&id);
         disconnected_since.remove(&id);
     }
 }

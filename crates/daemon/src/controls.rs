@@ -365,7 +365,10 @@ pub fn apply(dir: &Path, ctx: &MykoServerContext) {
     for id in &plan.held {
         if ids.contains(id) {
             match ctx.del_by_id(Session::ENTITY_NAME_STATIC, id) {
-                Ok(()) => log::warn!("[controls] forgot session {id} at the operator's request"),
+                Ok(()) => {
+                    log::warn!("[controls] forgot session {id} at the operator's request");
+                    crate::auth::session_binding::release(id);
+                }
                 Err(e) => log::warn!("[controls] couldn't forget session {id}: {e}"),
             }
         }
