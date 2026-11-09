@@ -272,6 +272,13 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   gives the project-local wiring, the checks with their expected output, and teardown, checked
   against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
   doc is marked not yet run. Done (#57), merged in 565688e.
+- [ ] **MAR-72: Cutover: a dry-run checklist for moving the watchman and the lamplighter.** Step 3 of the
+  cutover runbook. Step 1's kit launches with `--setting-sources project`, which drops all the user's
+  settings (auto mode, permission rules, model), not just Muster's hooks, and the lamplighter's `~/src`
+  is shared with other sessions. Done when: [cutover-step3-dry-run.md](cutover-step3-dry-run.md) gives
+  the wiring for both directories, the dry-run checks with a stand-in per role, the move's order (drain
+  and RAL-122's check, announce on Muster, restart, announce on Marshal, record the succession, check
+  again), and rollback. Marked not yet run.
 - [x] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
   `marshal-shim doctor` reads only `~/.claude/settings.json` and `~/.claude.json`, so it can't check a
   session wired by a project-local `.claude/settings.json` and `.mcp.json`, which is how the cutover
@@ -292,6 +299,15 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   database, with SELECTs only, for the latest message, the latest session event and the registered
   sessions; the query has been run once on Murph with its output recorded; and cutover.md links it
   (RAL-127).
+- [ ] **MAR-71: Cutover: doctor probes the daemon where the shim connects.** Found running MAR-70 on
+  Murph: `marshal-shim doctor` said "FAIL daemon ws://127.0.0.1:6155 answered HTTP 404 … isn't a Marshal
+  daemon" against the live daemon. The daemon serves its WebSocket at `/myko` only, and myko's client
+  turns an address with no path into `/myko` (`normalize_myko_address`), but doctor handshook at the
+  address as written, so it reached `/`. Its test server took a handshake on any path, so the tests
+  missed it. Done when: doctor resolves the address as myko's client does (no scheme means `ws://`, an
+  empty or `/` path means `/myko`, no port means 5155), names that URL in its finding, and a test
+  server that serves `/myko` only passes; doctor built from the branch, run against the live daemon on
+  Murph, says `ok daemon`.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
@@ -454,7 +470,9 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   another test's myko server holds the port, a connect succeeds, and detection rests on the bind
   error arriving within 200 ms, a timing assumption. Waits on the operator and upstream: an additive
   ask that myko-server accept a pre-bound listener, which Josh sends. Done when: myko-server accepts
-  a pre-bound listener, and the remaining port-0 picks in the tests use it.
+  a pre-bound listener, and the remaining port-0 picks in the tests use it. The ask is drafted in
+  [myko-prebound-listener-ask.md](myko-prebound-listener-ask.md): an additive
+  `MykoServer::run_with_socket(TcpSocket)`, so `run()` keeps myko#33's late `listen`.
 - [x] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
 - [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
