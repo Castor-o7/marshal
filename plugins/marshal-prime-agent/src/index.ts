@@ -24,7 +24,7 @@ import { Type } from "typebox";
 
 import { MarshalDaemon } from "./daemon.ts";
 import { pullForTurn } from "./inbox-pull.ts";
-import { deliverLivePush } from "./live-push.ts";
+import { deliverLivePush, deliverWaiting } from "./live-push.ts";
 import { resolveIdentity, type Identity } from "./identity.ts";
 import type { NotifyChannelMeta, SessionItem } from "./entities.ts";
 import { shouldRegisterPrimeAgentSession } from "./runtime.ts";
@@ -113,6 +113,27 @@ async function init(pi: ExtensionAPI) {
       hold: (messageId) => (daemon ? daemon.holdPush(sid, messageId) : null),
       pull: () => (daemon ? daemon.pullInbox(sid) : Promise.resolve(null)),
     }).catch((e) => log(`live push injection failed: ${String(e)}`));
+  }
+
+  /** On a reconnect, show the mail that waited out the drop (MAR-48). It
+   *  couldn't be pushed while the connection was down, so without this it
+   *  would wait for the next prompt. The handover starts a turn, which wakes
+   *  an idle session, and the mail is acked once it's taken. */
+  function onReconnect(sessionIds: string[]): void {
+    const sid = sessionId;
+    if (!sid || !daemon || !sessionIds.includes(sid)) return;
+    deliverWaiting({
+      inject: (content) =>
+        pi.sendMessage(
+          { customType: "marshal-channel", content, display: true },
+          { deliverAs: "steer", triggerTurn: true },
+        ),
+      pull: () => (daemon ? daemon.pullInbox(sid) : Promise.resolve(null)),
+    })
+      .then((shown) => {
+        if (shown && sessionCtx?.hasUI) sessionCtx.ui.notify("marshal: mail that arrived while disconnected", "info");
+      })
+      .catch((e) => log(`showing mail that waited out a reconnect failed: ${String(e)}`));
   }
 
   // ── Status helpers ────────────────────────────────────────────────────
@@ -225,6 +246,7 @@ async function init(pi: ExtensionAPI) {
     if (!daemon) {
       daemon = new MarshalDaemon({ address, cwd, identity, log });
       daemon.onNotify(onInboundMessage);
+      daemon.onReconnect(onReconnect);
       daemon.onConnectionChanged((connected) => {
       updateStatus();
       if (connected) {

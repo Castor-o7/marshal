@@ -34,7 +34,9 @@ marshal-daemon &
 # or under your favorite supervisor (systemd user unit, launchd, tmux pane, ...)
 ```
 
-The daemon binds `127.0.0.1:6155` by default, so only this machine can reach it, and writes its event log to `~/.local/state/marshal/events.jsonl`. To let sessions on other hosts reach it, set `MARSHAL_BIND` to an address they can reach, such as `MARSHAL_BIND=0.0.0.0:6155`. Marshal has no authentication, so expose it only on a network you trust.
+The daemon binds `127.0.0.1:6155` by default, so only this machine can reach it. To let sessions on other hosts reach it, set `MARSHAL_BIND` to an address they can reach, such as `MARSHAL_BIND=0.0.0.0:6155`. Marshal has no authentication, so expose it only on a network you trust.
+
+By default the daemon keeps its store in memory, so a restart loses messages, read state and rooms. To keep them, give it Postgres with `MYKO_POSTGRES_URL`, or, with no Postgres, set `MARSHAL_PERSIST=file`: the store goes to `store.jsonl` in the state directory (`MARSHAL_STATE_DIR`, else `$XDG_STATE_HOME/marshal`, else `~/.local/state/marshal`), private to your user. The daemon refuses a second daemon on the same directory, and any `MARSHAL_PERSIST` value other than `file`.
 
 ### 3. Add the plugin in Claude Code
 
@@ -340,7 +342,7 @@ identity when you mean to reach the human through their most-active agent.
 |---|---|
 | `send_message(to, body)` | Interrupt one peer by nickname, session id/prefix, or operator identity. |
 | `broadcast(to_room, body)` | Ambient room update; an `@mention` also directly interrupts that peer. |
-| `join_room(room)` / `leave_room(room)` | Create/join or leave an ad-hoc room. |
+| `join_room(name)` / `leave_room(room)` | Create/join or leave an ad-hoc room. |
 | `set_status(text)` | Update this session's free-form status (the `current_task` field on the roster). |
 | `ack_messages(message_ids)` | Mark message ids read for this session. |
 

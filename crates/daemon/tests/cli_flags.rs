@@ -82,6 +82,7 @@ fn help_names_the_flags_and_the_environment_and_exits() {
             "MARSHAL_BIND",
             "MARSHAL_HOOK_BIND",
             "MYKO_POSTGRES_URL",
+            "MARSHAL_PERSIST",
         ] {
             assert!(
                 help.contains(expected),
