@@ -809,6 +809,10 @@ async fn serve() -> Result<()> {
             session_for_publish.lock().unwrap().session_name.clone();
         let mut pushed_activity: Option<String> =
             session_for_publish.lock().unwrap().activity.clone();
+        // The `activity_at` (MAR-58) last pushed with it, seeded the same way;
+        // not `pushed_activity_at`, which tracks `last_activity_at`.
+        let mut pushed_activity_changed_at: Option<i64> =
+            session_for_publish.lock().unwrap().activity_at;
         // Consecutive ticks our own session was absent from the roster.
         let mut missing_from_roster: u32 = 0;
         loop {
@@ -920,40 +924,47 @@ async fn serve() -> Result<()> {
                 }
                 pushed_session_name = current_session_name;
             }
-            if pushed_activity != current_activity {
-                let arc_activity = current_activity.as_deref().map(Arc::<str>::from);
-                log_if_refused(
-                    "activity",
-                    client_for_publish.send_command::<marshal_entities::SetSessionActivity, ()>(
-                        &marshal_entities::SetSessionActivity {
-                            id: session_id_for_publish.clone(),
-                            activity: arc_activity,
-                        },
-                    ),
-                );
-                // MAR-58: when it changed, pushed right after the activity
-                // itself. A failure is logged, not retried: the next change
-                // or re-register sends it again, and a moment's skew between
-                // the two fields is acceptable.
-                let activity_at = session_discovery::activity_at(
-                    current_activity.as_deref(),
-                    status_updated_at,
-                    Utc::now().timestamp_millis(),
-                );
-                log_if_refused(
-                    "activity_at",
-                    client_for_publish.send_command::<marshal_entities::SetSessionActivityAt, ()>(
-                        &marshal_entities::SetSessionActivityAt {
-                            id: session_id_for_publish.clone(),
-                            activity_at,
-                        },
-                    ),
-                );
-                if let Ok(mut s) = session_for_publish.lock() {
-                    s.activity = current_activity.clone();
-                    s.activity_at = activity_at;
+            match session_discovery::activity_push(
+                pushed_activity.as_deref(),
+                pushed_activity_changed_at,
+                current_activity.as_deref(),
+                status_updated_at,
+                Utc::now().timestamp_millis(),
+            ) {
+                session_discovery::ActivityPush::Nothing => {}
+                session_discovery::ActivityPush::ActivityAndTime(activity_at) => {
+                    let arc_activity = current_activity.as_deref().map(Arc::<str>::from);
+                    log_if_refused(
+                        "activity",
+                        client_for_publish
+                            .send_command::<marshal_entities::SetSessionActivity, ()>(
+                                &marshal_entities::SetSessionActivity {
+                                    id: session_id_for_publish.clone(),
+                                    activity: arc_activity,
+                                },
+                            ),
+                    );
+                    // MAR-58: when it changed, pushed right after the activity
+                    // itself. A failure is logged, not retried: the next change
+                    // or re-register sends it again, and a moment's skew between
+                    // the two fields is acceptable.
+                    push_activity_at(&client_for_publish, &session_id_for_publish, activity_at);
+                    if let Ok(mut s) = session_for_publish.lock() {
+                        s.activity = current_activity.clone();
+                        s.activity_at = activity_at;
+                    }
+                    pushed_activity = current_activity;
+                    pushed_activity_changed_at = activity_at;
                 }
-                pushed_activity = current_activity;
+                session_discovery::ActivityPush::TimeOnly(at) => {
+                    // The same activity, set again since the last read (a flip
+                    // and back): only its time moves.
+                    push_activity_at(&client_for_publish, &session_id_for_publish, Some(at));
+                    if let Ok(mut s) = session_for_publish.lock() {
+                        s.activity_at = Some(at);
+                    }
+                    pushed_activity_changed_at = Some(at);
+                }
             }
 
             let last_activity_at = activity_for_publish.last_activity_ms();
@@ -1543,6 +1554,19 @@ fn log_if_refused(
             log::warn!("[marshal-shim] pushing {field} failed: {e}");
         }
     });
+}
+
+/// Push a session's `activity_at` (MAR-58), logging a refusal.
+fn push_activity_at(client: &MykoClient, id: &SessionId, activity_at: Option<i64>) {
+    log_if_refused(
+        "activity_at",
+        client.send_command::<marshal_entities::SetSessionActivityAt, ()>(
+            &marshal_entities::SetSessionActivityAt {
+                id: id.clone(),
+                activity_at,
+            },
+        ),
+    );
 }
 
 /// Default the roster's free-form `current_task` from evidence the shim already
