@@ -24,7 +24,7 @@ import type { Event } from "@opencode-ai/sdk";
 
 import { MarshalDaemon } from "./daemon.js";
 import { resolveIdentity } from "./identity.js";
-import { pushText } from "./push.js";
+import { deliverPush, deliverWaiting } from "./push.js";
 
 const DEFAULT_ADDRESS = "ws://localhost:6155";
 
@@ -89,22 +89,51 @@ export const MarshalPlugin: Plugin = async (input) => {
     const sid = meta.to_session;
     if (!sid) return;
     log(`marshal: inbound push for session ${sid}`);
-    // NotifyChannel already carries the body. The daemon marks a delivered
-    // direct push read; anything else unread (an @mention push, a message whose
-    // push failed) is surfaced by chat.message, which also runs for this
-    // prompt. Don't drain after the prompt: by then the drain can only find
-    // messages that turned unread during the turn, and it would ack them
-    // without showing them.
-    const text = meta.body ? pushText(who, meta) : await daemon.drainInbox(sid);
-    if (!text) {
-      log(`marshal: inbound push for ${sid} had no body and inbox was empty`);
-      return;
+    // NotifyChannel carries the body. The session registers with acksPushes,
+    // so the pushed message stays unread until deliverPush acks it, once the
+    // prompt has resolved; if the prompt fails it stays unread for the next
+    // turn's chat.message drain (MAR-10). While it's prompted it's held out of
+    // drains, so the chat.message run for this very prompt doesn't show it
+    // twice; that drain still surfaces anything else unread. Don't drain after
+    // the prompt: by then the drain can only find messages that turned unread
+    // during the turn, and it would ack them without showing them.
+    await deliverPush(meta, who, {
+      prompt: (text) => {
+        log(`marshal: auto-advancing ${sid} (${text.length} chars)`);
+        // throwOnError: the SDK otherwise resolves a failed prompt with an
+        // `error` field, which would ack a message opencode never took.
+        return client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] }, throwOnError: true });
+      },
+      hold: (messageId) => daemon.holdPush(sid, messageId),
+      ack: (messageId) => daemon.ackMessages(sid, [messageId]),
+      drain: () => daemon.drainInbox(sid),
+    })
+      .then((shown) =>
+        log(shown ? `marshal: auto-advanced session ${sid}` : `marshal: inbound push for ${sid} had nothing new to show`),
+      )
+      .catch((e: unknown) => log(`marshal: auto-advance prompt failed, left unread: ${String(e)}`));
+  });
+  // MAR-48: on a reconnect, show each session the mail that waited out the
+  // drop. It couldn't be pushed while the connection was down, so without
+  // this it would wait for the next prompt. It's acked once opencode has
+  // taken the prompt; if the prompt fails it stays unread for the next turn.
+  daemon.onReconnect((sessionIds) => {
+    for (const sid of sessionIds) {
+      void deliverWaiting({
+        prompt: (text) => {
+          log(`marshal: showing ${sid} mail that waited out a reconnect (${text.length} chars)`);
+          return client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] }, throwOnError: true });
+        },
+        pull: () => daemon.pullInbox(sid),
+      })
+        .then((shown) => {
+          if (!shown) return;
+          void client.tui
+            .showToast({ body: { message: "marshal: mail that arrived while disconnected", variant: "info" } })
+            .catch(() => {});
+        })
+        .catch((e: unknown) => log(`marshal: showing mail that waited out a reconnect failed, left unread: ${String(e)}`));
     }
-    log(`marshal: auto-advancing ${sid} (${text.length} chars)`);
-    await client.session
-      .prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] } })
-      .then(() => log(`marshal: auto-advanced session ${sid}`))
-      .catch((e: unknown) => log(`marshal: auto-advance prompt failed: ${String(e)}`));
   });
   daemon.onRosterChanged(() => ui?.invalidate({ surface: "sidebar" }));
   daemon.onConnectionChanged(() => {
