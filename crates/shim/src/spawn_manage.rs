@@ -138,7 +138,7 @@ async fn roster() -> Result<(
     let nicknames = client.watch_query::<GetAllSessionNicknames>(GetAllSessionNicknames {});
     let watchers = client.watch_query::<GetAllWakeWatchers>(GetAllWakeWatchers {});
     let address = crate::daemon_address();
-    client.set_address(Some(address.clone()));
+    client.set_address(Some(crate::tls_link::myko_address(address.clone())));
     let started = Instant::now();
     while !matches!(
         client.connection_status_sync(),
