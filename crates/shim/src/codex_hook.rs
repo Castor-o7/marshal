@@ -92,6 +92,9 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     let cwd = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
 
     let base = resolve_base(base_override);
+    if matches!(harness, Harness::Claude) {
+        confirm_seen(&base, sid, transcript_path(&v).as_deref());
+    }
     let host = short_host();
     let op = operator();
     // Map the hook entry point to (daemon endpoint, Codex hook-event name). The
@@ -169,6 +172,7 @@ pub fn watch(session_id: &str, base_override: Option<&str>, once: bool) {
         base_override,
         once,
         parent_pid(),
+        None,
         |resp| write_watch_events(&mut std::io::stdout().lock(), resp),
     );
 }
@@ -194,10 +198,20 @@ pub fn wait_hook(base_override: Option<&str>) {
     let Some(_lock) = acquire_waiter_lock(sid, deadline, parent) else {
         return;
     };
-    let delivered = wait_for_mail(sid, cwd, base_override, true, parent, |resp| {
-        let mut out = std::io::stderr().lock();
-        writeln!(out, "{resp}").and_then(|()| out.flush())
-    });
+    let transcript = transcript_path(&v);
+    confirm_seen(&resolve_base(base_override), sid, transcript.as_deref());
+    let delivered = wait_for_mail(
+        sid,
+        cwd,
+        base_override,
+        true,
+        parent,
+        transcript.as_deref(),
+        |resp| {
+            let mut out = std::io::stderr().lock();
+            writeln!(out, "{resp}").and_then(|()| out.flush())
+        },
+    );
     if delivered {
         std::process::exit(2);
     }
@@ -249,6 +263,7 @@ fn wait_for_mail(
     base_override: Option<&str>,
     once: bool,
     parent: Option<u32>,
+    transcript: Option<&std::path::Path>,
     mut deliver: impl FnMut(&str) -> std::io::Result<()>,
 ) -> bool {
     // A one-shot waiter only notices its parent is gone between polls, and until
@@ -301,15 +316,31 @@ fn wait_for_mail(
                     if parent_pid() != parent {
                         return false;
                     }
+                    // Mail this session's transcript already shows reached the
+                    // model (an offer whose `seen` was lost) is confirmed, not
+                    // shown again (MAR-82).
+                    let ids: Vec<String> = reply.ack_ids.iter().map(|id| id.to_string()).collect();
+                    if !ids.is_empty()
+                        && let Some(path) = transcript
+                        && crate::transcript::seen(path, &ids).len() == ids.len()
+                    {
+                        ack_seen(&base, session_id, &ids);
+                        continue;
+                    }
                     if deliver(resp).is_err() {
                         return false;
                     }
-                    // Only now has it been handed on. A lost ack means the mail
-                    // comes again, which beats losing it.
+                    // Only now has it been handed on, but Claude Code holds a
+                    // rewake until the running turn ends, so the model may not
+                    // have it yet: ack it offered, and the session's later hooks
+                    // confirm it from the transcript (MAR-82). A lost ack means
+                    // the mail comes again, which beats losing it.
                     if !reply.ack_ids.is_empty() {
+                        mark_offered(session_id);
                         let ack = serde_json::json!({
                             "session_id": session_id,
                             "message_ids": reply.ack_ids,
+                            "phase": "offered",
                         })
                         .to_string();
                         if let Err(e) = post("/hook/ack", &ack, ACK_TIMEOUT) {
@@ -350,6 +381,66 @@ fn wait_for_mail(
                 }
                 std::thread::sleep(WATCH_RETRY);
             }
+        }
+    }
+}
+
+/// `transcript_path` from a Claude hook's input, when it names a file.
+fn transcript_path(input: &serde_json::Value) -> Option<std::path::PathBuf> {
+    input
+        .get("transcript_path")
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Present while this session may have offered mail outstanding (MAR-82), so
+/// its hooks ask the daemon only then, not on every tool call.
+fn offered_marker(session_id: &str) -> Option<std::path::PathBuf> {
+    crate::config_file_candidates(&format!("offered-{session_id}"))
+        .into_iter()
+        .next()
+}
+
+fn mark_offered(session_id: &str) {
+    if let Some(path) = offered_marker(session_id) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, "");
+    }
+}
+
+/// Ack `ids` as seen: read (MAR-82).
+fn ack_seen(base: &str, session_id: &str, ids: &[String]) {
+    let ack = serde_json::json!({ "session_id": session_id, "message_ids": ids }).to_string();
+    let _ = http_post_why(base, "/hook/ack", &ack, Instant::now() + ACK_TIMEOUT);
+}
+
+/// Confirm whichever of this session's offered mail its transcript shows went
+/// to the model (MAR-82). Quiet and fail-safe: anything that goes wrong leaves
+/// the mail offered, and the daemon offers it again after its timeout.
+fn confirm_seen(base: &str, session_id: &str, transcript: Option<&std::path::Path>) {
+    let (Some(marker), Some(transcript)) = (offered_marker(session_id), transcript) else {
+        return;
+    };
+    if !marker.exists() {
+        return;
+    }
+    let body = serde_json::json!({ "session_id": session_id }).to_string();
+    let Ok(reply) = http_post_why(base, "/hook/offers", &body, Instant::now() + ACK_TIMEOUT) else {
+        return;
+    };
+    let offered: Vec<String> = serde_json::from_str(reply.body.trim()).unwrap_or_default();
+    if offered.is_empty() {
+        let _ = std::fs::remove_file(&marker);
+        return;
+    }
+    let seen = crate::transcript::seen(transcript, &offered);
+    if !seen.is_empty() {
+        ack_seen(base, session_id, &seen);
+        if seen.len() == offered.len() {
+            let _ = std::fs::remove_file(&marker);
         }
     }
 }

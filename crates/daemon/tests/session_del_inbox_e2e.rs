@@ -288,6 +288,7 @@ fn del_session_then_reregister_does_not_reinject_acked_direct_dm() {
     let ack = client_b.send_command::<AckMessages, AckMessagesResult>(&AckMessages {
         message_ids: vec![MessageId(dm_id.clone())],
         as_session: None,
+        phase: None,
     });
     {
         let cell = ack.clone();

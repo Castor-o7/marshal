@@ -36,12 +36,50 @@ use myko::{
 use serde_json::Value;
 
 use marshal_entities::{
-    AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllSessions, GetAllWakeWatchers, HostInfo, MessageId,
-    MessageView, ReadMessages, Session, SessionId, WakeWatcher, WakeWatcherId, context_preview,
-    nickname_for,
+    ACK_OFFERED, AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllMessageOffers, GetAllSessions,
+    GetAllWakeWatchers, HostInfo, MessageId, MessageView, ReadMessages, Session, SessionId,
+    WakeWatcher, WakeWatcherId, context_preview, nickname_for,
 };
 
 const AUTO_INBOX_BODY_BUDGET_CHARS: usize = 8_000;
+/// The longest message id the inbox's `ids` attribute names (MAR-82).
+const INBOX_ID_MAX: usize = 64;
+
+/// A message id the inbox names in its `ids` attribute, for the session's
+/// hooks to find in its transcript (MAR-82): hex digits and `-` only, as
+/// `SendMessage` mints them. Any other id is left out, so its mail can't be
+/// confirmed from the transcript and is offered again after the offer timeout.
+fn transcript_id(id: &MessageId) -> Option<&str> {
+    let id = id.0.as_ref();
+    ((1..=INBOX_ID_MAX).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+    .then_some(id)
+}
+
+/// The messages `sid` has a standing offer for (MAR-82): handed on by its
+/// waiter, not yet seen, and offered less than the offer timeout ago.
+fn standing_offers(cmd_ctx: &CommandContext, sid: &SessionId) -> HashSet<MessageId> {
+    let since = chrono::Utc::now().timestamp_millis() - marshal_entities::offer_timeout_ms();
+    cmd_ctx
+        .exec_query(GetAllMessageOffers {})
+        .unwrap_or_default()
+        .iter()
+        .filter(|o| &o.session_id == sid && o.offered_at > since)
+        .map(|o| o.message_id.clone())
+        .collect()
+}
+
+/// What `sid`'s hooks should look for in its transcript: the ids of its
+/// standing offers that the inbox named (MAR-82).
+pub fn offered_ids(ctx: &Arc<MykoServerContext>, sid: &str) -> Vec<MessageId> {
+    let cmd_ctx = internal_cmd_ctx(ctx);
+    let mut ids: Vec<MessageId> = standing_offers(&cmd_ctx, &SessionId(Arc::from(sid)))
+        .into_iter()
+        .filter(|id| transcript_id(id).is_some())
+        .collect();
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    ids
+}
 const AUTO_INBOX_MIN_BODY_CHARS: usize = 256;
 /// Room for the message lines of one inbox block, in UTF-16 units (how
 /// Claude Code measures). Claude injects hook context whole only up to
@@ -158,6 +196,7 @@ pub fn dispatch(
         "/hook/prompt-submit" => Some(handle_prompt_submit(query, body, ctx)),
         "/hook/session-end" => Some(handle_session_end(body, ctx)),
         "/hook/ack" => Some(handle_ack(body, ctx)),
+        "/hook/offers" => Some(handle_offers(body, ctx)),
         "/hook/bridge-watch" => Some(handle_bridge_watch(body, ctx)),
         _ => None,
     }
@@ -168,6 +207,18 @@ pub fn dispatch(
 /// messages (they stay unread and re-surface). Fail-loud: a failed ack is
 /// logged, not silently swallowed.
 pub fn ack_surfaced(ctx: &Arc<MykoServerContext>, session: &SessionId, ids: Vec<MessageId>) {
+    ack_with_phase(ctx, session, ids, None);
+}
+
+/// Ack `ids` for `session`: as read (`phase` `None` or `"seen"`), or, for mail
+/// a Claude waiter handed on that the model may not have yet, as offered
+/// (`"offered"`, MAR-82), which leaves it unread with a `MessageOffer`.
+fn ack_with_phase(
+    ctx: &Arc<MykoServerContext>,
+    session: &SessionId,
+    ids: Vec<MessageId>,
+    phase: Option<&str>,
+) {
     if ids.is_empty() {
         return;
     }
@@ -175,6 +226,7 @@ pub fn ack_surfaced(ctx: &Arc<MykoServerContext>, session: &SessionId, ids: Vec<
     let acked = (AckMessages {
         message_ids: ids.clone(),
         as_session: Some(session.clone()),
+        phase: phase.map(str::to_string),
     })
     .execute(cmd_ctx);
     // Only now, so the row is read before anyone else can be offered it.
@@ -204,15 +256,22 @@ fn handle_ack(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
         .filter_map(|id| id.as_str())
         .map(|id| MessageId(Arc::from(id)))
         .collect();
+    // `"offered"` from a Claude waiter: handed on, not yet seen (MAR-82).
+    // Anything else, or none, is today's ack: read.
+    let phase = parsed
+        .as_ref()
+        .and_then(|b| b.get("phase")?.as_str())
+        .filter(|p| *p == ACK_OFFERED);
     if let Some(session) = session {
         if !ids.is_empty() {
             log::info!(
-                "[hook] {}: client acked {} message(s)",
+                "[hook] {}: client {} {} message(s)",
                 session.0.as_ref(),
+                if phase.is_some() { "offered" } else { "acked" },
                 ids.len()
             );
         }
-        ack_surfaced(ctx, &session, ids);
+        ack_with_phase(ctx, &session, ids, phase);
     }
     HookOutcome::text(String::new())
 }
@@ -698,7 +757,38 @@ fn handle_session_end(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome 
         crate::succession::record_removed(sid, chrono::Utc::now().timestamp_millis());
     }
     end_all_waits(&cmd_ctx, sid);
+    drop_offers(&cmd_ctx, sid);
     HookOutcome::text(String::new())
+}
+
+/// Drop `sid`'s standing offers (MAR-82). The mail was never marked read, so
+/// it's unread again for the session if it comes back, or, by MAR-42, for
+/// its successor.
+fn drop_offers(cmd_ctx: &CommandContext, sid: &str) {
+    let offers = cmd_ctx
+        .exec_query(GetAllMessageOffers {})
+        .unwrap_or_default();
+    for offer in offers.iter().filter(|o| o.session_id.0.as_ref() == sid) {
+        if let Err(e) = cmd_ctx.emit_del(&**offer) {
+            log::warn!("[hook] dropping an offer for {sid} failed: {e:?}");
+        }
+    }
+}
+
+/// `/hook/offers` (MAR-82): the ids of `session_id`'s standing offers, as a
+/// JSON array, for its hooks to look for in its transcript.
+fn handle_offers(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
+    let sid = parse_body(body)
+        .as_ref()
+        .and_then(|b| b.get("session_id")?.as_str().map(str::to_string));
+    let ids: Vec<String> = match sid {
+        Some(sid) => offered_ids(ctx, &sid)
+            .into_iter()
+            .map(|id| id.0.to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+    HookOutcome::text(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into()))
 }
 
 /// Fetch unread messages addressed to `sid`, format them framed as
@@ -745,7 +835,12 @@ fn surface_unread(cmd_ctx: &CommandContext, sid: &str) -> (String, Vec<MessageId
     // budget across this batch, never exceeding the per-message live-push cap.
     let per_message_chars = (AUTO_INBOX_BODY_BUDGET_CHARS / result.messages.len())
         .clamp(AUTO_INBOX_MIN_BODY_CHARS, CONTEXT_BODY_MAX_CHARS);
-    let framing = "<marshal_inbox count=\"20\" remaining=\"4294967295\">\n</marshal_inbox>\n";
+    // The `ids` attribute is budgeted at its longest: 20 ids of 64, comma-separated.
+    let framing = format!(
+        "<marshal_inbox count=\"20\" remaining=\"4294967295\" ids=\"{}\">\n</marshal_inbox>\n",
+        "x".repeat(20 * (INBOX_ID_MAX + 1))
+    );
+    let framing = framing.as_str();
     let operator_notice =
         marshal_entities::operator_relay_notice(&"x".repeat(PEER_HANDLE_MAX_UTF16));
     let lines_limit = AUTO_INBOX_OUTPUT_BUDGET_UTF16.saturating_sub(
@@ -796,6 +891,7 @@ fn surface_unread(cmd_ctx: &CommandContext, sid: &str) -> (String, Vec<MessageId
         .chain(agent.iter().map(|m| (*m, false)))
         .map(|(m, is_human)| (m, is_human, render_line(m)))
         .collect();
+    let offered = standing_offers(cmd_ctx, &sid_typed);
     let now = Instant::now();
     let mut lines_budget = lines_limit;
     let mut selected_ids = Vec::new();
@@ -806,6 +902,7 @@ fn surface_unread(cmd_ctx: &CommandContext, sid: &str) -> (String, Vec<MessageId
             .0
             .get(&(sid_typed.clone(), m.message_id.clone()))
             .is_some_and(|until| *until > now)
+            || offered.contains(&m.message_id)
         {
             continue;
         }
@@ -846,12 +943,27 @@ fn surface_unread(cmd_ctx: &CommandContext, sid: &str) -> (String, Vec<MessageId
     let shown = shown_human.len() + shown_agent.len();
 
     let mut out = String::new();
-    let remaining = result.total_matched.saturating_sub(shown as u32);
+    let remaining = result
+        .total_matched
+        .saturating_sub(shown as u32)
+        .saturating_sub(offered.len() as u32);
+    // The ids, so the session's later hooks can find this block in its
+    // transcript and confirm the model has it (MAR-82).
+    let named: Vec<&str> = shown_human
+        .iter()
+        .chain(&shown_agent)
+        .filter_map(|(m, _)| transcript_id(&m.message_id))
+        .collect();
+    let ids_attr = if named.is_empty() {
+        String::new()
+    } else {
+        format!(" ids=\"{}\"", named.join(","))
+    };
     if remaining == 0 {
-        out.push_str(&format!("<marshal_inbox count=\"{shown}\">\n"));
+        out.push_str(&format!("<marshal_inbox count=\"{shown}\"{ids_attr}>\n"));
     } else {
         out.push_str(&format!(
-            "<marshal_inbox count=\"{shown}\" remaining=\"{remaining}\">\n"
+            "<marshal_inbox count=\"{shown}\" remaining=\"{remaining}\"{ids_attr}>\n"
         ));
     }
     if let Some((first, _)) = shown_human.first() {

@@ -489,3 +489,210 @@ fn both_harness_hooks_transport_normalized_metadata_only_in_json_body() {
         }
     }
 }
+
+// ---- MAR-82: offered, then confirmed from the transcript -------------------
+
+/// Serve `count` hook requests, answering each by its path: `/hook/wait` with
+/// `wait_reply` and an ack header naming `ids`, `/hook/offers` with `ids` as a
+/// JSON list, anything else empty. Sends what each request carried.
+fn routed_listener(
+    count: usize,
+    wait_reply: &'static str,
+    ids: &'static [&'static str],
+) -> (String, mpsc::Receiver<Seen>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for _ in 0..count {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let ids_json = serde_json::to_string(ids).unwrap();
+            let (headers, reply) = if request_line.starts_with("POST /hook/wait") {
+                (
+                    format!("X-Marshal-Ack-V1: {ids_json}\r\n"),
+                    wait_reply.to_string(),
+                )
+            } else if request_line.starts_with("POST /hook/offers") {
+                (String::new(), ids_json)
+            } else {
+                (String::new(), String::new())
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = tx.send(Seen {
+                request_line: request_line.trim_end().to_string(),
+                body: String::from_utf8(body).unwrap(),
+            });
+        }
+    });
+    (base, rx)
+}
+
+const OFFERED_ID: &str = "01a1c1f1-7ab6-7b93-b529-71d184728a5a";
+
+fn offered_marker(config: &std::path::Path) -> std::path::PathBuf {
+    config.join("marshal").join("offered-itest-claude")
+}
+
+/// A transcript holding the inbox block for `OFFERED_ID` as a record of
+/// `record_type` (see `transcript.rs` for which types count).
+fn transcript_with(dir: &std::path::Path, record_type: &str) -> std::path::PathBuf {
+    let inbox = format!(
+        "<marshal_inbox count=\"1\" ids=\"{OFFERED_ID}\">\n- from peer: hi\n</marshal_inbox>"
+    );
+    let record = match record_type {
+        "enqueue" => {
+            serde_json::json!({ "type": "queue-operation", "operation": "enqueue", "content": inbox })
+        }
+        other => {
+            serde_json::json!({ "type": other, "message": { "role": "user", "content": inbox } })
+        }
+    };
+    let path = dir.join("transcript.jsonl");
+    std::fs::write(&path, format!("{record}\n")).unwrap();
+    path
+}
+
+fn run_prompt_submit(base: &str, config: &std::path::Path, transcript: &std::path::Path) {
+    let input = serde_json::json!({
+        "session_id": "itest-claude",
+        "cwd": "/tmp/proj",
+        "transcript_path": transcript,
+    })
+    .to_string();
+    let mut child = support::shim(support::shared_home())
+        .args(["claude-hook", "prompt-submit"])
+        .env("MARSHAL_BASE_URL", base)
+        .env("XDG_CONFIG_HOME", config)
+        .env("APPDATA", config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn marshal-shim claude-hook prompt-submit");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+}
+
+fn requests(seen: &mpsc::Receiver<Seen>) -> Vec<Seen> {
+    let mut all = Vec::new();
+    while let Ok(s) = seen.recv_timeout(Duration::from_secs(2)) {
+        all.push(s);
+    }
+    all
+}
+
+#[test]
+fn the_waiter_acks_mail_it_hands_on_as_offered() {
+    let inbox = "<marshal_inbox count=\"1\">\n- from peer: hi\n</marshal_inbox>\n";
+    let (base, seen) = routed_listener(2, inbox, &[OFFERED_ID]);
+    let config = temp_config("waiter-offered");
+    let out = spawn_waiter(&base, &config).wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+
+    let seen = requests(&seen);
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("an ack");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert_eq!(ack["phase"], "offered", "{ack}");
+    assert_eq!(ack["message_ids"][0], OFFERED_ID);
+    assert!(
+        offered_marker(&config).exists(),
+        "the marker says to confirm later"
+    );
+}
+
+#[test]
+fn a_later_hook_confirms_offered_mail_the_transcript_shows() {
+    let (base, seen) = routed_listener(3, "", &[OFFERED_ID]);
+    let config = temp_config("confirm-seen");
+    std::fs::create_dir_all(config.join("marshal")).unwrap();
+    std::fs::write(offered_marker(&config), "").unwrap();
+    let transcript = transcript_with(&config, "user");
+
+    run_prompt_submit(&base, &config, &transcript);
+
+    let seen = requests(&seen);
+    assert!(
+        seen.iter()
+            .any(|s| s.request_line.starts_with("POST /hook/offers"))
+    );
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("a seen ack");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert_eq!(ack["message_ids"][0], OFFERED_ID);
+    assert!(ack.get("phase").is_none(), "seen is a plain ack: {ack}");
+    assert!(!offered_marker(&config).exists(), "nothing left to confirm");
+}
+
+#[test]
+fn a_held_rewake_in_the_transcript_is_not_confirmed() {
+    // Only the queue-operation enqueue is there: the model doesn't have it yet.
+    let (base, seen) = routed_listener(2, "", &[OFFERED_ID]);
+    let config = temp_config("confirm-held");
+    std::fs::create_dir_all(config.join("marshal")).unwrap();
+    std::fs::write(offered_marker(&config), "").unwrap();
+    let transcript = transcript_with(&config, "enqueue");
+
+    run_prompt_submit(&base, &config, &transcript);
+
+    let seen = requests(&seen);
+    assert!(
+        !seen
+            .iter()
+            .any(|s| s.request_line.starts_with("POST /hook/ack")),
+        "confirmed a held rewake"
+    );
+    assert!(offered_marker(&config).exists());
+}
+
+#[test]
+fn with_no_marker_a_hook_doesnt_ask_about_offers() {
+    let (base, seen) = routed_listener(1, "", &[OFFERED_ID]);
+    let config = temp_config("confirm-none");
+    let transcript = transcript_with(&config, "user");
+
+    run_prompt_submit(&base, &config, &transcript);
+
+    let seen = requests(&seen);
+    assert!(
+        !seen
+            .iter()
+            .any(|s| s.request_line.starts_with("POST /hook/offers"))
+    );
+}
