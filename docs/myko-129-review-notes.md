@@ -17,9 +17,9 @@ been posted.
   2026-06-19.
 
 Code claims were checked by reading the PR's code at `f6028125`. Claims marked *(docs)* come from
-`docs/auth/design.md` and weren't traced in the code. Marshal itself was built and tested against
-the PR (next section), but no auth provider was switched on, so that run shows #129 doesn't break
-Marshal. It doesn't show that the attackers are stopped.
+`docs/auth/design.md` and weren't traced in the code. Marshal was built and tested against the PR
+with no provider switched on, which shows #129 doesn't break Marshal. The provider was then
+switched on and tried against the four attackers (both in the next section).
 
 ## Building Marshal against #129
 
@@ -40,6 +40,28 @@ Murph.
   With both fixed (`2dffeeb`), `cargo deny check` passed too.
 - At `f6028125` (draft head `3508c8a`, with `Cargo.lock` now recording the git crates): all five
   checks passed, `cargo deny` included. Run 42679474846.
+
+## Trying the provider against the four attackers
+
+Castor-o7/marshal#84 (another draft that is never merged, stacked on #78's pin of `f6028125`) adds
+`crates/daemon/tests/myko129_threat_model.rs`. It serves Marshal's commands through
+`route_connection_with_auth` with a fixture authenticator (each token is its subject's name, plus a
+revoked set behind `validate_identity`) and one of two fixture authorizers: `AllowAll`, or
+`OwnSessionsOnly`, which refuses a command whose `asSession` isn't the caller's subject. The fixtures
+only stand in for whatever Marshal would build. All four tests pass at draft head `fe75603` (run
+42683510337, job `check`). Each one asserts what #129 does today, gaps included:
+
+| Attacker | What the test shows |
+|---|---|
+| A web page on another site | With no provider (today's default), a page sending `Origin: https://evil.example` and no token is admitted. With the provider on, it gets 401 before the upgrade. `Origin` is never checked either way |
+| Another LAN device | A guessed token gets 401. A real token is accepted over plain `ws://`, so a token on the LAN can be read off the wire |
+| One session claiming to be another | Under `AllowAll`, alice's `SendMessage` with `asSession: "bob"` gets through #129 and reaches Marshal's own resolver, which answers `asSession 'bob' is not on the roster`. With bob on the roster, it would have sent as bob. Under `OwnSessionsOnly`, the same command gets `CommandError` "permission denied", alice's own `asSession` still reaches the handler, and the connection stays up |
+| A stolen machine | Once bob's token is revoked, bob's open socket closes within 3 s (the session's recheck), alice's stays open, and bob's next connection gets 401 |
+
+So #129 does what it says: tokens keep out pages and LAN devices, and revoking one credential works
+without touching the others. What's left for Marshal is what the table above already lists: the
+`asSession` check (it fits in `authorize`, as the test shows), TLS, an `Origin` check, and a local
+token store.
 
 ## What it gives Marshal
 
@@ -62,8 +84,10 @@ must be `https` (or `http` on loopback only).
 > right for that, especially `authorize` seeing the command arguments, and today's per-identity
 > `session_revision` and `with_live_permissions` answer what I was going to ask about revoking one
 > principal without disconnecting everyone. Marshal builds and passes its tests and conformance suite
-> against `f6028125` with no changes (I haven't switched a provider on yet). A few questions and one
-> possible bug:
+> against `f6028125` with no changes. With a fixture provider switched on, tokens kept out a
+> cross-site page and a LAN device, revoking one credential closed just that connection, and an
+> `Authorizer` that compares a command's `asSession` with the caller stopped one session acting as
+> another, all with no changes to myko. A few questions and one possible bug:
 >
 > 1. **Possible bug:** in `ws_handler.rs` (around line 1970 at `f6028125`), when the recheck before
 >    running a queued command fails, the function returns without sending a `CommandError`, so the
