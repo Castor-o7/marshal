@@ -41,10 +41,10 @@ daemon's host.
 - **Off by default.** Plain mode stays exactly as it is. A flag (say `marshal-daemon --auth`)
   turns it on.
 - **Built on myko#129.** Plug into its `with_auth_provider`, with a Marshal `Authenticator` and
-  `Authorizer`, so there's no vendored myko-server. As I read #129 (at `fcdbc52b`), it gives the
-  hooks for this: bearer admission, an authorizer that sees each command's arguments, and revoking
-  one credential through `validate_identity`. The credentials, the session rule and TLS would be
-  Marshal's to write.
+  `Authorizer`, so there's no vendored myko-server. #129 (at `f6028125`) gives the hooks for this:
+  bearer admission, an authorizer that sees each command's arguments, and revoking one credential
+  through `validate_identity`. I've tried each of these with Marshal's own commands (below). The
+  credentials, the session rule and TLS would be Marshal's to write.
 - **Pairing a machine.** A one-time code on the daemon's host yields a local token for that
   machine. Each token can be revoked by itself, without disconnecting everyone else.
 - **Sessions bound to their machine.** A connection may act only as the sessions its token
@@ -64,7 +64,12 @@ per-machine pairing, a session frame filter and a written threat model). It was 
 myko-server, which is the part I don't want to bring here. So I'd port the behaviour and its tests
 onto myko#129 instead, in small PRs: first tests and docs, then the opt-in pieces one at a time.
 
-I've read myko#129 against these four cases, and I'm glad to help test it.
+I've also tried myko#129 against these four cases with Marshal's commands and fixture credentials,
+and it holds up. With the provider on, a page or LAN device without a token gets 401. Revoking one
+token closes just that machine's connection. An `Authorizer` that compares `asSession` with the
+caller stops one session acting as another, and the connection stays up. What #129 leaves to Marshal
+is the parts above: real credentials, the `asSession` rule, TLS and an `Origin` check. Marshal's
+tests and conformance suite pass against #129 unchanged. I'm glad to help test it further.
 
 ## Questions for you
 
