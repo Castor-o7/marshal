@@ -92,7 +92,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -103,7 +103,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -255,14 +255,16 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "autosocket"
-version = "6.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "580d5dc343141a54402d2c021028cef8e3a9ebdfa9a1bf45480b11b5b9a86fab"
+version = "6.11.6"
+source = "git+https://github.com/ignition-is-go/myko?rev=f60281252c32919d149c6bc94e42d0469c396f20#f60281252c32919d149c6bc94e42d0469c396f20"
 dependencies = [
+ "base64",
  "flume",
+ "futures",
  "futures-util",
  "hyphae",
  "js-sys",
+ "myko-auth",
  "send_wrapper",
  "serde",
  "tokio",
@@ -272,6 +274,7 @@ dependencies = [
  "tungstenite",
  "url",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
@@ -1528,7 +1531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3090,9 +3093,8 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "myko"
-version = "6.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d002f1f86941e7eeae587b41d58e3639763abc3c9f63d0e04c0ed77f6c21635"
+version = "6.11.6"
+source = "git+https://github.com/ignition-is-go/myko?rev=f60281252c32919d149c6bc94e42d0469c396f20#f60281252c32919d149c6bc94e42d0469c396f20"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -3112,6 +3114,7 @@ dependencies = [
  "hyphae",
  "inventory",
  "js-sys",
+ "myko-auth",
  "myko-macros",
  "nucleo-matcher",
  "num-traits",
@@ -3135,10 +3138,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "myko-auth"
+version = "6.11.6"
+source = "git+https://github.com/ignition-is-go/myko?rev=f60281252c32919d149c6bc94e42d0469c396f20#f60281252c32919d149c6bc94e42d0469c396f20"
+dependencies = [
+ "futures",
+ "inventory",
+ "serde",
+ "serde_json",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "myko-leptos"
-version = "6.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224b9804b96347d6e61bd39899f24c7d536e2b65791cc56226e5e44dd8ac54c9"
+version = "6.11.6"
+source = "git+https://github.com/ignition-is-go/myko?rev=f60281252c32919d149c6bc94e42d0469c396f20#f60281252c32919d149c6bc94e42d0469c396f20"
 dependencies = [
  "hyphae-leptos",
  "leptos",
@@ -3148,9 +3163,8 @@ dependencies = [
 
 [[package]]
 name = "myko-macros"
-version = "6.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33566bcbaab44d182c17eb01256719480acf6fc42da3bef82e0e218c891e3a6c"
+version = "6.11.6"
+source = "git+https://github.com/ignition-is-go/myko?rev=f60281252c32919d149c6bc94e42d0469c396f20#f60281252c32919d149c6bc94e42d0469c396f20"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3160,10 +3174,10 @@ dependencies = [
 
 [[package]]
 name = "myko-server"
-version = "6.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17b4f3d456f61c8d05f6fe50bb10ace6dd8c2fc710ef8558471b8ea81c583637"
+version = "6.11.6"
+source = "git+https://github.com/ignition-is-go/myko?rev=f60281252c32919d149c6bc94e42d0469c396f20#f60281252c32919d149c6bc94e42d0469c396f20"
 dependencies = [
+ "base64",
  "chrono",
  "ciborium",
  "confique",
@@ -3174,6 +3188,7 @@ dependencies = [
  "hyphae",
  "inventory",
  "myko",
+ "myko-auth",
  "myko-telemetry",
  "num-traits",
  "opentelemetry",
@@ -3191,9 +3206,8 @@ dependencies = [
 
 [[package]]
 name = "myko-telemetry"
-version = "6.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54cdebf3be3feb2a1e27318530b1bd070b00928b6862252db9618f948105b374"
+version = "6.11.6"
+source = "git+https://github.com/ignition-is-go/myko?rev=f60281252c32919d149c6bc94e42d0469c396f20#f60281252c32919d149c6bc94e42d0469c396f20"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3297,7 +3311,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3992,7 +4006,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4100,7 +4114,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4608,7 +4622,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4667,7 +4681,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5099,7 +5113,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5127,7 +5141,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5460,10 +5474,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6353,7 +6367,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
