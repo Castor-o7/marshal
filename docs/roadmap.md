@@ -18,6 +18,9 @@ Muster is frozen. Castor-o7/marshal is the only active line, and muster is kept 
 ports come from. The ignition-is-go lead's invitation was to help Marshal rather than run a separate
 project, and this roadmap takes him at his word.
 
+The rally's main goal is switching the fleet from Muster to Marshal, once that can happen with no
+interruption (operator, 2026-11-08). The steps still to do are in [Cutover](#cutover).
+
 The goals are security, durability and portability, and Marshal's core concept stays as it is: a
 message bus with a roster, for many harnesses. Work sits in one of three layers:
 
