@@ -42,3 +42,8 @@ chrono = { workspace = true }
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 hyphae = { workspace = true }
+# myko129_threat_model.rs (MAR-37) switches on myko#129's provider. Same rev as
+# the workspace's myko pin; back to crates.io with it.
+myko-auth = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
