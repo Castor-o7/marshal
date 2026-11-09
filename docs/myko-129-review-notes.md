@@ -4,6 +4,16 @@ Fork-only. This is a read of ignition-is-go/myko#129 (trevorsargent's auth PR) a
 checked against the four attackers in muster's threat model. The comment below is for Josh to
 post on the PR if he wants to, after changing it however he likes. Nothing has been posted.
 
+## Where it stands (checked 2026-11-09)
+
+- Still open, not a draft, and mergeable. The head is still `fcdbc52b` (2026-11-06), 9 commits, +15,116 / -174.
+  Nothing has been pushed since this read, so the notes and draft below still match the code.
+- No reviews, no review decision, and no comments on the PR yet.
+- It's based on myko main at `bd43bea9` (v6.11.6), 9 commits ahead and 0 behind. Main hasn't moved
+  since.
+- The other auth PR, myko#26 (optional per-command OIDC/JWT), is still open and untouched since
+  2026-06-19.
+
 Code claims were checked by reading the PR's code. No tests were run. Claims marked *(docs)* come
 from `docs/auth/design.md` and weren't traced in the code.
 
@@ -44,6 +54,9 @@ Nothing is public by default.
 
 ## Also worth knowing
 
-- The PR's base is myko 6.0.0, and Marshal pins `=6.11.5`. Whether it rebases cleanly onto 6.11.5
-  hasn't been checked.
+- An earlier version of these notes said the PR's base was myko 6.0.0. That was wrong: 6.0.0 is
+  only the root `[workspace.package]` version. The crates themselves are at 6.11.6, both at the PR's
+  head and on main. Marshal pins `=6.11.5`. The only code change from 6.11.5 to 6.11.6 is #127's
+  `relationship_manager.rs` fix, so taking #129 means bumping the pin one patch, not a rebase.
+  Building Marshal against #129's head hasn't been tried.
 - `validate_identity` runs several times per message, so a token-store lookup behind it must be cheap.
