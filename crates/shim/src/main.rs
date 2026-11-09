@@ -176,6 +176,34 @@ fn main() -> Result<()> {
             return run_terminal_send(terminal_send::Target::Named(target), body);
         }
         // Print the roster as JSON for other programs. See `roster_read`.
+        // Pairing with a `--tls` daemon (MAR-24).
+        Some("pair") => {
+            let code = match argv.next() {
+                Some(code) => code,
+                None => {
+                    let mut code = String::new();
+                    std::io::stdin().read_line(&mut code)?;
+                    code
+                }
+            };
+            println!("{}", tls_link::pair_with_code(&code)?);
+            return Ok(());
+        }
+        Some("pairing") if argv.next().is_none() => {
+            match tls_link::load_pairing() {
+                Some(pairing) => println!("{}", pairing.masked()),
+                None => println!("this machine isn't paired"),
+            }
+            return Ok(());
+        }
+        Some("unpair") if argv.next().is_none() => {
+            if tls_link::remove_pairing()? {
+                println!("removed this machine's pairing");
+            } else {
+                println!("this machine isn't paired");
+            }
+            return Ok(());
+        }
         Some("roster") if argv.next().is_none() => {
             return tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -552,7 +580,7 @@ async fn serve() -> Result<()> {
 
     // All queries / handlers / connection subscribers are registered.
     // Now it's safe to start the WS handshake.
-    client.set_address(Some(tls_link::myko_address(daemon_address)));
+    tls_link::connect(&client, daemon_address);
 
     // Parent-death watchdog — defense in depth beside the exit-on-EOF path.
     // Stdin EOF is the primary death signal, but it never arrives when a
