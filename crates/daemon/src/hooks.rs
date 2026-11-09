@@ -174,6 +174,9 @@ impl Leases {
 
 static LEASES: LazyLock<Mutex<Leases>> = LazyLock::new(Mutex::default);
 
+/// Sessions already logged as acking without a rollout file (MAR-84).
+static NO_ROLLOUT_NOTED: LazyLock<Mutex<HashSet<SessionId>>> = LazyLock::new(Mutex::default);
+
 fn lease_duration() -> Duration {
     std::env::var("MARSHAL_ACK_LEASE_SECS")
         .ok()
@@ -262,6 +265,20 @@ fn handle_ack(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
         .as_ref()
         .and_then(|b| b.get("phase")?.as_str())
         .filter(|p| *p == ACK_OFFERED || *p == ACK_WITHDRAWN);
+    // A Codex hook with no rollout file (`transcript_path` null) acks read at
+    // once, with no two-phase delivery (MAR-84): logged once per session, so
+    // an operator can see the weaker path is in use.
+    let no_rollout = parsed.as_ref().and_then(|b| b.get("rollout")?.as_bool()) == Some(false);
+    if no_rollout
+        && let Some(session) = &session
+        && let Ok(mut noted) = NO_ROLLOUT_NOTED.lock()
+        && noted.insert(session.clone())
+    {
+        log::warn!(
+            "[hook] {}: Codex hook names no rollout file, so its mail is marked read when handed on, without two-phase delivery (MAR-84)",
+            session.0.as_ref()
+        );
+    }
     if let Some(session) = session {
         if !ids.is_empty() {
             log::info!(

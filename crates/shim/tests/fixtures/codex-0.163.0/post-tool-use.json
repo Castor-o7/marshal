@@ -1,1 +1,1 @@
-{"session_id":"{{thread_id}}","cwd":"{{cwd}}","hook_event_name":"PostToolUse","tool_name":"shell","tool_input":{"command":["true"]}}
+{"session_id":"{{thread_id}}","turn_id":"turn-1","transcript_path":null,"cwd":"{{cwd}}","hook_event_name":"PostToolUse","model":"gpt-5","permission_mode":"default","tool_name":"shell","tool_input":{"command":["true"]},"tool_response":"","tool_use_id":"call-1"}

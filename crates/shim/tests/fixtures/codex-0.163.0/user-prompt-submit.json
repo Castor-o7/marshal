@@ -1,1 +1,1 @@
-{"session_id":"{{thread_id}}","cwd":"{{cwd}}","hook_event_name":"UserPromptSubmit","prompt":"<marshal_wake>"}
+{"session_id":"{{thread_id}}","turn_id":"turn-1","transcript_path":null,"cwd":"{{cwd}}","hook_event_name":"UserPromptSubmit","model":"gpt-5","permission_mode":"default","prompt":"<marshal_wake>"}

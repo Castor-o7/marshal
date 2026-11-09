@@ -127,6 +127,71 @@ fn tag_ids(text: &str) -> Vec<String> {
     ids
 }
 
+/// Which of `ids` a Codex rollout file (`transcript_path` in Codex's hook
+/// input, MAR-84) shows the model received. Codex records a hook's
+/// `additionalContext` as a developer `response_item` *before* it samples,
+/// and records it even when the turn then stops, so that line alone proves
+/// nothing (docs/codex-two-phase-delivery.md, from Codex's source at
+/// `rust-v0.163.0`). An id counts only when model output (an `assistant`
+/// message, `reasoning` or a `function_call`) comes after its developer line,
+/// in file order. Output before it, from an earlier turn, doesn't count. Only
+/// this file is read: a rollout resumed from another isn't followed.
+pub fn seen_codex(rollout: &Path, ids: &[String]) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    match read_tail(rollout) {
+        Some(text) => codex_seen_in(&text, ids),
+        None => Vec::new(),
+    }
+}
+
+/// `seen_codex` over rollout text already read.
+pub fn codex_seen_in(text: &str, ids: &[String]) -> Vec<String> {
+    // Ids whose developer line has been passed, still waiting for model output.
+    let mut waiting: Vec<String> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+        let kind = payload.get("type").and_then(|t| t.as_str());
+        let role = payload.get("role").and_then(|r| r.as_str());
+        match (kind, role) {
+            (Some("message"), Some("developer")) => {
+                if !line.contains("marshal_inbox") {
+                    continue;
+                }
+                let mut named = Vec::new();
+                if let Some(content) = payload.get("content") {
+                    walk_text(content, &mut |text| named.extend(tag_ids(text)));
+                }
+                for id in named {
+                    if ids.contains(&id) && !found.contains(&id) && !waiting.contains(&id) {
+                        waiting.push(id);
+                    }
+                }
+            }
+            (Some("message"), Some("assistant"))
+            | (Some("reasoning"), _)
+            | (Some("function_call"), _) => {
+                found.append(&mut waiting);
+                if found.len() == ids.len() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// The last `TAIL_BYTES` of the file, from the first whole line on.
 fn read_tail(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
@@ -294,7 +359,10 @@ mod tests {
     #[test]
     fn a_recorded_tool_result_holding_an_inbox_block_is_not_delivery() {
         let line = RECORDED_TOOL_RESULT.trim().replace("{ID}", A);
-        assert!(line.contains(&format!(r#"ids=\"{A}\""#)), "fixture names the id");
+        assert!(
+            line.contains(&format!(r#"ids=\"{A}\""#)),
+            "fixture names the id"
+        );
         assert!(seen_in(&line, &ids(&[A])).is_empty(), "{line}");
     }
 
@@ -342,6 +410,82 @@ mod tests {
         .unwrap();
         let line = format!(r#"{{"type":"user","message":{{"role":"user","content":{inbox}}}}}"#);
         assert_eq!(seen_in(&line, &ids(&[A, B])), ids(&[B]));
+    }
+
+    // ---- Codex rollout records (MAR-84). Constructed from Codex's source at
+    // `rust-v0.163.0` (`history/src/lib.rs` RolloutLine, `rollout_payload.rs`,
+    // `protocol/src/models.rs` ResponseItem); not yet recorded from a live
+    // Codex (pending one on Murph).
+
+    fn codex_developer(id: &str) -> String {
+        let text = serde_json::to_string(&format!(
+            "<marshal_inbox count=\"1\" ids=\"{id}\">\n- from x [response_required=false]: hi\n</marshal_inbox>"
+        ))
+        .unwrap();
+        format!(
+            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"message","role":"developer","content":[{{"type":"input_text","text":{text}}}]}}}}"#
+        )
+    }
+
+    const CODEX_ASSISTANT: &str = r#"{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#;
+    const CODEX_REASONING: &str =
+        r#"{"timestamp":"t","type":"response_item","payload":{"type":"reasoning","summary":[]}}"#;
+    const CODEX_CALL: &str = r#"{"timestamp":"t","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c"}}"#;
+    const CODEX_USER: &str = r#"{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}}"#;
+    const CODEX_META: &str = r#"{"timestamp":"t","type":"session_meta","payload":{"id":"s"}}"#;
+
+    #[test]
+    fn codex_context_followed_by_model_output_is_seen() {
+        for output in [CODEX_ASSISTANT, CODEX_REASONING, CODEX_CALL] {
+            let text = [CODEX_META, CODEX_USER, &codex_developer(A), output].join("\n");
+            assert_eq!(codex_seen_in(&text, &ids(&[A])), ids(&[A]), "{output}");
+        }
+    }
+
+    #[test]
+    fn codex_context_with_no_output_after_it_is_not_seen() {
+        // Recorded before sampling, and recorded when the turn then stops.
+        let text = [CODEX_USER, &codex_developer(A)].join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_output_before_the_context_proves_nothing() {
+        // An earlier turn's output, in file order before the developer line.
+        let text = [
+            CODEX_ASSISTANT,
+            CODEX_REASONING,
+            CODEX_USER,
+            &codex_developer(A),
+        ]
+        .join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_tool_output_holding_an_inbox_block_is_not_context() {
+        // A function_call_output whose output is an inbox block, then output.
+        let block =
+            serde_json::to_string(&format!("<marshal_inbox count=\"1\" ids=\"{A}\">")).unwrap();
+        let tool = format!(
+            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"function_call_output","call_id":"c","output":{block}}}}}"#
+        );
+        let text = [tool.as_str(), CODEX_ASSISTANT].join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_a_later_turn_confirms_what_an_earlier_stopped_turn_recorded() {
+        // The first turn stopped before sampling; the next one's output comes
+        // with that context still in history.
+        let text = [
+            &codex_developer(A),
+            CODEX_USER,
+            &codex_developer(B),
+            CODEX_ASSISTANT,
+        ]
+        .join("\n");
+        assert_eq!(codex_seen_in(&text, &ids(&[A, B])), ids(&[A, B]));
     }
 
     #[test]
