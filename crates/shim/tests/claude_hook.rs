@@ -358,6 +358,9 @@ fn boundary_listener(response: Vec<u8>, delay: Duration) -> (String, mpsc::Recei
         let deadline = Instant::now() + Duration::from_millis(300);
         while Instant::now() < deadline {
             if let Ok((mut stream, _)) = listener.accept() {
+                // On Windows a stream accepted from a non-blocking listener is
+                // non-blocking too, so its read can fail with WouldBlock (MAR-63).
+                stream.set_nonblocking(false).unwrap();
                 let n = stream.read(&mut request).unwrap_or(0);
                 let _ = tx.send(String::from_utf8_lossy(&request[..n]).into_owned());
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
@@ -443,6 +446,10 @@ fn a_replacement_waiter_takes_over_after_the_old_process_releases_its_lock() {
     let until = Instant::now() + Duration::from_secs(3);
     let (mut stream, _) = loop {
         if let Ok(pair) = listener.accept() {
+            // On Windows the accepted stream inherits the listener's
+            // non-blocking mode, and the read below would fail with
+            // WouldBlock (10035) before the request arrived (MAR-63).
+            pair.0.set_nonblocking(false).unwrap();
             break pair;
         }
         assert!(
