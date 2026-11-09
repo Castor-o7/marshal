@@ -29,7 +29,9 @@ mod room_tools;
 mod sandbox;
 mod send_message;
 mod session;
+mod session_identity;
 mod session_nickname;
+mod succession;
 mod wake_watcher;
 
 pub use ack_messages::*;
@@ -45,7 +47,9 @@ pub use room_tools::*;
 pub use sandbox::*;
 pub use send_message::*;
 pub use session::*;
+pub use session_identity::*;
 pub use session_nickname::*;
+pub use succession::*;
 pub use wake_watcher::*;
 
 /// Force-link this crate so the `inventory`-based item registration in the
@@ -75,6 +79,7 @@ myko::register_typegen_type!(
     AckMessagesResult,
     ReadMessagesResult,
     MessageView,
+    RecipientStatus,
     RoomKind,
     AutoSource,
     LivePushStatus,

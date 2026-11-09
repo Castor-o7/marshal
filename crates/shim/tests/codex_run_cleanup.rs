@@ -1,11 +1,13 @@
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -192,7 +194,7 @@ fn start_launcher(exit_tui: bool) -> RunningLauncher {
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o755))
         .expect("make fake Codex executable");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_marshal-shim"))
+    let child = support::shim(support::shared_home())
         .arg("codex-run")
         .env("MARSHAL_CODEX_BIN", &codex)
         .env("FAKE_CODEX_MARKER", &marker)

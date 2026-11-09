@@ -30,12 +30,24 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    message::{CONTEXT_BODY_MAX_CHARS, Message, MessageId, context_preview},
+    message::{CONTEXT_BODY_MAX_CHARS, GetMessagesByIds, Message, MessageId, context_preview},
     message_read::{MessageRead, MessageReadId},
     notify::NotifyChannel,
     session::{GetAllSessions, Session, SessionId, resolve_caller},
     wake_watcher::{GetAllWakeWatchers, WakeWatcher},
 };
+
+/// Namespace for message ids derived from an idempotency key. Marshal's own,
+/// so these ids can't coincide with those of any other UUIDv5 scheme.
+const IDEMPOTENT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x7a4776dd_d70f_405c_898c_8432b782d05f);
+
+/// Longest accepted idempotency key. The shim sends a 36-character UUID.
+const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
+
+/// Held by a keyed send from looking up its first attempt until it has stored
+/// its own message. See `SendMessage::execute`.
+#[cfg(not(target_arch = "wasm32"))]
+static KEYED_SENDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[myko_command(SendMessageResult)]
 pub struct SendMessage {
@@ -52,6 +64,15 @@ pub struct SendMessage {
     /// this; the server derives the sender from the live connection.
     #[serde(default, rename = "asSession", skip_serializing_if = "Option::is_none")]
     pub as_session: Option<SessionId>,
+
+    /// Makes a retry safe. Sending again with the key of a send whose outcome
+    /// wasn't seen, such as one that timed out, stores and delivers nothing new.
+    #[serde(
+        default,
+        rename = "idempotencyKey",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,13 +180,81 @@ impl CommandHandler for SendMessage {
         // policy — resolution used to live only in the shim, so plugin/HTTP
         // callers could address by exact id alone. Accepts id / nickname /
         // operator (human-via-agent) / id-prefix; see `resolve_recipient`.
+        // The id comes from the sender and key, so a retry finds the first send.
+        let id = match &self.idempotency_key {
+            Some(key) => {
+                if key.trim().is_empty() {
+                    return Err(err(
+                        &ctx,
+                        "`idempotencyKey` is empty; omit it or send a key",
+                    ));
+                }
+                if key.len() > IDEMPOTENCY_KEY_MAX_BYTES {
+                    return Err(err(
+                        &ctx,
+                        &format!(
+                            "`idempotencyKey` is longer than {IDEMPOTENCY_KEY_MAX_BYTES} bytes"
+                        ),
+                    ));
+                }
+                Uuid::new_v5(
+                    &IDEMPOTENT_ID_NAMESPACE,
+                    format!("{}\0{key}", sender.id.0).as_bytes(),
+                )
+            }
+            None => Uuid::now_v7(),
+        };
+        let id = MessageId(Arc::from(id.to_string()));
+
+        // A keyed send looks for its first attempt and stores itself under one
+        // lock, so two attempts racing (a retry sent while a timed-out first is
+        // still running) can't both find nothing and both store and push. The
+        // store insert in `emit_set` is synchronous, so the second attempt sees
+        // the first's message. Sends without a key don't take the lock.
+        let keyed_guard = match self.idempotency_key {
+            Some(_) => {
+                let guard = KEYED_SENDS.lock().unwrap_or_else(|e| e.into_inner());
+                let found: Vec<Arc<Message>> = ctx.exec_query(GetMessagesByIds {
+                    ids: vec![id.clone()],
+                })?;
+                if let Some(first) = found.first() {
+                    // Checked before the recipient is resolved: a retry to a
+                    // nickname or operator email can resolve to another session
+                    // by now, or to none, and is still the same send. The
+                    // stored message doesn't keep the `to` token, so the
+                    // recipient isn't compared; the key is the sender's own.
+                    if first.body != self.body || first.response_required != self.response_required
+                    {
+                        return Err(err(
+                            &ctx,
+                            "this idempotency key was already used for a different message",
+                        ));
+                    }
+                    // Already stored, and delivered or waiting in the inbox. What
+                    // happened to its live push wasn't recorded, so don't claim any.
+                    return Ok(SendMessageResult {
+                        message_id: first.id.clone(),
+                        to_session_id: first
+                            .to_session_id
+                            .clone()
+                            .unwrap_or_else(|| self.to_session_id.clone()),
+                        sent_at: first.sent_at,
+                        live_push: LivePushStatus::Unknown,
+                        wake: WakeStatus::Unobserved,
+                        delivered_live: false,
+                    });
+                }
+                Some(guard)
+            }
+            None => None,
+        };
+
         let (recipient, to_operator) =
             resolve_recipient(&ctx, &sessions, self.to_session_id.0.as_ref())?;
-
         let now = Utc::now().timestamp_millis();
         let msg = Message {
             response_required: self.response_required,
-            id: MessageId(Arc::from(Uuid::now_v7().to_string())),
+            id,
             from_session_id: sender.id.clone(),
             to_session_id: Some(recipient.id.clone()),
             to_room_id: None,
@@ -178,6 +267,8 @@ impl CommandHandler for SendMessage {
         // this on its next turn via the hook, whether or not it has a live
         // connection right now. Delivery is decoupled from acceptance.
         ctx.emit_set(&msg)?;
+        // Stored: a racing retry now finds it. Push without holding the lock.
+        drop(keyed_guard);
 
         // Best-effort live push: only when the recipient has a live WS client
         // AND its session can actually render channel pushes. A flag-off
@@ -250,9 +341,7 @@ impl CommandHandler for SendMessage {
             ctx.exec_query(GetAllWakeWatchers {})
                 .unwrap_or_default()
                 .iter()
-                .any(|w: &Arc<WakeWatcher>| {
-                    w.id.0.as_ref() == recipient.id.0.as_ref() && w.until > now
-                })
+                .any(|w: &Arc<WakeWatcher>| w.session() == recipient.id.0.as_ref() && w.until > now)
         };
         let wake = match live_push {
             LivePushStatus::Delivered => WakeStatus::NotNeeded,
@@ -357,6 +446,10 @@ fn resolve_recipient(
     if by_nick.len() > 1 {
         return Err(err(ctx, &ambiguous(ctx, "nickname", token, &by_nick)));
     }
+    // MUS-3: a session that restarted keeps reaching whoever took it over.
+    if let Some(s) = resolve_succeeded(ctx, sessions, token)? {
+        return Ok((s, None));
+    }
     // 3. Operator identity — human-via-agent routing. Record the operator we
     // addressed (the resolved session's canonical operator string, falling back
     // to the bare token) so the message is marked human-addressed downstream.
@@ -383,6 +476,55 @@ fn resolve_recipient(
             ),
         )),
         _ => Err(err(ctx, &ambiguous(ctx, "id-prefix", token, &by_prefix))),
+    }
+}
+
+/// MUS-3: a token that names a session through a succession or a role, after
+/// the nickname and id tiers found nothing.
+///
+/// - A nickname a session gave up in a late takeover reaches it until the
+///   alias lapses, since peers may have written to it meanwhile.
+/// - An old session id reaches the session that took it over.
+/// - A declared role (`MARSHAL_IDENTITY=watchman`) reaches the one session
+///   that claims it. It's a claim, not attested; see `Session::identity`.
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_succeeded(
+    ctx: &CommandContext,
+    sessions: &[Arc<Session>],
+    token: &str,
+) -> Result<Option<Arc<Session>>, CommandError> {
+    let successions: Vec<Arc<crate::Succession>> = ctx.exec_query(crate::GetAllSuccessions {})?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let find = |id: &str| sessions.iter().find(|s| s.id.0.as_ref() == id).cloned();
+    if let Some(s) = successions.iter().find(|s| {
+        s.alias.as_deref() == Some(token) && s.alias_until.is_some_and(|until| until > now)
+    }) && let Some(found) = find(&s.to_session_id)
+    {
+        return Ok(Some(found));
+    }
+    if let Some(to) = crate::successor_of(&successions, token)
+        && let Some(found) = find(&to)
+    {
+        return Ok(Some(found));
+    }
+    let by_role: Vec<&Arc<Session>> = sessions
+        .iter()
+        .filter(|s| s.identity.as_deref() == Some(token) && token != "none")
+        .collect();
+    match by_role.as_slice() {
+        [one] => Ok(Some((*one).clone())),
+        [] => Ok(None),
+        many => Err(err(
+            ctx,
+            &format!(
+                "role '{token}' is claimed by {} sessions; name one by nickname: {}",
+                many.len(),
+                many.iter()
+                    .map(|s| crate::nickname_for(ctx, s.id.0.as_ref()).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
     }
 }
 

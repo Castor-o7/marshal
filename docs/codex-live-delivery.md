@@ -53,6 +53,26 @@ For the launcher-selected thread, the bridge sets `[nickname]` even before
 Codex has generated a title. Later title updates retain the nickname prefix.
 Naming does not depend on a `SessionStart` hook firing before the first prompt.
 
+## The wake path on the roster
+
+Codex holds no `/hook/wait`, so on its own the roster would call a bridge-watched
+thread `wake: none`, and a send to it would say `wake: unobserved`, though the
+bridge will start a turn. So the bridge tells the daemon which threads it can
+wake: while it leads the wake election for its app-server, it posts
+`/hook/bridge-watch` with `{"session_id": …, "watching": true}` every 30 seconds
+for each thread it registered. The daemon keeps a `WakeWatcher` for each, as it
+does for a held wait, and the roster says `waiting` and a send says
+`wake: expected`. The bridge posts `"watching": false` when a thread closes, when
+it stops leading, when it loses the app-server, and when it exits.
+
+When the app-server connection ends, the bridge forgets the threads it
+registered: none can be woken, and none will send `thread/closed`. The snapshot
+on reconnect registers, and so watches again, the threads the app-server still
+has. A registered thread whose session leaves the roster, as after a daemon
+restart without Postgres, is registered again after a 5-second cooldown. If a
+request is lost, the daemon's record runs out within two minutes. The daemon
+keeps no record for a session that isn't on the roster.
+
 The bridge deliberately does not mark the message read. The existing hook
 acknowledges it only after the daemon successfully writes the
 `<marshal_inbox>` response back to Codex. If the app-server is unavailable, the

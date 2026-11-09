@@ -30,6 +30,9 @@ concurrency:
 
 jobs:
   release:
+    # Castor fork: self-hosted runners exist only upstream, so this runs only there
+    # and the fork's main isn't held on a job that can never start (MAR-34).
+    if: github.repository == 'ignition-is-go/marshal'
     runs-on: ["self-hosted", "Linux", "X64", "ram-ge-16g", "disk-ge-100g"]
     # Backstop: this job does apt + cross-build + the marshal-ui WASM bundle +
     # upload. A flaky apt mirror hung it ~2h on 2026-06-18; fail in minutes.
@@ -237,7 +240,7 @@ jobs:
   # strand a GitHub Release without the binaries used by pulse-deploy.
   publish-packages:
     needs: release
-    if: needs.release.outputs.skip == 'false' || inputs.publish_version != ''
+    if: github.repository == 'ignition-is-go/marshal' && (needs.release.outputs.skip == 'false' || inputs.publish_version != '')
     runs-on: ["self-hosted", "Linux", "X64", "ram-ge-16g", "disk-ge-100g"]
     timeout-minutes: 20
     permissions:
@@ -311,7 +314,7 @@ jobs:
   # Gated on `release` so the tag + GitHub release already exist to upload into.
   build-macos:
     needs: release
-    if: needs.release.outputs.skip == 'false'
+    if: github.repository == 'ignition-is-go/marshal' && needs.release.outputs.skip == 'false'
     runs-on: ["self-hosted", "macOS", "ARM64", "site-lucid-lab", "ram-ge-24g", "disk-ge-100g"]
     timeout-minutes: 40
     permissions:

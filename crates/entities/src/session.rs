@@ -53,6 +53,49 @@ mod tests {
         assert!(serde_json::to_value(s).unwrap().get("agentId").is_none());
     }
 
+    /// MAR-58: `activity_at` is camelCase on the wire, survives the round
+    /// trip a re-register's SET makes, and is absent (not null) when unset.
+    #[test]
+    fn activity_at_round_trips_and_is_omitted_when_unset() {
+        let mut s = Session {
+            id: SessionId(Arc::from("sess-mar58")),
+            client_id: None,
+            agent_id: None,
+            pid: 1,
+            cwd: "/repo".into(),
+            git_branch: None,
+            current_task: None,
+            session_name: None,
+            activity: Some("idle".into()),
+            activity_at: Some(1_794_186_070_745_i64),
+            kind: None,
+            connected_at: 1_700_000_000_000_i64,
+            last_activity_at: None,
+            last_tool: None,
+            last_tool_at: None,
+            operator: None,
+            host: None,
+            project: None,
+            channels_enabled: None,
+            acks_pushes: None,
+            harness: None,
+            identity: None,
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["activityAt"], 1_794_186_070_745_i64);
+        let back: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(back.activity_at, Some(1_794_186_070_745_i64));
+
+        s.activity = None;
+        s.activity_at = None;
+        assert!(
+            serde_json::to_value(&s)
+                .unwrap()
+                .get("activityAt")
+                .is_none()
+        );
+    }
+
     #[test]
     fn session_with_liveness_round_trips() {
         let s = Session {
@@ -65,6 +108,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 1_700_000_000_000_i64,
             last_activity_at: Some(1_700_000_005_000_i64),
@@ -75,6 +119,8 @@ mod tests {
             project: None,
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         };
         let json = serde_json::to_value(&s).unwrap();
         // camelCase on the wire (matches the rest of the codebase).
@@ -98,6 +144,7 @@ mod tests {
             current_task: None,
             session_name: Some("auth refactor".into()),
             activity: Some("busy".into()),
+            activity_at: None,
             kind: Some("interactive".into()),
             connected_at: 1_700_000_000_000_i64,
             last_activity_at: None,
@@ -112,6 +159,8 @@ mod tests {
             }),
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["operator"], "trevor");
@@ -193,6 +242,17 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[myko_setter]
     pub activity: Option<String>,
+
+    /// Wall-clock millis when `activity` last changed, so a reader can tell
+    /// "idle for a minute" from "idle for an hour". Taken from the manifest's
+    /// `statusUpdatedAt` when it has one, so a shim restart or a re-register
+    /// keeps the real time; otherwise the shim's clock when it saw the change.
+    /// `None` whenever `activity` is `None` (Codex, older Claude builds).
+    /// Pushed by its own setter right after `activity`'s, so the two can
+    /// briefly disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[myko_setter]
+    pub activity_at: Option<i64>,
 
     /// Session kind, from the manifest `kind`: `"interactive"` (a human at a
     /// terminal) or `"bg"` (a background / headless agent). Set once at
@@ -278,6 +338,25 @@ pub struct Session {
     /// for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acks_pushes: Option<bool>,
+
+    /// Which agent harness runs this session: `claude`, `codex`, `pi`,
+    /// `opencode` or `prime-agent`. Declared. Part of the identity key a
+    /// restarted session is matched on (MUS-3). `None` when unknown, and then
+    /// the session has no inferred identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+
+    /// The identity this session claims, from `MARSHAL_IDENTITY` (MUS-3).
+    /// Declared, not attested: any session on a machine can claim any name.
+    /// - `None`: the identity is inferred from the harness and working
+    ///   directory, so a session restarted in the same place keeps its
+    ///   nickname.
+    /// - `Some("none")`: no identity; the session is never a successor.
+    /// - `Some(role)`: a role, such as `watchman`. Addressable by that name
+    ///   while its holder is live, and passed to a successor only when no
+    ///   holder is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 /// Resolve the session a write command is acting *as*.
@@ -333,15 +412,25 @@ pub fn resolve_caller(
                 .is_some_and(|id| id.0.as_ref() == client_id)
         })
         .cloned()
-        .ok_or_else(|| {
-            caller_err(
-                ctx,
-                &format!(
-                    "caller (client {}) has no session on the roster — re-SET your Session and retry",
-                    client_id,
-                ),
-            )
-        })
+        .ok_or_else(|| caller_err(ctx, &unregistered_refusal(client_id)))
+}
+
+/// The stable code that starts `resolve_caller`'s refusal of a connection with
+/// no session bound to it (MAR-18, from muster's MUS-80). myko's
+/// `CommandError` carries only a message, so the code goes in it. The shim
+/// retries on the code, never on the wording after it.
+pub const UNREGISTERED_CODE: &str = "[unregistered]";
+
+/// The refusal for a connection whose client has no session on the roster.
+pub fn unregistered_refusal(client_id: &str) -> String {
+    format!(
+        "{UNREGISTERED_CODE} caller (client {client_id}) has no session on the roster — re-SET your Session and retry"
+    )
+}
+
+/// Whether `message` is [`unregistered_refusal`]'s, by its code.
+pub fn is_unregistered_refusal(message: &str) -> bool {
+    message.contains(UNREGISTERED_CODE)
 }
 
 fn caller_err(ctx: &CommandContext, message: &str) -> CommandError {

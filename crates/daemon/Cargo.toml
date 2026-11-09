@@ -32,6 +32,10 @@ notify-debouncer-mini = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# controls.rs checks a control file is owned by the daemon's own user.
+libc = "0.2"
+
 [dev-dependencies]
 serde_json = "1"
 chrono = { workspace = true }

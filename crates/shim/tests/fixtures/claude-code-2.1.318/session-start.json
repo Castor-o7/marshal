@@ -1,0 +1,1 @@
+{"session_id":"{{session_id}}","transcript_path":"/tmp/conformance/.claude/projects/conformance/{{session_id}}.jsonl","cwd":"{{cwd}}","hook_event_name":"SessionStart","source":"startup"}
