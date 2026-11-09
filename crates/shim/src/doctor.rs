@@ -769,14 +769,17 @@ mod tests {
 
     #[tokio::test]
     async fn the_daemon_check_fails_when_nothing_listens() {
-        // Bind and drop a listener, so the port is free and nothing accepts.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Bound but not listening, and held to the end, so connecting is
+        // refused and no parallel test can take the port (MAR-67), as
+        // link.rs's refusing_address.
+        use socket2::{Domain, Socket, Type};
+        let dead = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        dead.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let port = dead.local_addr().unwrap().as_socket().unwrap().port();
         let f = daemon_check(&format!("ws://127.0.0.1:{port}")).await;
         assert_eq!(f.level, Level::Fail, "{f:?}");
+        drop(dead);
     }
 
     #[tokio::test]
