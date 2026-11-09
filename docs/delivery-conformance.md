@@ -12,9 +12,7 @@ that ran:
 - the `claude-tls` and `codex-tls` columns: Marshal has no TLS gate yet (MAR-23);
 - the `pi`, `opencode` and `prime-agent` columns: stage 2, with MAR-10 and MAR-11;
 - `operator-pause-stops-wakes` and `resume-wakes-held-mail`: Marshal has no
-  operator pause;
-- `unread-mail-follows-a-restart`: Marshal hands a restarted session its
-  predecessor's nickname (MAR-9) but not its mail yet (muster's MUS-47).
+  operator pause.
 
 The sections below describe the whole suite as muster built it, including the
 columns stage 1 doesn't run.
@@ -62,7 +60,7 @@ checked as well as what the recipient sees.
 | 10 | `hung-handover-released` | When the harness's API hangs taking a push, a turn's pull doesn't show the message while the plugin holds it, the next turn shows it once the hold's lease lapses, and no pull shows it again after the hung handover goes through. That late handover can show it a second time, which the design accepts ([push-ack-design.md](push-ack-design.md)). |
 
 | 11 | `restart-keeps-identity` | A session that ends as its TUI ends it, followed by a new session in the same working directory, hands the new one its nickname (MUS-3). Mail to the old nickname and the old id reaches the new one. If the new one first got a fresh nickname, mail to that still reaches it, and its next hook says its name changed. |
-| 12 | `live-sibling-keeps-its-name` | A second session in the same working directory, started while the first is live and idle past the quiet time, gets a nickname of its own, and the first keeps its own. For Codex the first is a hook-owned row with no client, which mustn't be taken over until MUS-77. |
+| 12 | `live-sibling-keeps-its-name` | A second session in the same working directory, started while the first is live and idle past the quiet time, gets a nickname of its own, and the first keeps its own. For Codex the first is a hook-owned row with no client, which mustn't be taken over unless its bridge's wake record has ended (MAR-54). |
 | 13 | `unread-mail-follows-a-restart` | Mail sent to a session while no hook runs, so it's still unread when the session ends, is shown once by the session that takes over its nickname, and not at the hook after (MUS-47). |
 
 Scenarios 9 and 10 are about a live push, so they're `n/a` for the hook
