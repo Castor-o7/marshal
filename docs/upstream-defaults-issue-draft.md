@@ -6,9 +6,10 @@ change, and we send code only for the ones it asks for. The commissioner (cobalt
 draft first, as MAR-15's "Done when" requires. The title and body follow the line.
 
 **File only once every listed change has merged on the fork.** The commissioner's rule (2026-11-08):
-upstream shouldn't weigh a moving target. As of 2026-11-08, items 4 and 6 are still **in review**, and
-their lines cite the head that was read. Before filing, replace those with the merge commits, or drop
-those items.
+upstream shouldn't weigh a moving target. As of 2026-11-09 every built item below has merged, and each
+line cites its merge commit (checked against GitHub that day). Item 6 is marked as a possible default:
+Josh decides whether it goes in this issue or is offered as an ordinary PR
+([upstream-offers.md](upstream-offers.md)).
 
 This supersedes muster's `docs/upstream-issue-defaults.md` (2026-11-05, cobalt-bream's first draft).
 Two of that draft's items are handled differently here. Codex threads re-registering after a restart
@@ -35,12 +36,13 @@ time, after #168, so nothing here lands as a batch.
 | 1 | A shim's first write waits until its session is registered, and one refused as unregistered is retried once | merged | none |
 | 2 | A session holding a `/hook/wait` isn't reaped when its WebSocket drops | merged | none |
 | 3 | A restarted session in the same harness and directory takes over its predecessor's nickname | merged | `MARSHAL_IDENTITY=none`; could be opt-in instead |
-| 4 | A restarted session also takes over its predecessor's unread mail | not final (in review) | as for 3 |
+| 4 | A restarted session also takes over its predecessor's unread mail | merged | as for 3 |
 | 5 | Ended sessions are removed from rooms, and broadcasts count only members on the roster | merged | none |
-| 6 | `current_task` follows a checkout while it still holds the branch's default | not final (in review) | set your own with `set_status` |
+| 6 | `current_task` follows a checkout while it still holds the branch's default (possible default, Josh to decide) | merged | set your own with `set_status` |
+| 7 | A Codex session still on the roster can count as dead once its bridge's wake record has ended, so 3 and 4 apply to it | merged | as for 3 |
 
 Two bug fixes and one piece of an additive feature aren't default changes, so they're offered as
-small PRs, listed after the six. Proposed and not built on the fork yet: a refused empty `to`, a
+small PRs, listed after the seven. Proposed and not built on the fork yet: a refused empty `to`, a
 per-session send rate limit, keeping a session while its hooks fire, a larger hook body, and a
 resource read that waits for registration (listed at the end).
 
@@ -122,11 +124,11 @@ resource read that waits for registration (listed at the end).
   successor, which shows each once at its next hook, as its own. Mail the predecessor had read stays
   with it. The takeover record lists the ids it moved.
 - **Why:** without it, a restart silently strands whatever arrived while the old session was dying.
-- **Fork:** MAR-42 (from muster's MUS-47), Castor-o7/marshal#43, in review at head
-  `17dd317f114c84f269a122d35b1bfa91ee3dbe04`. It depends on 3.
+- **Fork:** MAR-42 (from muster's MUS-47), Castor-o7/marshal#43, merged at
+  `cd3c87eef0ba6bea207492a80f937e2184104dca`. It depends on 3.
 - **Opt-out:** `MARSHAL_IDENTITY=none`, since there's no takeover without an identity. As with 3,
   we'd make this opt-in if you prefer.
-- **Risk:** the largest of the six, with 3. The successor gets the predecessor's unread mail as its
+- **Risk:** the largest here, with 3. The successor gets the predecessor's unread mail as its
   own, including mail written for context it doesn't have: a new, unrelated agent started in the
   same directory inherits instructions meant for the one that died. It's also at-least-once, not
   exactly-once: if the old session's waiter showed a message, lost the ack and then died, the
@@ -151,7 +153,10 @@ resource read that waits for registration (listed at the end).
   and comes back without a takeover is no longer in the ad hoc rooms it joined. Until a takeover or a day passes, a reaped
   predecessor can still be listed in an ad hoc room in `marshal://rooms`, though broadcasts skip it.
 
-### 6. `current_task` follows the branch while it holds the default
+### 6. `current_task` follows the branch while it holds the default (possible default)
+
+Josh to decide whether this belongs here. It changes what an unchanged install shows, but only for a
+field the session hasn't set itself, so it could also go as an ordinary PR.
 
 - **Before:** the shim sets a session's default `current_task` from its branch at startup, and a
   later `git checkout` leaves it naming the old branch.
@@ -159,11 +164,31 @@ resource read that waits for registration (listed at the end).
   holds the default for the branch being left. Text set with `set_status`, an explicit clear, and a
   workspace-derived name are left alone.
 - **Why:** the roster showed every long-lived session working on whatever it had started on.
-- **Fork:** MAR-20 (from muster's MUS-26), Castor-o7/marshal#34, in review at head
-  `5f9bcff5b7a0a2d1355f4fb3a66482053cca95b1`.
+- **Fork:** MAR-20 (from muster's MUS-26), Castor-o7/marshal#34, merged at
+  `04a915bde89583a566248c601f9a50bd9feb560c`.
 - **Opt-out:** set your own task with `set_status`, and it isn't touched.
 - **Risk:** low. Text that happens to equal the old branch's default is taken for the default and
   changed.
+
+### 7. A Codex session on the roster can count as dead, from its bridge's signal
+
+- **Before:** upstream has no takeover (3), so nothing decides whether a session is dead. With 3 and
+  4 alone, a Codex row still on the roster never counted as dead, since a Codex session holds no
+  Claude-style waiter: a Codex session restarted in the same directory never took over its
+  predecessor's nickname or mail.
+- **After:** a Codex row still on the roster counts as dead only once this daemon saw its bridge's
+  wake record end at least `MARSHAL_SUCCESSION_BRIDGE_GRACE_SECS` (120 s) ago, with no other waiter
+  and no hook since. A row this daemon never saw with a bridge record never counts as dead. Takeover
+  finds a session's waiters by the record's own session, not its key.
+- **Why:** without it, 3 and 4 covered Claude sessions only. A restarted Codex session lost its
+  name and stranded its unread mail.
+- **Fork:** MAR-54, Castor-o7/marshal#48, merged at `62761e7df4d5a30d646197b52cb2f14f77e4f2fc`.
+  Its tests were made race-free in MAR-62, Castor-o7/marshal#66, merged at
+  `1ae97172f2a67c3ba17410c9e4e51046742449a7` (tests only). Depends on 3 and 4.
+- **Opt-out:** as for 3, `MARSHAL_IDENTITY=none`, or the grace raised.
+- **Risk:** as for 3 and 4, for Codex. A bridge handover that leaves no record for longer than the
+  grace would let a newer session take over a live one's name. The 120 s grace allows for a 45 s
+  handover gap, which the tests cover.
 
 ## Bug fixes and additive pieces, offered as small PRs
 
@@ -181,7 +206,8 @@ complete:
   5 s cooldown. Fork: MAR-7 (from muster's MUS-76), Castor-o7/marshal#5, merged at
   `4ebcf08222f08500fac3c62db37cf5fa41ccf8fd`.
 - **An unknown `MARSHAL_PERSIST` value stops startup.** This only means something alongside the
-  fork's opt-in file store (MAR-53, Castor-o7/marshal#55, in review), so it's part of that additive
+  fork's opt-in file store (MAR-53, Castor-o7/marshal#55, merged at
+  `4d4d21eaf112427d272358cd3e40b8a736d8b5f2`), so it's part of that additive
   PR's contract, not a default change here.
 
 ## Proposed, not built on the fork yet
