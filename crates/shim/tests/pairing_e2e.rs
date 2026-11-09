@@ -126,6 +126,30 @@ fn current_task_of(rig: &Rig, session: &str) -> Option<String> {
     find(&roster, session)
 }
 
+/// `declared.machine` of `session` on the roster, through the host's shim.
+fn machine_of(rig: &Rig, session: &str) -> Option<String> {
+    let out = rig.local_shim(&["roster"]).output().unwrap();
+    let roster: serde_json::Value =
+        serde_json::from_str(text(&out).trim_start_matches(|c| c != '{')).ok()?;
+    fn find(v: &serde_json::Value, id: &str) -> Option<String> {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.get("session_id").and_then(|v| v.as_str()) == Some(id) {
+                    return map
+                        .get("declared")?
+                        .get("machine")?
+                        .as_str()
+                        .map(str::to_string);
+                }
+                map.values().find_map(|v| find(v, id))
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(|v| find(v, id)),
+            _ => None,
+        }
+    }
+    find(&roster, session)
+}
+
 fn text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -374,7 +398,12 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
     // Pair: a code from the daemon's host, redeemed by the machine, once.
     let code = rig.pair_code("laptop");
     let out = rig.remote_shim(None, &["pair", &code]).output().unwrap();
-    assert!(out.status.success(), "pair: {}", text(&out));
+    assert!(
+        out.status.success(),
+        "pair: {}\ndaemon log:\n{}",
+        text(&out),
+        rig.log()
+    );
     assert!(text(&out).contains("paired as laptop"), "{}", text(&out));
     let again = rig.remote_shim(None, &["pair", &code]).output().unwrap();
     assert!(
@@ -420,6 +449,25 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
     assert!(
         !text(&rig.local_shim(&["roster"]).output().unwrap()).contains("unpaired-session"),
         "the tokenless hook's session joined"
+    );
+    // Nor can the host end it, or re-register it over the owner's row: the
+    // row keeps the owner's declared host after both refusals.
+    let ended = rig.hook(rig.local_shim(&[]), "session-end", "paired-session");
+    assert!(
+        text(&ended).contains("belongs to another machine"),
+        "the host ended the paired machine's session: {}",
+        text(&ended)
+    );
+    let overwrite = rig.hook(rig.local_shim(&[]), "session-start", "paired-session");
+    assert!(
+        text(&overwrite).contains("belongs to another machine"),
+        "the host re-registered the paired machine's session: {}",
+        text(&overwrite)
+    );
+    assert_eq!(
+        machine_of(&rig, "paired-session").as_deref(),
+        Some("remote"),
+        "the owner's row didn't survive the refused hooks"
     );
 
     // Acting *as* the hook-registered session (MAR-80 through MAR-81): the

@@ -344,6 +344,17 @@ pub fn bind(session: &str, principal: &Principal) -> bool {
     bind_to(table, &principal_key(principal), session)
 }
 
+/// Whether `session` is held by a principal other than `principal` (MAR-81):
+/// the check a hook makes before acting for a session it didn't register.
+/// Unbound, or no binding installed, is false.
+pub fn held_by_another(session: &str, principal: &Principal) -> bool {
+    installed().as_ref().is_some_and(|Installed { table, .. }| {
+        table
+            .owner_of(session)
+            .is_some_and(|owner| owner != principal_key(principal))
+    })
+}
+
 /// Forget who held a session that has gone: ended, swept or forgotten. With
 /// no binding installed it's a no-op, and false.
 pub fn release(session: &str) -> bool {
@@ -770,6 +781,9 @@ mod tests {
             binding.table().owner_of("s-laptop").as_deref(),
             Some(principal_key(&laptop).as_str())
         );
+        assert!(held_by_another("s-laptop", &desk));
+        assert!(!held_by_another("s-laptop", &laptop));
+        assert!(!held_by_another("s-free", &desk), "unbound is nobody's");
         assert!(release("s-laptop"));
         assert!(bind("s-laptop", &desk), "released, it's free again");
     }
