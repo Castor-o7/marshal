@@ -329,7 +329,7 @@ stays the default and behaves as it does today.
   Marshal still writes, and which of MAR-38's questions it waits on, with proposed revisions to the
   gate stories that aren't applied until MAR-38 is answered. Done (#95), merged in 0380d4a; the
   watchman then had the revisions applied fork-side.
-- [ ] **MAR-23: Security: Gate: opt-in TLS.** From MAR-76's map, with MAR-25's remnant folded in.
+- [x] **MAR-23: Security: Gate: opt-in TLS.** From MAR-76's map, with MAR-25's remnant folded in.
   `marshal-daemon --tls`; plain stays the default. #129 has no TLS, so the daemon terminates it.
   Done when: with `--tls`, a TLS listener on `MARSHAL_BIND` serves a self-signed certificate made at
   first start and kept in the state directory; myko and the hook listener bind loopback only behind
@@ -337,7 +337,9 @@ stays the default and behaves as it does today.
   the certificate's SHA-256 fingerprint pinned, and a wrong pin is refused; without `--tls` nothing
   changes; e2e tests cover a pinned connect and delivery, a wrong pin, and plain mode unchanged; and
   the PR says what it adds to the binaries' size and dependencies (rustls is already in the
-  daemon's tree, through myko's telemetry).
+  daemon's tree, through myko's telemetry). Done in two parts: the daemon (#102, merged in
+  d2925e1) and the shim's pinned link (#104, merged in a49ade4). Each binary grows by 1.9 MB, on
+  ring. Off until the operator starts the daemon with `--tls`.
 - [ ] **MAR-24: Security: Gate: per-machine pairing.** Depends on MAR-23. A Marshal `Authenticator`
   on #129. Done when: a machine pairs with a single-use, expiring code and gets a token kept in a
   pairing store; the shim presents it through #129's `CredentialProvider`; an unpaired or revoked
