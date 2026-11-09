@@ -1907,10 +1907,6 @@ const MARSHAL_NOT_APPLICABLE: &[(&str, &str)] = &[
         "resume-wakes-held-mail",
         "Marshal has no operator pause to resume (MUS-10)",
     ),
-    (
-        "unread-mail-follows-a-restart",
-        "Marshal doesn't hand a successor its predecessor's mail yet (muster's MUS-47)",
-    ),
 ];
 
 const TLS_EXCLUDED: &str = "Marshal has no TLS gate yet (MAR-23); runs as plain mode would";

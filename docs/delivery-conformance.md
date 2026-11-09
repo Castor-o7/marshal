@@ -12,9 +12,7 @@ that ran:
 - the `claude-tls` and `codex-tls` columns: Marshal has no TLS gate yet (MAR-23);
 - the `pi`, `opencode` and `prime-agent` columns: stage 2, with MAR-10 and MAR-11;
 - `operator-pause-stops-wakes` and `resume-wakes-held-mail`: Marshal has no
-  operator pause;
-- `unread-mail-follows-a-restart`: Marshal hands a restarted session its
-  predecessor's nickname (MAR-9) but not its mail yet (muster's MUS-47).
+  operator pause.
 
 The sections below describe the whole suite as muster built it, including the
 columns stage 1 doesn't run.
