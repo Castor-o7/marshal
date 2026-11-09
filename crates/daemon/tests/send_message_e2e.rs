@@ -318,6 +318,7 @@ fn a_session_that_acks_pushes_keeps_a_push_unread_until_it_acks() {
     let ack = client_b.send_command::<AckMessages, AckMessagesResult>(&AckMessages {
         message_ids: vec![MessageId(Arc::from(message_id))],
         as_session: None,
+        phase: None,
     });
     wait_for("B's ack response", move || matches!(ack.get(), Some(Ok(_))));
     let ctx = server.ctx.clone();

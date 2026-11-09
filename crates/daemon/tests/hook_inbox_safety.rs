@@ -541,6 +541,7 @@ fn check_mention_acknowledgment(acks_pushes: bool) {
         marshal_entities::AckMessages {
             message_ids: vec![ping.id.clone()],
             as_session: Some(SessionId(Arc::from("live"))),
+            phase: None,
         }
         .execute(daemon.context())
         .expect("acknowledge written mention");
@@ -551,6 +552,211 @@ fn check_mention_acknowledgment(acks_pushes: bool) {
         !inbox.contains("MENTION-MARKER"),
         "a mention pushed live came back in the inbox:\n{inbox}"
     );
+}
+
+// ---- MAR-82: two-phase delivery for a Claude waiter -----------------------
+
+impl Daemon {
+    fn post(&self, path_and_query: &str, body: &str) -> String {
+        let mut stream = TcpStream::connect(self.hooks).expect("connect hook listener");
+        write!(
+            stream,
+            "POST {path_and_query} HTTP/1.1\r\nHost: x\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default()
+    }
+
+    /// An inbox fetched as a client that acks for itself (`ack=client`), as
+    /// the waiter does, so nothing is acked until it says so.
+    fn fetch_for_client(&self, session_id: &str) -> String {
+        self.post(
+            "/hook/prompt-submit?harness=claude&ack=client",
+            &format!(r#"{{"session_id":"{session_id}","cwd":"/repo"}}"#),
+        )
+    }
+
+    fn ack(&self, session_id: &str, ids: &[&str], phase: Option<&str>) {
+        let mut body = serde_json::json!({ "session_id": session_id, "message_ids": ids });
+        if let Some(phase) = phase {
+            body["phase"] = phase.into();
+        }
+        self.post("/hook/ack", &body.to_string());
+    }
+
+    fn offers(&self, session_id: &str) -> Vec<String> {
+        let body = self.post(
+            "/hook/offers",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+        );
+        serde_json::from_str(body.trim()).expect("a JSON list")
+    }
+
+    fn reads(&self, session_id: &str) -> usize {
+        marshal_entities::ReadMessages {
+            room: None,
+            from: None,
+            to_session: Some(SessionId(Arc::from(session_id))),
+            inbox: false,
+            sent: false,
+            unread: false,
+            since: None,
+            limit: Some(100),
+            as_session: Some(SessionId(Arc::from(session_id))),
+        }
+        .execute(self.context())
+        .expect("read messages")
+        .messages
+        .iter()
+        .filter(|m| m.read_by_me)
+        .count()
+    }
+
+    fn only_message_id(&self, to: &str) -> String {
+        marshal_entities::ReadMessages {
+            room: None,
+            from: None,
+            to_session: Some(SessionId(Arc::from(to))),
+            inbox: false,
+            sent: false,
+            unread: false,
+            since: None,
+            limit: Some(1),
+            as_session: Some(SessionId(Arc::from(to))),
+        }
+        .execute(self.context())
+        .expect("read messages")
+        .messages[0]
+            .message_id
+            .0
+            .to_string()
+    }
+}
+
+/// The lease that keeps surfaced mail from being offered twice before its
+/// ack lasts 60 s; these tests ack at once, so it never lapses within them.
+fn offered_once(daemon: &Daemon) -> String {
+    daemon.apply(&session("sender"));
+    daemon.apply(&session("waiter"));
+    daemon.send("sender", "waiter", "two-phase check");
+    let id = daemon.only_message_id("waiter");
+    let first = daemon.fetch_for_client("waiter");
+    assert!(first.contains("two-phase check"), "{first}");
+    daemon.ack("waiter", &[&id], Some("offered"));
+    id
+}
+
+#[test]
+fn the_inbox_names_its_messages_for_the_transcript() {
+    let daemon = daemon();
+    daemon.apply(&session("sender"));
+    daemon.apply(&session("waiter"));
+    daemon.send("sender", "waiter", "hello");
+    let id = daemon.only_message_id("waiter");
+
+    let inbox = daemon.fetch_for_client("waiter");
+
+    assert!(inbox.contains(&format!(r#"ids="{id}""#)), "{inbox}");
+}
+
+#[test]
+fn offered_mail_stays_unread_and_isnt_handed_over_again() {
+    let daemon = daemon();
+    let id = offered_once(&daemon);
+
+    assert_eq!(daemon.reads("waiter"), 0, "an offer isn't a read");
+    assert_eq!(daemon.offers("waiter"), [id]);
+    let again = daemon.fetch_for_client("waiter");
+    assert!(
+        !again.contains("two-phase check"),
+        "offered twice:\n{again}"
+    );
+}
+
+#[test]
+fn seen_mail_is_read_and_its_offer_goes() {
+    let daemon = daemon();
+    let id = offered_once(&daemon);
+
+    daemon.ack("waiter", &[&id], None);
+
+    assert_eq!(daemon.reads("waiter"), 1);
+    assert!(daemon.offers("waiter").is_empty());
+}
+
+#[test]
+fn an_offer_left_at_session_end_leaves_the_mail_unread_for_next_time() {
+    let daemon = daemon();
+    offered_once(&daemon);
+
+    daemon.post(
+        "/hook/session-end?harness=claude",
+        r#"{"session_id":"waiter","cwd":"/repo"}"#,
+    );
+    daemon.apply(&session("waiter")); // resumed under the same id
+
+    assert_eq!(daemon.reads("waiter"), 0);
+    assert!(daemon.offers("waiter").is_empty());
+    let resumed = daemon.fetch_for_client("waiter");
+    assert!(resumed.contains("two-phase check"), "{resumed}");
+}
+
+#[test]
+fn an_offer_older_than_the_timeout_is_offered_again() {
+    let daemon = daemon();
+    let id = offered_once(&daemon);
+    // Josh's 6 h: an offer older than that stands no longer.
+    daemon.apply(&marshal_entities::MessageOffer {
+        id: marshal_entities::MessageOfferId(Arc::from(
+            marshal_entities::MessageOffer::make_id(&id, "waiter").as_str(),
+        )),
+        message_id: MessageId(Arc::from(id.as_str())),
+        session_id: SessionId(Arc::from("waiter")),
+        offered_at: chrono::Utc::now().timestamp_millis() - 6 * 60 * 60 * 1000 - 1,
+    });
+
+    let again = daemon.fetch_for_client("waiter");
+
+    assert!(again.contains("two-phase check"), "{again}");
+    assert_eq!(daemon.reads("waiter"), 0);
+}
+
+#[test]
+fn an_ack_with_no_phase_still_marks_mail_read() {
+    // A shim from before MAR-82 sends no phase.
+    let daemon = daemon();
+    daemon.apply(&session("sender"));
+    daemon.apply(&session("waiter"));
+    daemon.send("sender", "waiter", "old shim");
+    let id = daemon.only_message_id("waiter");
+    daemon.fetch_for_client("waiter");
+
+    daemon.ack("waiter", &[&id], None);
+
+    assert_eq!(daemon.reads("waiter"), 1);
+    assert!(daemon.offers("waiter").is_empty());
+}
+
+#[test]
+fn a_withdrawn_offer_leaves_the_mail_unread_and_offered_again_now() {
+    // After a crash, the session's next start takes back offers its
+    // transcript doesn't show, rather than wait out the 6 h (MAR-82).
+    let daemon = daemon();
+    let id = offered_once(&daemon);
+
+    daemon.ack("waiter", &[&id], Some("withdrawn"));
+
+    assert_eq!(daemon.reads("waiter"), 0);
+    assert!(daemon.offers("waiter").is_empty());
+    let again = daemon.fetch_for_client("waiter");
+    assert!(again.contains("two-phase check"), "{again}");
 }
 
 /// A session of `kind` on `machine`, as a shim would register it.

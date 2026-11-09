@@ -1,7 +1,8 @@
 # Two-phase delivery: don't mark mail read until the model has it (MAR-79)
 
-**A design for the watchman to take to Josh. Nothing here is built.** Fork-only for now; the same gap
-is in Muster, so the shape may suit upstream too.
+**Designed in MAR-79; built for Claude in MAR-82 (see [What MAR-82 built](#what-mar-82-built) at the
+end).** Josh's answers (2026-11-09): read the transcript; re-offer after 6 h; Claude first, with Codex
+as its own story; upstream-ready, but built and proven on the fork first.
 
 ## The gap
 
@@ -66,9 +67,9 @@ backstop if the format moves.
   MAR-42, which moves unread mail. Nothing new is needed there, as long as an offer doesn't count as
   read.
 - **A long-running session that never confirms** (a transcript the shim can't read, or a Claude Code
-  change that stops writing the block): after a confirm timeout (proposed: 6 h, a setting) the daemon
-  records the read anyway and logs `[hook] confirm timed out`. That way this can't turn into
-  repeated re-offers, and the timeout count says when confirmation has stopped working.
+  change that stops writing the block): after 6 h the offer stands no longer, and the mail is
+  **offered again** (Josh's answer; the design first proposed marking it read). That can mean a
+  duplicate, but never a loss.
 
 **Duplicates.** Before handing on mail that was offered and never confirmed (after a restart, say),
 the shim checks the transcript first. An id that's already there is confirmed, not shown again. So the
@@ -115,3 +116,59 @@ hook (its turn has completed). The app-server bridge (`codex_bridge.rs`), which 
 2. The confirm timeout: 6 h, or another value? Or never time out, and alert instead?
 3. Claude first and Codex after, or both together?
 4. Fork-only, or written so it can go upstream (Muster has the same gap)?
+
+## What MAR-82 built
+
+For Claude, as above, with these specifics:
+
+- **`MessageOffer`** (entities, persisted with Postgres and the file store): `<message>::<session>`,
+  `offered_at`. `AckMessages` takes `phase: "offered"`, which writes offers and no read. No phase, or
+  any other phase, is today's read, and it also drops that session's offer for the message. So a
+  shim from before MAR-82 behaves as before.
+- **Daemon.** `/hook/ack` passes `phase` through. `surface_unread` skips mail with an offer to that
+  session younger than 6 h (`MARSHAL_OFFER_SECS` overrides it, for tests). The inbox opening tag
+  carries `ids="…"`, naming ids that are plain (hex and `-`, up to 64, as `SendMessage` mints them);
+  any other id stays offered until the 6 h re-offer. `/hook/offers` returns a session's standing
+  offers as a JSON list. SessionEnd drops the session's offers, and `phase: "withdrawn"` drops the
+  named ones, with no read either way. The cleanup sweeper removes offers whose message is gone or
+  that are past the 6 h, when they no longer hold anything back, including the one a succession
+  leaves on the old session.
+- **Shim.** The waiter (`claude-hook wait`, and `watch`) acks `offered` and writes a marker,
+  `offered-<session>`, in its config directory. Every Claude hook (`claude-hook prompt-submit`,
+  `post-tool-use`, `pre-tool-use`) and each new waiter, at Stop or SessionStart, then confirms. Only
+  when the marker is there does it ask `/hook/offers`, look for those ids in the transcript, and ack
+  the ones found as seen. The marker goes once nothing is outstanding, and only if it's older than
+  that `/hook/offers` request, so an offer a waiter wrote meanwhile isn't left unconfirmed. Before
+  handing mail on, the waiter checks the transcript too: mail already seen is acked and not shown
+  again.
+- **A crash, then the same session again.** A `kill -9` or an OOM sends no SessionEnd, so its offers
+  stand. The waiter that SessionStart starts in the new process confirms what the transcript shows
+  and **withdraws** the rest, so that mail is offered at once, not in 6 h. A waiter started at Stop
+  doesn't withdraw anything, since it's the same process and an unseen offer may still be held.
+- **The matcher** (`crates/shim/src/transcript.rs`) reads the last 4 MB of `transcript_path`. It takes
+  ids only from the `ids="…"` attribute of a `<marshal_inbox …>` opening tag, split on `,` and matched
+  exactly, in a JSON line whose top-level `type` is `user` or `attachment`, never `queue-operation`.
+  It skips anything inside a tool call or tool result (`tool_use`, `tool_result`, `toolUseResult`),
+  since a session that reads a log or a transcript gets inbox blocks back as tool output, and that
+  isn't delivery. Only the daemon can write that tag: it escapes `<` in every body and handle.
+  Anything it can't read or parse counts as not seen.
+
+**Deploying and rolling back.** Deploy the daemon and the shim together; either order is safe. An old
+shim sends no phase, which is today's read. A new shim with an old daemon gets its phase ignored, which
+is also today's read. Rolling the daemon back past MAR-82 on Postgres, as Murph runs, is safe: myko
+skips an item type it has no parser for (`No parser for entity type: MessageOffer`, a warning), so
+offered mail is just unread to the old daemon and is offered again. That can mean a duplicate, never a
+loss. With the file store (`MARSHAL_PERSIST`) an older daemon refuses to start on a kind it doesn't
+know, so remove the offers from `store.jsonl` first (`grep -v '"MessageOffer"'` to a new file, then
+move it into place, with the daemon stopped).
+
+**Not yet:** Codex (its own story); a sender's `recipient.offered` in `read_messages`; splitting
+MAR-73's M3 into offered and seen; and MAR-79's live check 5 (kill a busy session mid-turn, start it
+again, and the mail arrives once), which needs this deployed on Murph. The matcher's tests include records
+recorded from a disposable test session on Claude Code 2.1.321 and scrubbed to their shapes
+(`crates/shim/tests/fixtures/claude-code-2.1.321`). They confirm the design: each delivery's first
+record is a `queue-operation` `enqueue`, written while the rewake is held, and the model-bound ones
+follow when the next turn starts (`api-request-blob` with `attachment`/`queued_command` for mail sent
+while busy, and `api-request-blob` with `user` for mail sent while idle). A test fails if Claude Code
+changes those shapes, which is the cue to re-record.
+
