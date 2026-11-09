@@ -257,10 +257,14 @@ launcher.
   6 h unconfirmed (at least once); Claude first, with Codex as its own story; built and proven on
   the fork first, then offered upstream as one PR in the one-at-a-time queue. Done when: a Claude
   session's waiter acks mail as offered, not read; a later hook finds the inbox block's ids in the
-  session's transcript (in `user` or `attachment` records, never `enqueue`) and marks it read; an
-  offer unconfirmed at SessionEnd or reap is unread again, so MAR-42 moves it; one unconfirmed for
-  6 h is offered again; and a test kills a session mid-turn and its mail is still unread (MAR-79's
-  check 5).
+  session's transcript (in `user` or `attachment` records, never `enqueue`) and marks it read; the
+  transcript matcher is isolated and tested against records captured from Claude Code, so a format
+  change fails safe (nothing matches and the mail stays offered, never lost); a session whose
+  transcript already shows a message isn't handed it again; an offer unconfirmed at SessionEnd or
+  reap is dropped, so the mail is unread again for that session or, by MAR-42, its successor; one
+  unconfirmed for 6 h is offered again; a shim that sends no phase keeps today's behaviour (the ack
+  marks it read); and a test kills a session mid-turn and its mail is still unread (MAR-79's check
+  5).
 
 ## Later: other harnesses
 
