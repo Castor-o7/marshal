@@ -348,7 +348,7 @@ stays the default and behaves as it does today.
 - [x] **MAR-25: Dropped: Gate: myko's own listener behind the gate.** Superseded by #129 (MAR-76):
   with `with_auth_provider`, myko checks every connection's token itself, so no vendored
   `RequestFilter` is needed. Its remnant, binding myko to loopback behind TLS, is part of MAR-23.
-- [ ] **MAR-80: Security: With auth on, a connection acts only as its own sessions.** A
+- [x] **MAR-80: Security: With auth on, a connection acts only as its own sessions.** A
   `SessionBinding` Authorizer (`crates/daemon/src/auth/`) wraps the provider's own. Done when, with a
   provider on: a principal owns the sessions it registers (`RegisterSession`, or the raw `Session`
   SET fallback), and a session owned by another principal can't be re-registered by it; a command
@@ -362,7 +362,7 @@ stays the default and behaves as it does today.
   when its session ends or is forgotten; plain mode is unchanged; in-process tests as in #84 for
   each. The doc says plainly that the hook listener itself isn't covered (MAR-81), and that the local
   token is a loopback trust boundary: on a shared machine its file must be owner-only (0600). The
-  doc is [session-binding.md](session-binding.md).
+  doc is [session-binding.md](session-binding.md). Done (#105), merged in defa09c.
 - [ ] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
   listener is outside myko, so #129 doesn't cover it. Done when: with a provider on, every `/hook/*`
   request must carry the daemon host's local token or a paired machine's token as
