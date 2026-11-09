@@ -36,8 +36,9 @@ use myko::{
 use serde_json::Value;
 
 use marshal_entities::{
-    AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllWakeWatchers, HostInfo, MessageId, MessageView,
-    ReadMessages, Session, SessionId, WakeWatcher, WakeWatcherId, context_preview, nickname_for,
+    AckMessages, CONTEXT_BODY_MAX_CHARS, GetAllSessions, GetAllWakeWatchers, HostInfo, MessageId,
+    MessageView, ReadMessages, Session, SessionId, WakeWatcher, WakeWatcherId, context_preview,
+    nickname_for,
 };
 
 const AUTO_INBOX_BODY_BUDGET_CHARS: usize = 8_000;
@@ -157,6 +158,7 @@ pub fn dispatch(
         "/hook/prompt-submit" => Some(handle_prompt_submit(query, body, ctx)),
         "/hook/session-end" => Some(handle_session_end(body, ctx)),
         "/hook/ack" => Some(handle_ack(body, ctx)),
+        "/hook/bridge-watch" => Some(handle_bridge_watch(body, ctx)),
         _ => None,
     }
 }
@@ -215,6 +217,76 @@ fn handle_ack(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
     HookOutcome::text(String::new())
 }
 
+/// A Codex app-server bridge saying it can wake a thread (MAR-12). Codex holds
+/// no `/hook/wait`, so without this the roster calls a bridge-watched thread
+/// `wake: none`, and a send to it says `unobserved`, though its bridge will
+/// start a turn. Body: `{"session_id": …, "watching": true|false}`. `true`
+/// refreshes this bridge's `WakeWatcher` for the session (written only when
+/// due, as a held wait's is); `false` ends that one record. The body may name
+/// the bridge process in `"bridge"` (MAR-4).
+///
+/// It touches only what a bridge registered: a hook-owned row on the roster
+/// (no client binding), as Codex's are, since Codex's MCP shim registers no
+/// session. A Claude session's row is bound to its shim's connection, and
+/// its record belongs to its own waiter, so it's left alone. So is anything
+/// when `watching` isn't an explicit bool: a malformed body changes nothing.
+/// Like the other hook routes, this trusts the session id it's given: keep
+/// the hook listener on loopback or a trusted network.
+fn handle_bridge_watch(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
+    let parsed = parse_body(body);
+    let Some(sid) = parsed
+        .as_ref()
+        .and_then(|b| b.get("session_id")?.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return HookOutcome::text("ignored".to_string());
+    };
+    let Some(watching) = parsed.as_ref().and_then(|b| b.get("watching")?.as_bool()) else {
+        return HookOutcome::text("ignored".to_string());
+    };
+    let cmd_ctx = internal_cmd_ctx(ctx);
+    let bridge_owned = cmd_ctx
+        .exec_query(GetAllSessions {})
+        .unwrap_or_default()
+        .iter()
+        .any(|s| s.id.0.as_ref() == sid && s.client_id.is_none());
+    if !bridge_owned {
+        return HookOutcome::text("not watching".to_string());
+    }
+    // Each bridge has its own record (MAR-4), so a bridge that has handed over
+    // wake leadership can't end the new leader's, and neither can end a held
+    // `/hook/wait`'s. A bridge that names no valid `bridge` shares one record
+    // with any other such bridge.
+    let bridge = parsed
+        .as_ref()
+        .and_then(|b| b.get("bridge")?.as_str())
+        .filter(|s| valid_bridge_name(s))
+        .unwrap_or("bridge");
+    let record = WakeWatcher::bridge_id(sid, bridge);
+    if watching {
+        mark_path(
+            &cmd_ctx,
+            &record,
+            Some(sid),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        HookOutcome::text("watching".to_string())
+    } else {
+        end_path(&cmd_ctx, &record, sid);
+        HookOutcome::text("not watching".to_string())
+    }
+}
+
+/// A bridge name the daemon will key a record by: 1 to 64 characters from
+/// `[A-Za-z0-9:._-]`. Any other name gets the shared `bridge` record, so a
+/// bridge can't make a record id as long as the request body.
+fn valid_bridge_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-'))
+}
+
 /// Register or refresh a hook-owned session without surfacing its inbox.
 ///
 /// Codex's app-server bridge calls this as soon as it observes
@@ -253,7 +325,11 @@ fn handle_session_start(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     // who it is. Authoritative (assigned handle, else the computed candidate the
     // assigner would use), matching what peers see in marshal://roster.
     let q = parse_query(query);
-    let nick = nickname_for(&cmd_ctx, &sid).unwrap_or_else(|_| marshal_entities::nickname(&sid));
+    // Named here rather than left to the saga, so a session that takes over a
+    // predecessor's nickname (MUS-3) shows that one in its session block.
+    let nick = crate::nickname_assign::ensure_assigned(&cmd_ctx, &sid)
+        .or_else(|_| nickname_for(&cmd_ctx, &sid))
+        .unwrap_or_else(|_| marshal_entities::nickname(&sid));
     // Assigned handles are wordlist pairs, but the nickname store takes any SET.
     let nick = peer_attr(&nick);
     let mut out = if q.get("harness").map(String::as_str) == Some("codex") {
@@ -269,6 +345,9 @@ fn handle_session_start(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
              identity.</marshal_session>\n"
         )
     };
+    // The session block above already names it, so a late swap's notice
+    // isn't needed this time.
+    let _ = crate::succession::take_notice(&cmd_ctx, &sid);
     let (inbox, ids) = surface_unread(&cmd_ctx, &sid);
     out.push_str(&inbox);
     HookOutcome {
@@ -298,6 +377,18 @@ fn register_hook_session(
 ) -> Option<(String, CommandContext)> {
     let body = parse_body(body)?;
     let sid = body.get("session_id").and_then(|v| v.as_str())?;
+    // A `#` is how a bridge's wake-path record is named (MAR-4), so a session
+    // id carrying one could pose as another session's record. Register none.
+    if sid.contains('#') {
+        log::warn!("[hook] not registering session id {sid:?}: it contains '#'");
+        return None;
+    }
+    // The operator forgot it (MAR-46): a waiter still polling under its id
+    // mustn't put the row back while the forget holds.
+    if crate::controls::is_forgotten(sid) {
+        log::debug!("[hook] not registering {sid}: the operator forgot it");
+        return None;
+    }
     let sid = sid.to_string();
     let agent_id = body
         .get("agent_id")
@@ -330,6 +421,9 @@ fn register_hook_session(
         os: q.get("os").cloned().unwrap_or_default(),
         arch: q.get("arch").cloned().unwrap_or_default(),
     });
+    // MUS-3: what the session is matched on after a restart. Both declared.
+    let harness = q.get("harness").filter(|s| !s.is_empty()).cloned();
+    let identity = q.get("identity").filter(|s| !s.is_empty()).cloned();
     let project = if dir == "session" {
         None
     } else {
@@ -368,6 +462,12 @@ fn register_hook_session(
                 if updated.project.is_none() {
                     updated.project = project;
                 }
+                if harness.is_some() {
+                    updated.harness = harness;
+                }
+                // The hook reads MARSHAL_IDENTITY from the session's environment
+                // each time, so it's current.
+                updated.identity = identity;
                 updated
             }
             None => Session {
@@ -381,6 +481,7 @@ fn register_hook_session(
                 // Codex has no per-PID name manifest; identity is hook-owned.
                 session_name: None,
                 activity: None,
+                activity_at: None,
                 kind: None,
                 connected_at: now,
                 last_activity_at: active_at,
@@ -391,6 +492,8 @@ fn register_hook_session(
                 project,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness,
+                identity,
             },
         });
     if let Err(e) = result {
@@ -410,8 +513,14 @@ fn handle_prompt_submit(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     };
 
     let (inbox, ids) = surface_unread(&cmd_ctx, &sid);
+    // MUS-3: a session that took a predecessor's nickname over after it
+    // registered is told once, here, since its session block named the old one.
+    let body = match crate::succession::take_notice(&cmd_ctx, &sid) {
+        Some(notice) => notice + &inbox,
+        None => inbox,
+    };
     HookOutcome {
-        body: inbox,
+        body,
         deferred_ack: (!ids.is_empty()).then(|| (SessionId(Arc::from(sid)), ids)),
     }
 }
@@ -439,7 +548,7 @@ pub fn begin_wait(
 
 /// How long a `WakeWatcher` counts without being refreshed, which is how long a
 /// wait that timed out and wasn't followed by another still shows as waiting.
-const WAKE_WATCHER_TTL_MS: i64 = 2 * 60 * 1000;
+pub(crate) const WAKE_WATCHER_TTL_MS: i64 = 2 * 60 * 1000;
 /// Refresh a held wait once this old, so its inbox checks don't each write an event.
 const WAKE_WATCHER_REFRESH_MS: i64 = 60 * 1000;
 
@@ -456,22 +565,33 @@ pub fn mark_waiting_now(cmd_ctx: &CommandContext, sid: &str) {
 }
 
 fn mark_waiting(cmd_ctx: &CommandContext, sid: &str, now: i64) {
+    // A held wait's record is keyed by the session id itself (MAR-4).
+    mark_path(cmd_ctx, sid, None, now);
+}
+
+/// Refresh the wake-path record `id`, when due. `session` names the session it
+/// wakes when `id` isn't that session's id.
+fn mark_path(cmd_ctx: &CommandContext, id: &str, session: Option<&str>, now: i64) {
     let watchers: Vec<Arc<WakeWatcher>> = cmd_ctx
         .exec_query(GetAllWakeWatchers {})
         .unwrap_or_default();
-    let until = watchers
-        .iter()
-        .find(|w| w.id.0.as_ref() == sid)
-        .map(|w| w.until);
-    if !wake_watcher_due(until, now) {
+    let existing = watchers.iter().find(|w| w.id.0.as_ref() == id);
+    // A record that wakes another session isn't this path's to replace (MAR-4).
+    let wakes = session.unwrap_or(id);
+    if existing.is_some_and(|w| w.session() != wakes) {
+        log::warn!("[hook] not replacing wake watcher {id}: it belongs to another session");
+        return;
+    }
+    if !wake_watcher_due(existing.map(|w| w.until), now) {
         return;
     }
     let watcher = WakeWatcher {
-        id: WakeWatcherId(Arc::from(sid)),
+        id: WakeWatcherId(Arc::from(id)),
         until: now + WAKE_WATCHER_TTL_MS,
+        session_id: session.map(|s| SessionId(Arc::from(s))),
     };
     if let Err(e) = cmd_ctx.emit_set(&watcher) {
-        log::warn!("[hook] wake watcher SET failed for {sid}: {e:?}");
+        log::warn!("[hook] wake watcher SET failed for {id}: {e:?}");
     }
 }
 
@@ -487,14 +607,44 @@ fn truncation_notice(message_id: &str, sent_at: i64) -> String {
 /// A wait ended with its connection dropped or its mail handed out, so stop
 /// reporting it. Any other waiter for the session puts the record back at its next
 /// inbox check. A wait that merely timed out keeps its record, because the waiter
-/// normally asks again at once.
+/// normally asks again at once. Only the held wait's record goes: a Codex
+/// bridge's record for the same session is its own (MAR-4).
 pub fn end_wait(cmd_ctx: &CommandContext, sid: &str) {
+    end_path(cmd_ctx, sid, sid);
+}
+
+/// Remove the wake-path record `id`, if it's one that wakes `session`: a record
+/// for another session isn't this path's to end (MAR-4).
+fn end_path(cmd_ctx: &CommandContext, id: &str, session: &str) {
+    let watchers: Vec<Arc<WakeWatcher>> = cmd_ctx
+        .exec_query(GetAllWakeWatchers {})
+        .unwrap_or_default();
+    match watchers.iter().find(|w| w.id.0.as_ref() == id) {
+        Some(w) if w.session() == session => {}
+        Some(_) => {
+            log::warn!("[hook] not ending wake watcher {id}: it belongs to another session");
+            return;
+        }
+        None => return,
+    }
     let watcher = WakeWatcher {
-        id: WakeWatcherId(Arc::from(sid)),
+        id: WakeWatcherId(Arc::from(id)),
         until: 0,
+        session_id: None,
     };
     if let Err(e) = cmd_ctx.emit_del(&watcher) {
-        log::warn!("[hook] wake watcher DEL failed for {sid}: {e:?}");
+        log::warn!("[hook] wake watcher DEL failed for {id}: {e:?}");
+    }
+}
+
+/// The session ended, so every wake path to it goes: its held wait's and any
+/// bridge's.
+fn end_all_waits(cmd_ctx: &CommandContext, sid: &str) {
+    let watchers: Vec<Arc<WakeWatcher>> = cmd_ctx
+        .exec_query(GetAllWakeWatchers {})
+        .unwrap_or_default();
+    for w in watchers.iter().filter(|w| w.session() == sid) {
+        end_path(cmd_ctx, w.id.0.as_ref(), sid);
     }
 }
 
@@ -527,6 +677,7 @@ fn handle_session_end(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome 
         current_task: None,
         session_name: None,
         activity: None,
+        activity_at: None,
         kind: None,
         connected_at: 0,
         last_activity_at: None,
@@ -537,11 +688,16 @@ fn handle_session_end(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome 
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     };
     if let Err(e) = cmd_ctx.emit_del(&stub) {
         log::warn!("[hook] session-end DEL failed for {sid}: {e:?}");
+    } else {
+        // MUS-3: an ended session can be taken over by its successor.
+        crate::succession::record_removed(sid, chrono::Utc::now().timestamp_millis());
     }
-    end_wait(&cmd_ctx, sid);
+    end_all_waits(&cmd_ctx, sid);
     HookOutcome::text(String::new())
 }
 
@@ -555,6 +711,15 @@ fn surface_unread(cmd_ctx: &CommandContext, sid: &str) -> (String, Vec<MessageId
     // ambient (read via `marshal://messages room=…` or the marshal UI), so it
     // never hijacks the turn with unrelated context. `inbox: true` (direct +
     // room) stays available for explicit reads; auto-inject is direct-only.
+    //
+    // Hold the leases from before the read until the new ones are taken.
+    // `ack_surfaced` acks, then releases under this lock, so this read either
+    // sees a lease still held or sees the row already read. Reading first and
+    // locking after let a pull read a row as unread, then find its lease
+    // released by an ack that landed in between, and offer it a second time.
+    let Ok(mut leases) = LEASES.lock() else {
+        return (String::new(), Vec::new());
+    };
     let read = ReadMessages {
         room: None,
         from: None,
@@ -631,9 +796,6 @@ fn surface_unread(cmd_ctx: &CommandContext, sid: &str) -> (String, Vec<MessageId
         .chain(agent.iter().map(|m| (*m, false)))
         .map(|(m, is_human)| (m, is_human, render_line(m)))
         .collect();
-    let Ok(mut leases) = LEASES.lock() else {
-        return (String::new(), Vec::new());
-    };
     let now = Instant::now();
     let mut lines_budget = lines_limit;
     let mut selected_ids = Vec::new();

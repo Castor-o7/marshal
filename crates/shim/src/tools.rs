@@ -109,19 +109,33 @@ impl Handler for CoordHandler {
         let args = args.clone();
         let name = name.to_string();
         Box::pin(async move {
-            match name.as_str() {
-                "set_status" => set_status(&host, &args).await,
-                "send_message" => send_message(&host, &args).await,
-                "broadcast" => broadcast(&host, &args).await,
-                "join_room" => join_room(&host, &args).await,
-                "leave_room" => leave_room(&host, &args).await,
-                "ack_messages" => ack_messages(&host, &args).await,
-                other => Err(ToolError {
-                    code: METHOD_NOT_FOUND,
-                    message: format!("unknown tool: {other}"),
-                    data: None,
-                }),
+            // Under Codex the caller is named by `asSession`, so there's no
+            // connection binding to wait for or refuse.
+            if host.is_codex {
+                return dispatch_tool(&host, &name, &args).await;
             }
+            // Every tool here writes as this session, which the daemon refuses
+            // until the session's row is on the roster, bound to this
+            // connection. An agent's first call can come before the shim's
+            // registration lands, so hold it briefly rather than fail it
+            // (MAR-43, from muster's MUS-72 and MUS-78).
+            wait_until_registered(&host).await;
+            // The hold can pass on a row still bound to an earlier connection
+            // for this session (one that died and the sweeper hasn't cleared),
+            // and the daemon then refuses the write. A refused write stored
+            // nothing, so send the session again and retry it once (MUS-79).
+            let resend = || {
+                log::warn!(
+                    "[marshal-shim] {name} was refused as unregistered; sending the session again and retrying once"
+                );
+                resend_session(&host);
+            };
+            retry_once_if_unbound(
+                || dispatch_tool(&host, &name, &args),
+                resend,
+                UNBOUND_RETRY_AFTER,
+            )
+            .await
         })
     }
 
@@ -176,6 +190,7 @@ fn read_whoami(
                             "nickname": handle_for(host, s.id.0.as_ref()),
                             "session_name": s.session_name,
                             "activity": s.activity,
+                            "activity_at": s.activity_at,
                             "kind": s.kind,
                             "pid": s.pid,
                             "cwd": s.cwd,
@@ -223,6 +238,7 @@ fn read_whoami(
             "nickname": handle_for(host, snapshot.id.0.as_ref()),
             "session_name": snapshot.session_name,
             "activity": snapshot.activity,
+            "activity_at": snapshot.activity_at,
             "kind": snapshot.kind,
             "pid": host.pid,
             "cwd": host.cwd,
@@ -257,6 +273,7 @@ fn read_roster(host: &ToolHost, uri: &str) -> ResourceContent {
                 "current_task": s.current_task,
                 "session_name": s.session_name,
                 "activity": s.activity,
+                "activity_at": s.activity_at,
                 "kind": s.kind,
                 "operator": s.operator,
                 "agent_id": s.agent_id,
@@ -274,6 +291,10 @@ fn read_roster(host: &ToolHost, uri: &str) -> ResourceContent {
                 // Would a message wake it? `waiting` is observed by the daemon; `channel`
                 // and `busy` are declared by the session, which can claim anything.
                 "wake": marshal_entities::wake_state(s, &watchers, now_ms).as_str(),
+                // MUS-3: a role this session claims (`MARSHAL_IDENTITY`), which
+                // reaches it by name. Declared: any session can claim one.
+                "declared_role": s.identity.as_deref().filter(|i| *i != "none"),
+                "harness": s.harness,
                 "rooms": rooms,
             })
         })
@@ -376,39 +397,32 @@ async fn read_messages(
 // Tool implementations (writes)
 // =============================================================================
 
-/// The session a write command acts AS. Under Codex the shim holds no
-/// connection identity, so the agent names its own session explicitly via
-/// `asSession` (the id the SessionStart hook injected in the `<marshal_session>`
-/// block) and the shim forwards it. Every other harness resolves the caller
-/// from the WS connection, so this is `None`.
-fn caller(host: &ToolHost, args: &Value) -> Result<Option<SessionId>, ToolError> {
-    if !host.is_codex {
-        return Ok(None);
-    }
-    let s = args
-        .get("asSession")
+const AS_SESSION_HINT: &str = "pass your own marshal session id (shown in the \
+     <marshal_session> block at session start) so peers know who sent this";
+
+/// The `asSession` a Codex agent passed: under Codex the shim holds no
+/// connection identity, so the agent names its own session (the id the
+/// SessionStart hook injected in the `<marshal_session>` block).
+fn as_session_arg(args: &Value) -> Option<&str> {
+    args.get("asSession")
         .or_else(|| args.get("as_session"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            ToolError::invalid_params(
-                "missing `asSession`: pass your own marshal session id (shown in the \
-                 <marshal_session> block at session start) so peers know who sent this",
-            )
-        })?;
-    Ok(Some(SessionId(Arc::from(s))))
 }
 
 async fn set_status(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let text = arg_str(args, "text", "set_status: missing `text`")?;
+    let mut req = Required::new("set_status", args);
+    let text = req.string("text", &["current_task", "status"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     let new_task = if text.is_empty() {
         None
     } else {
         Some(Arc::<str>::from(text.as_str()))
     };
     // Codex: target the agent's own session (asSession); else our own row.
-    let id = caller(host, args)?.unwrap_or_else(|| host.session.lock().unwrap().id.clone());
+    let id = as_session.unwrap_or_else(|| host.session.lock().unwrap().id.clone());
     let _ = host
         .client
         .send_command::<SetSessionCurrentTask, ()>(&SetSessionCurrentTask {
@@ -433,12 +447,11 @@ fn response_required(args: &Value) -> Result<bool, ToolError> {
 }
 
 async fn send_message(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let to = arg_str(
-        args,
-        "to",
-        "send_message: missing `to` (session id or nickname)",
-    )?;
-    let body = arg_str(args, "body", "send_message: missing `body`")?;
+    let mut req = Required::new("send_message", args);
+    let to = req.string("to", &["recipient", "to_session"], "session id or nickname");
+    let body = req.string("body", &["message", "text"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     // Pin a visible nickname to the exact id from this shim's roster snapshot.
     // Other tokens stay server-resolved so operator/human routing and id-prefix
     // addressing retain their shared daemon policy.
@@ -447,19 +460,71 @@ async fn send_message(host: &ToolHost, args: &Value) -> Result<ToolOutcome, Tool
     let to_session_id = resolve_visible_nickname(&sessions, &nicknames, &to)
         .map_err(ToolError::invalid_params)?
         .unwrap_or_else(|| SessionId(std::sync::Arc::from(to.as_str())));
+    // Every send carries a key, so a timeout can tell the caller how to retry.
+    let key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     let cmd = SendMessage {
         response_required: response_required(args)?,
         to_session_id,
         body,
-        as_session: caller(host, args)?,
+        as_session,
+        idempotency_key: Some(key.clone()),
     };
     let cell = host
         .client
         .send_command::<SendMessage, SendMessageResult>(&cmd);
     let result = await_command(cell, REQUEST_TIMEOUT)
         .await
-        .map_err(ToolError::invalid_params)?;
-    Ok(ToolOutcome::Json(send_message_output(&result)))
+        .map_err(|e| ToolError::invalid_params(retry_hint(e, &key)))?;
+    let mut out = send_message_output(&result);
+    explain_inbox_delivery_once(
+        &mut out,
+        result.effective_live_push(),
+        &INBOX_DELIVERY_EXPLAINED,
+    );
+    Ok(ToolOutcome::Json(out))
+}
+
+/// Whether this shim has told its agent what `live_push: unavailable` means.
+static INBOX_DELIVERY_EXPLAINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+const INBOX_DELIVERY_NOTE: &str = "No live channel to this recipient, so the message waits in \
+     its inbox: it shows at the recipient's next tool call or prompt. An idle recipient is \
+     woken only when `wake` is `expected`; a busy one in a long command sees it when that \
+     command returns. Said once per session.";
+
+/// The first send that finds no live channel says what that means, so a
+/// sender isn't left guessing when a reply is slow (MAR-47, from muster's
+/// MUS-99). Only once per shim, to keep tool output small.
+fn explain_inbox_delivery_once(
+    out: &mut Value,
+    live_push: marshal_entities::LivePushStatus,
+    explained: &std::sync::atomic::AtomicBool,
+) {
+    if live_push == marshal_entities::LivePushStatus::Unavailable
+        && !explained.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        out["note"] = json!(INBOX_DELIVERY_NOTE);
+    }
+}
+
+/// `await_command`'s error when the response handler went away before a reply.
+const RESPONSE_DROPPED: &str = "command response handler dropped";
+
+/// A send whose reply never came (timed out, or its handler dropped) may still
+/// have arrived, so say how to retry without a duplicate. A refusal is final,
+/// and adds nothing.
+fn retry_hint(error: String, key: &str) -> String {
+    if error.starts_with("command timed out") || error == RESPONSE_DROPPED {
+        format!(
+            "{error}. The message may still have been delivered. To retry safely, send the same `to`, `body` and `response_required` with idempotency_key `{key}`."
+        )
+    } else {
+        error
+    }
 }
 
 fn send_message_output(result: &SendMessageResult) -> Value {
@@ -486,13 +551,16 @@ fn send_message_output(result: &SendMessageResult) -> Value {
 }
 
 async fn broadcast(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let to_room = arg_str(args, "to_room", "broadcast: missing `to_room` (room id)")?;
-    let body = arg_str(args, "body", "broadcast: missing `body`")?;
+    let mut req = Required::new("broadcast", args);
+    let to_room = req.string("to_room", &["room", "room_id"], "room id");
+    let body = req.string("body", &["message", "text"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     let cmd = BroadcastMessage {
         response_required: response_required(args)?,
         to_room_id: RoomId(Arc::<str>::from(to_room.as_str())),
         body,
-        as_session: caller(host, args)?,
+        as_session,
     };
     let cell = host
         .client
@@ -545,7 +613,10 @@ fn broadcast_message_output(result: &BroadcastMessageResult) -> Value {
 }
 
 async fn join_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let name = arg_str(args, "name", "join_room: missing `name`")?;
+    let mut req = Required::new("join_room", args);
+    let name = req.string("name", &["room", "room_name"], "");
+    let as_session = req.caller(host);
+    req.finish()?;
     let description = args
         .get("description")
         .and_then(|v| v.as_str())
@@ -553,7 +624,7 @@ async fn join_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolErr
     let cmd = JoinRoom {
         name,
         description,
-        as_session: caller(host, args)?,
+        as_session,
     };
     let cell = host.client.send_command::<JoinRoom, JoinRoomResult>(&cmd);
     let result = await_command(cell, REQUEST_TIMEOUT)
@@ -563,11 +634,11 @@ async fn join_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolErr
 }
 
 async fn leave_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let room = arg_str(args, "room", "leave_room: missing `room` (id or name)")?;
-    let cmd = LeaveRoom {
-        room,
-        as_session: caller(host, args)?,
-    };
+    let mut req = Required::new("leave_room", args);
+    let room = req.string("room", &["room_id", "name", "to_room"], "id or name");
+    let as_session = req.caller(host);
+    req.finish()?;
+    let cmd = LeaveRoom { room, as_session };
     let cell = host.client.send_command::<LeaveRoom, LeaveRoomResult>(&cmd);
     let result = await_command(cell, REQUEST_TIMEOUT)
         .await
@@ -576,20 +647,17 @@ async fn leave_room(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolEr
 }
 
 async fn ack_messages(host: &ToolHost, args: &Value) -> Result<ToolOutcome, ToolError> {
-    let ids = args
-        .get("message_ids")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            ToolError::invalid_params("ack_messages: missing `message_ids` (array of ids)")
-        })?;
-    let message_ids: Vec<MessageId> = ids
-        .iter()
-        .filter_map(|v| v.as_str())
+    let mut req = Required::new("ack_messages", args);
+    let message_ids: Vec<MessageId> = req
+        .string_array("message_ids", &["ids", "message_id"], "array of ids")
+        .into_iter()
         .map(|s| MessageId(Arc::<str>::from(s)))
         .collect();
+    let as_session = req.caller(host);
+    req.finish()?;
     let cmd = AckMessages {
         message_ids,
-        as_session: caller(host, args)?,
+        as_session,
     };
     let cell = host
         .client
@@ -653,6 +721,7 @@ pub fn tools_def(is_codex: bool) -> Vec<ToolDef> {
                 json!({
                     "to":   { "type": "string", "description": "Nickname, session id/prefix, or operator email from the roster." },
                     "body": { "type": "string", "description": "Message body." },
+                    "idempotency_key": { "type": "string", "description": "Only to retry a send whose reply never came: the key its error gave, with the same `to`, `body` and `response_required`." },
                     "response_required": { "type": "boolean", "default": false, "description": "Whether this message needs an answer. Normally false for answers, results, and release notices." }
                 }),
                 &["to", "body"],
@@ -751,11 +820,123 @@ pub fn resources_def(is_codex: bool) -> Vec<ResourceDef> {
 // Helpers
 // =============================================================================
 
-fn arg_str(args: &Value, key: &str, missing_msg: &str) -> Result<String, ToolError> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| ToolError::invalid_params(missing_msg))
+/// A tool's required arguments, read together so that one error names every
+/// field that's missing rather than one per round trip (MUS-100). Each field
+/// also answers to a few common aliases (`room` for `to_room`, `message` for
+/// `body`, `current_task` for `text`), since agents guess those names often.
+struct Required<'a> {
+    tool: &'static str,
+    args: &'a Value,
+    missing: Vec<String>,
+}
+
+impl<'a> Required<'a> {
+    fn new(tool: &'static str, args: &'a Value) -> Self {
+        Self {
+            tool,
+            args,
+            missing: Vec::new(),
+        }
+    }
+
+    /// The first of `key` and its `aliases` that's present. A present
+    /// alias wins over nothing but never over the canonical name.
+    fn lookup(&self, key: &str, aliases: &[&str]) -> Option<&'a Value> {
+        let args = self.args;
+        std::iter::once(key)
+            .chain(aliases.iter().copied())
+            .find_map(|k| args.get(k).filter(|v| !v.is_null()))
+    }
+
+    fn note_missing(&mut self, key: &str, hint: &str, wrong_type: bool) {
+        let mut entry = format!("`{key}`");
+        match (hint.is_empty(), wrong_type) {
+            (_, true) if hint.is_empty() => entry.push_str(" (must be a string)"),
+            (_, true) => entry.push_str(&format!(" ({hint}; must be a string)")),
+            (false, false) => entry.push_str(&format!(" ({hint})")),
+            (true, false) => {}
+        }
+        self.missing.push(entry);
+    }
+
+    /// A required string. Missing or not a string, it's recorded and an
+    /// empty string stands in until [`Self::finish`] reports it.
+    fn string(&mut self, key: &str, aliases: &[&str], hint: &str) -> String {
+        match self.lookup(key, aliases) {
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => {
+                self.note_missing(key, hint, true);
+                String::new()
+            }
+            None => {
+                self.note_missing(key, hint, false);
+                String::new()
+            }
+        }
+    }
+
+    /// A required array of strings. A lone string is taken as a one-item
+    /// array.
+    fn string_array(&mut self, key: &str, aliases: &[&str], hint: &str) -> Vec<String> {
+        match self.lookup(key, aliases) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(_) => {
+                self.missing.push(format!("`{key}` ({hint})"));
+                Vec::new()
+            }
+            None => {
+                self.missing.push(format!("`{key}` ({hint})"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// The session a write command acts AS. Under Codex the shim holds no
+    /// connection identity, so the agent names its own session via
+    /// `asSession` (the id the SessionStart hook injected in the
+    /// `<marshal_session>` block); a missing one is reported with the rest.
+    /// Every other harness resolves the caller from the WS connection, so
+    /// this is `None`.
+    fn caller(&mut self, host: &ToolHost) -> Option<SessionId> {
+        if !host.is_codex {
+            return None;
+        }
+        match as_session_arg(self.args) {
+            Some(s) => Some(SessionId(Arc::from(s))),
+            None => {
+                self.missing
+                    .push(format!("`asSession` ({AS_SESSION_HINT})"));
+                None
+            }
+        }
+    }
+
+    /// One error naming every missing field, plus the keys that were
+    /// given, so a wrong guess at a name is visible at once.
+    fn finish(self) -> Result<(), ToolError> {
+        if self.missing.is_empty() {
+            return Ok(());
+        }
+        let mut msg = format!("{}: missing {}", self.tool, join_and(&self.missing));
+        if let Some(obj) = self.args.as_object().filter(|o| !o.is_empty()) {
+            let given: Vec<String> = obj.keys().map(|k| format!("`{k}`")).collect();
+            msg.push_str(&format!("; got {}", given.join(", ")));
+        }
+        Err(ToolError::invalid_params(msg))
+    }
+}
+
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 fn parse_bool(s: &str) -> bool {
@@ -868,11 +1049,139 @@ where
     cell.own(guard);
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("command response handler dropped".to_string()),
+        Ok(Err(_)) => Err(RESPONSE_DROPPED.to_string()),
         Err(_) => Err(format!(
             "command timed out after {} ms (daemon unresponsive?)",
             timeout.as_millis()
         )),
+    }
+}
+
+/// Run one tool call.
+async fn dispatch_tool(
+    host: &ToolHost,
+    name: &str,
+    args: &Value,
+) -> Result<ToolOutcome, ToolError> {
+    match name {
+        "set_status" => set_status(host, args).await,
+        "send_message" => send_message(host, args).await,
+        "broadcast" => broadcast(host, args).await,
+        "join_room" => join_room(host, args).await,
+        "leave_room" => leave_room(host, args).await,
+        "ack_messages" => ack_messages(host, args).await,
+        other => Err(ToolError {
+            code: METHOD_NOT_FOUND,
+            message: format!("unknown tool: {other}"),
+            data: None,
+        }),
+    }
+}
+
+/// Send this session's row again, from the shim's current copy.
+fn resend_session(host: &ToolHost) {
+    let snapshot = host.session.lock().unwrap().clone();
+    crate::emit_session_set(&host.client, &snapshot, &host.session);
+}
+
+/// How long a write waits for this session to reach the roster.
+const REGISTER_WAIT: Duration = Duration::from_secs(5);
+const REGISTER_POLL: Duration = Duration::from_millis(100);
+/// If the row hasn't landed by then, the session is sent again.
+const REGISTER_RESEND_AFTER: Duration = Duration::from_secs(1);
+
+/// Wait until this session is on the roster, bound to a connection, or
+/// [`REGISTER_WAIT`] passes. Past the wait the write goes ahead anyway, and
+/// the daemon's own refusal reaches the agent.
+async fn wait_until_registered(host: &ToolHost) {
+    let registered = || {
+        let me = host.session.lock().unwrap().id.clone();
+        crate::registered_on_roster(&host.sessions_cell.get(), &me)
+    };
+    let resend = || {
+        log::warn!(
+            "[marshal-shim] session not on the roster {} s after a write began; sending it again",
+            REGISTER_RESEND_AFTER.as_secs()
+        );
+        resend_session(host);
+    };
+    hold_until(
+        registered,
+        resend,
+        REGISTER_RESEND_AFTER,
+        REGISTER_WAIT,
+        REGISTER_POLL,
+    )
+    .await;
+}
+
+/// Poll `ready` until it's true or `limit` passes. Returns whether it became true.
+async fn wait_for(ready: impl Fn() -> bool, limit: Duration, poll: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Wait for `ready` up to `limit`, calling `resend` once if it isn't ready by
+/// `resend_after`. The registration sent on connect is fire-and-forget, and the
+/// background check only re-sends after missing the row on two 5 s ticks, so a
+/// lost first registration would outlast the whole wait without this.
+async fn hold_until(
+    ready: impl Fn() -> bool,
+    resend: impl FnOnce(),
+    resend_after: Duration,
+    limit: Duration,
+    poll: Duration,
+) -> bool {
+    if wait_for(&ready, resend_after, poll).await {
+        return true;
+    }
+    resend();
+    wait_for(&ready, limit.saturating_sub(resend_after), poll).await
+}
+
+/// How long a retried write waits for its re-sent registration to land. The
+/// roster can't tell this connection's binding from an older one, so there's
+/// nothing to poll.
+const UNBOUND_RETRY_AFTER: Duration = Duration::from_millis(750);
+
+/// Whether the daemon refused a write because this connection has no session
+/// bound to it (`resolve_caller`'s refusal), which re-sending the session fixes.
+/// Matched by the daemon's stable code (MAR-18). A daemon from before the code
+/// sends only the text, so that is accepted until every daemon carries the
+/// code; the code is what keeps a later rewording from stopping the retry.
+fn is_unbound_refusal(message: &str) -> bool {
+    marshal_entities::is_unregistered_refusal(message) || message.contains(LEGACY_UNREGISTERED_TEXT)
+}
+
+/// What a daemon before MAR-18 says instead of the code. Remove once no daemon
+/// runs a build older than MAR-18.
+const LEGACY_UNREGISTERED_TEXT: &str = "has no session on the roster";
+
+/// Run `call`; if the daemon refused it as unbound, `resend` the session, wait
+/// `settle`, and run it once more. Any other outcome is returned as it is.
+async fn retry_once_if_unbound<T, Fut>(
+    call: impl Fn() -> Fut,
+    resend: impl FnOnce(),
+    settle: Duration,
+) -> Result<T, ToolError>
+where
+    Fut: std::future::Future<Output = Result<T, ToolError>>,
+{
+    match call().await {
+        Err(e) if is_unbound_refusal(&e.message) => {
+            resend();
+            tokio::time::sleep(settle).await;
+            call().await
+        }
+        other => other,
     }
 }
 
@@ -910,6 +1219,162 @@ mod tests {
         }
     }
 
+    /// MAR-58: whoami and the roster show `activity_at` beside `activity`,
+    /// and a session with no activity (Codex, older Claude) shows neither.
+    #[test]
+    fn whoami_and_roster_show_when_activity_last_changed() {
+        let mut busy = (*session("busy-one")).clone();
+        busy.activity = Some("busy".into());
+        busy.activity_at = Some(1_794_186_070_745);
+        let quiet = session("no-activity");
+        let host = ToolHost {
+            client: Arc::new(MykoClient::new()),
+            pid: 1,
+            cwd: "/repo".into(),
+            is_codex: false,
+            session: Arc::new(Mutex::new(busy.clone())),
+            sessions_cell: Cell::new(vec![Arc::new(busy), quiet]).lock(),
+            rooms_cell: Cell::new(vec![]).lock(),
+            members_cell: Cell::new(vec![]).lock(),
+            nicknames_cell: Cell::new(vec![]).lock(),
+            wake_watchers_cell: Cell::new(vec![]).lock(),
+        };
+
+        let parsed = ParsedUri::parse("marshal://whoami").unwrap();
+        let whoami: Value =
+            serde_json::from_str(&read_whoami(&host, "marshal://whoami", &parsed.query).text)
+                .unwrap();
+        assert_eq!(whoami["activity"], "busy");
+        assert_eq!(whoami["activity_at"], 1_794_186_070_745_i64);
+
+        let roster: Value =
+            serde_json::from_str(&read_roster(&host, "marshal://roster").text).unwrap();
+        let row = |id: &str| {
+            roster["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["session_id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row("busy-one")["activity"], "busy");
+        assert_eq!(row("busy-one")["activity_at"], 1_794_186_070_745_i64);
+        assert!(row("no-activity")["activity"].is_null());
+        assert!(row("no-activity")["activity_at"].is_null());
+    }
+
+    #[test]
+    fn one_error_names_every_missing_field_and_what_was_given() {
+        let args = json!({"room_name": "x"});
+        let mut req = Required::new("broadcast", &args);
+        req.string("to_room", &["room", "room_id"], "room id");
+        req.string("body", &["message", "text"], "");
+        let err = req.finish().unwrap_err();
+        assert_eq!(
+            err.message,
+            "broadcast: missing `to_room` (room id) and `body`; got `room_name`"
+        );
+    }
+
+    #[test]
+    fn common_aliases_stand_in_for_the_field_names() {
+        let args = json!({"room": "everyone", "message": "hi"});
+        let mut req = Required::new("broadcast", &args);
+        assert_eq!(
+            req.string("to_room", &["room", "room_id"], "room id"),
+            "everyone"
+        );
+        assert_eq!(req.string("body", &["message", "text"], ""), "hi");
+        assert!(req.finish().is_ok());
+
+        let args = json!({"current_task": ""});
+        let mut req = Required::new("set_status", &args);
+        assert_eq!(req.string("text", &["current_task", "status"], ""), "");
+        assert!(req.finish().is_ok(), "an empty status still clears");
+    }
+
+    #[test]
+    fn the_canonical_name_wins_over_an_alias() {
+        let args = json!({"body": "real", "message": "alias"});
+        let mut req = Required::new("send_message", &args);
+        assert_eq!(req.string("body", &["message"], ""), "real");
+    }
+
+    #[test]
+    fn a_wrong_type_is_reported_with_the_missing_ones() {
+        let args = json!({"to": 7});
+        let mut req = Required::new("send_message", &args);
+        req.string("to", &[], "session id or nickname");
+        req.string("body", &["message"], "");
+        let err = req.finish().unwrap_err();
+        assert_eq!(
+            err.message,
+            "send_message: missing `to` (session id or nickname; must be a string) and `body`; got `to`"
+        );
+    }
+
+    fn host_for(is_codex: bool) -> ToolHost {
+        ToolHost {
+            client: Arc::new(MykoClient::new()),
+            pid: 1,
+            cwd: "/repo".into(),
+            is_codex,
+            session: Arc::new(Mutex::new((*session("me")).clone())),
+            sessions_cell: Cell::new(vec![]).lock(),
+            rooms_cell: Cell::new(vec![]).lock(),
+            members_cell: Cell::new(vec![]).lock(),
+            nicknames_cell: Cell::new(vec![]).lock(),
+            wake_watchers_cell: Cell::new(vec![]).lock(),
+        }
+    }
+
+    #[test]
+    fn a_codex_call_without_as_session_names_it_with_the_rest() {
+        let args = json!({"to": "peer"});
+        let mut req = Required::new("send_message", &args);
+        req.string("to", &[], "session id or nickname");
+        req.string("body", &["message", "text"], "");
+        assert_eq!(req.caller(&host_for(true)), None);
+        let err = req.finish().unwrap_err();
+        assert_eq!(
+            err.message,
+            format!("send_message: missing `body` and `asSession` ({AS_SESSION_HINT}); got `to`")
+        );
+
+        let args = json!({"to": "peer", "body": "hi", "as_session": "abc"});
+        let mut req = Required::new("send_message", &args);
+        req.string("to", &[], "");
+        req.string("body", &[], "");
+        assert_eq!(
+            req.caller(&host_for(true)),
+            Some(SessionId(Arc::from("abc")))
+        );
+        assert!(req.finish().is_ok());
+    }
+
+    #[test]
+    fn a_call_outside_codex_needs_no_as_session() {
+        let args = json!({"text": "busy"});
+        let mut req = Required::new("set_status", &args);
+        req.string("text", &[], "");
+        assert_eq!(req.caller(&host_for(false)), None);
+        assert!(req.finish().is_ok());
+    }
+
+    #[test]
+    fn ack_ids_take_an_array_or_one_string() {
+        let args = json!({"message_id": "m1"});
+        let mut req = Required::new("ack_messages", &args);
+        assert_eq!(
+            req.string_array("message_ids", &["ids", "message_id"], "array of ids"),
+            vec!["m1"]
+        );
+        assert!(req.finish().is_ok());
+        let err = Required::new("ack_messages", &json!({})).finish();
+        assert!(err.is_ok(), "nothing asked, nothing missing");
+    }
+
     #[test]
     fn response_requirement_defaults_and_rejects_non_booleans() {
         assert!(!response_required(&json!({})).unwrap());
@@ -934,6 +1399,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 0,
             last_activity_at: None,
@@ -944,7 +1410,21 @@ mod tests {
             project: None,
             channels_enabled: None,
             acks_pushes: None,
+            harness: None,
+            identity: None,
         })
+    }
+
+    #[test]
+    fn a_timeout_says_how_to_retry_and_a_refusal_does_not() {
+        let timeout = retry_hint("command timed out after 10000 ms".to_string(), "k1");
+        assert!(timeout.contains("idempotency_key `k1`"), "{timeout}");
+        let dropped = retry_hint(RESPONSE_DROPPED.to_string(), "k2");
+        assert!(dropped.contains("idempotency_key `k2`"), "{dropped}");
+        assert_eq!(
+            retry_hint("no such session".to_string(), "k1"),
+            "no such session"
+        );
     }
 
     #[test]
@@ -1003,6 +1483,25 @@ mod tests {
             wake,
             delivered_live,
         }
+    }
+
+    #[test]
+    fn the_first_inbox_only_send_explains_itself_once() {
+        let explained = std::sync::atomic::AtomicBool::new(false);
+        let send = |live_push| {
+            let mut out = send_message_output(&result(live_push, WakeStatus::Unobserved, false));
+            explain_inbox_delivery_once(&mut out, live_push, &explained);
+            out
+        };
+        assert!(send(LivePushStatus::Delivered).get("note").is_none());
+        let first = send(LivePushStatus::Unavailable);
+        let note = first["note"].as_str().expect("the first one explains");
+        assert!(note.contains("next tool call"), "{note}");
+        assert!(note.contains("`expected`"), "{note}");
+        assert!(
+            send(LivePushStatus::Unavailable).get("note").is_none(),
+            "only once"
+        );
     }
 
     #[test]
@@ -1069,5 +1568,189 @@ mod tests {
         assert_eq!(output["mentioned"].as_array().unwrap().len(), 10);
         assert_eq!(output["mentioned_omitted"], 5);
         assert!(output.get("delivered").is_none());
+    }
+    #[tokio::test]
+    async fn an_early_write_waits_for_registration_then_goes_ahead() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        // Registered on the third look.
+        let ready = wait_for(
+            || polls.fetch_add(1, Ordering::SeqCst) >= 2,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(ready);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn an_early_write_waits_only_so_long() {
+        let started = std::time::Instant::now();
+        let ready = wait_for(
+            || false,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(
+            !ready,
+            "it gives up, and the daemon's own error reaches the agent"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_session_still_missing_after_a_while_is_sent_again_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let ms = std::time::Duration::from_millis;
+        // The first SET was lost: the row only lands once the session is resent.
+        let resent = AtomicBool::new(false);
+        let resends = AtomicUsize::new(0);
+        let ready = hold_until(
+            || resent.load(Ordering::SeqCst),
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+                resent.store(true, Ordering::SeqCst);
+            },
+            ms(50),
+            ms(2000),
+            ms(10),
+        )
+        .await;
+        assert!(ready);
+        assert_eq!(resends.load(Ordering::SeqCst), 1);
+
+        // Already registered: nothing is resent.
+        let resends = AtomicUsize::new(0);
+        let ready = hold_until(
+            || true,
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            ms(50),
+            ms(2000),
+            ms(10),
+        )
+        .await;
+        assert!(ready);
+        assert_eq!(resends.load(Ordering::SeqCst), 0);
+
+        // Never registered: resent once, then it gives up at the limit.
+        let resends = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let ready = hold_until(
+            || false,
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            ms(50),
+            ms(200),
+            ms(10),
+        )
+        .await;
+        assert!(!ready);
+        assert_eq!(resends.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_the_unbound_refusal_is_retried() {
+        // The daemon's own refusal, built by the function it uses (MAR-18).
+        assert!(is_unbound_refusal(&marshal_entities::unregistered_refusal(
+            "abc"
+        )));
+        // The code alone is enough, whatever the wording after it.
+        assert!(is_unbound_refusal(&format!(
+            "{} reworded in some later release",
+            marshal_entities::UNREGISTERED_CODE
+        )));
+        // A daemon from before the code.
+        assert!(is_unbound_refusal(
+            "caller (client abc) has no session on the roster — re-SET your Session and retry"
+        ));
+        for other in [
+            "no session matches 'x' (by id, nickname, operator, or id-prefix) — check marshal://roster",
+            "no recipient: `to` is empty; name a session by nickname, id or operator email (see marshal://roster)",
+            "command timed out after 15000 ms (daemon unresponsive?)",
+        ] {
+            assert!(!is_unbound_refusal(other), "{other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unbound_refusal_resends_and_retries_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let refused = |m: &str| ToolError::invalid_params(m.to_string());
+        let unbound =
+            "caller (client c) has no session on the roster — re-SET your Session and retry";
+        let settle = std::time::Duration::from_millis(5);
+
+        // Refused as unbound, then fine after the re-SET: one resend, two calls.
+        let (calls, resends) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = retry_once_if_unbound(
+            || async {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(refused(unbound))
+                } else {
+                    Ok(7)
+                }
+            },
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            settle,
+        )
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!((calls.into_inner(), resends.into_inner()), (2, 1));
+
+        // Refused as unbound twice: retried only once, and the second refusal
+        // is what the agent sees.
+        let (calls, resends) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out: Result<(), _> = retry_once_if_unbound(
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(refused(unbound))
+            },
+            || {
+                resends.fetch_add(1, Ordering::SeqCst);
+            },
+            settle,
+        )
+        .await;
+        assert!(is_unbound_refusal(&out.unwrap_err().message));
+        assert_eq!((calls.into_inner(), resends.into_inner()), (2, 1));
+
+        // Any other refusal, or success, isn't retried.
+        for succeeds in [false, true] {
+            let (calls, resends) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let _ = retry_once_if_unbound(
+                || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if succeeds {
+                        Ok(1)
+                    } else {
+                        Err(refused("no session matches 'x'"))
+                    }
+                },
+                || {
+                    resends.fetch_add(1, Ordering::SeqCst);
+                },
+                settle,
+            )
+            .await;
+            assert_eq!((calls.into_inner(), resends.into_inner()), (1, 0));
+        }
+    }
+
+    // MAR-43 pinned the daemon's wording here until the refusal had a code.
+    // MAR-18 gave it one: the daemon builds its refusal with
+    // `unregistered_refusal`, and the retry matches the code that starts it.
+    #[test]
+    fn the_daemons_unbound_refusal_is_the_one_retried() {
+        let refusal = marshal_entities::unregistered_refusal("client-1");
+        assert!(refusal.starts_with(marshal_entities::UNREGISTERED_CODE));
+        assert!(is_unbound_refusal(&refusal));
     }
 }
