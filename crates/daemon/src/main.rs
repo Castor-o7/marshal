@@ -113,18 +113,48 @@ async fn main() -> Result<()> {
     // daemon is still usable in dev / CI without a database, and the roster,
     // rooms, and messages regenerate as sessions reconnect. myko-server handles
     // Postgres replay + live-notify internally — no manual replay/watcher here.
-    builder = match PostgresConfig::from_env() {
-        Some(pg) => {
+    //
+    // Without Postgres, `MARSHAL_PERSIST=file` keeps the store in a file in the
+    // state directory instead (MAR-53, from muster's MUS-17; opt-in, so the
+    // default is unchanged).
+    use daemon::file_persister::{FilePersister, PersistMode, resolve_mode};
+    let postgres = PostgresConfig::from_env();
+    let (mode, note) = resolve_mode(
+        postgres.is_some(),
+        std::env::var(daemon::file_persister::ENV).ok().as_deref(),
+    )
+    .map_err(|why| anyhow::anyhow!("marshal-daemon: {why}"))?;
+    if let Some(note) = note {
+        log::warn!("marshal-daemon persistence: {note}");
+    }
+    let mut file_store = None;
+    builder = match (mode, postgres) {
+        (PersistMode::Postgres, Some(pg)) => {
             log::info!(
                 "marshal-daemon persistence: postgres (events table `{}`)",
                 pg.table
             );
             builder.with_postgres(pg)
         }
-        None => {
+        (PersistMode::File, _) => {
+            // The one state directory, shared with the operator's controls (MAR-46).
+            let dir = daemon::controls::state_dir().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "marshal-daemon: the state directory: HOME is not set; set MARSHAL_STATE_DIR"
+                )
+            })?;
+            let opened = FilePersister::open(&dir)
+                .map_err(|e| anyhow::anyhow!("marshal-daemon: the store file: {e}"))?;
+            let persister: Arc<dyn myko::server::Persister> = opened.persister.clone();
+            file_store = Some(opened);
+            builder.with_default_persister(persister)
+        }
+        _ => {
             log::warn!(
                 "marshal-daemon persistence: EPHEMERAL — no MYKO_POSTGRES_URL set; \
-                 roster/rooms/messages will NOT survive a restart"
+                 roster/rooms/messages will NOT survive a restart (set {}=file to keep them in \
+                 the state directory)",
+                daemon::file_persister::ENV
             );
             builder.with_default_persister(blackhole)
         }
@@ -137,6 +167,32 @@ async fn main() -> Result<()> {
     // filter keeps dropping, matching the blackhole default.
     if let Some(handle) = server.postgres_producer.clone() {
         session_filter.bind(Arc::new(handle));
+    }
+    // With the store in a file, load it before anything starts, the sweeper
+    // included, so nothing sees it half-loaded (MAR-53).
+    if let Some(opened) = file_store {
+        session_filter.bind(opened.persister.clone());
+        let (loaded, unparsed) = load_into_stores(&server, opened.folded.events);
+        log::info!(
+            "marshal-daemon persistence: file ({}, {loaded} entities loaded{}){}",
+            opened.path.display(),
+            opened.backup,
+            if opened.folded.torn_tail {
+                "; skipped a last line cut off by a crash"
+            } else {
+                ""
+            }
+        );
+        log::info!(
+            "marshal-daemon persistence: loaded {:?}",
+            opened.folded.counts
+        );
+        if unparsed > 0 {
+            log::error!(
+                "marshal-daemon persistence: {unparsed} stored entities no longer parse and \
+                 weren't loaded; they stay in the file"
+            );
+        }
     }
 
     // The periodic sweeper starts below, once myko has caught up with Postgres
@@ -198,6 +254,36 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+/// Put stored entities straight into myko's stores, as myko's own Postgres
+/// consumer does at boot (`apply_remote_event`): no cascades, which already
+/// ran when they were written, and nothing written back to the store file.
+fn load_into_stores(server: &MykoServer, events: Vec<myko::wire::MEvent>) -> (usize, usize) {
+    let handlers = server.handler_registry();
+    let registry = server.registry();
+    let (mut loaded, mut unparsed) = (0, 0);
+    for event in events {
+        let parsed = handlers
+            .item_parser(&event.item_type)
+            .and_then(|parse| parse(event.item).ok());
+        match parsed {
+            Some(item) => {
+                registry
+                    .get_or_create(item.entity_type())
+                    .insert(item.id(), item);
+                loaded += 1;
+            }
+            None => {
+                log::error!(
+                    "marshal-daemon persistence: a stored {} doesn't parse",
+                    event.item_type
+                );
+                unparsed += 1;
+            }
+        }
+    }
+    (loaded, unparsed)
+}
+
 /// How long a stopping daemon gives held waits to write their replies.
 const STOP_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -250,9 +336,11 @@ Environment:
   MARSHAL_HOOK_BIND  HTTP hook listen address (default {DEFAULT_HOOK_BIND})
   MYKO_POSTGRES_URL  Postgres URL for durable state; without it the daemon
                      runs ephemeral and keeps nothing across a restart
+  MARSHAL_PERSIST    Set to `file`, with no Postgres, to keep messages, read
+                     state and rooms in the state directory across a restart
   MARSHAL_STATE_DIR  The daemon's state directory, for the operator's control
-                     files (default $XDG_STATE_HOME/marshal, else
-                     ~/.local/state/marshal)
+                     files and MARSHAL_PERSIST=file's store (default
+                     $XDG_STATE_HOME/marshal, else ~/.local/state/marshal)
   MARSHAL_FORGET_HOLD_SECS  How long `forget` refuses a session's hooks
                      (default 600)
   RUST_LOG           Log filter (default info)

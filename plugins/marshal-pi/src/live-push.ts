@@ -38,8 +38,19 @@ export async function deliverLivePush(meta: NotifyChannelMeta, who: string, targ
     return;
   }
   // Older daemons send no body: show the inbox instead, and ack it once shown.
+  await deliverWaiting(target);
+}
+
+/**
+ * Show the session's unread mail, and ack it once pi has taken it: for a
+ * push with no body, and on a reconnect, for mail that waited out the drop
+ * (MAR-48). A message a push is handing over is that push's to show. Returns
+ * whether there was anything to show. If the handover throws, the mail stays
+ * unread for the next pull.
+ */
+export async function deliverWaiting(target: Pick<LivePushTarget, "inject" | "pull">): Promise<boolean> {
   const pull = await target.pull().catch(() => null);
-  if (!pull) return;
+  if (!pull) return false;
   try {
     await target.inject(pull.text);
   } catch (e) {
@@ -47,4 +58,5 @@ export async function deliverLivePush(meta: NotifyChannelMeta, who: string, targ
     throw e;
   }
   await pull.commit().catch(() => pull.release());
+  return true;
 }
