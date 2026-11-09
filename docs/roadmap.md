@@ -164,6 +164,37 @@ launcher.
   taken over with its unread mail; the codex conformance cells still pass; and `stable-identity.md`
   says so. Done (#48): verdict tests in `crates/daemon/src/succession.rs`, daemon tests in
   `crates/daemon/tests/identity_succession.rs`.
+- [x] **MAR-62: Supporting: MAR-54's succession tests don't race on the shared bridge observations.**
+  Found on #58's check job (run 42640488345): `a_codex_row_whose_bridge_record_ended_is_taken_over`
+  failed at "the new session takes the name". The race: `succession`'s observations are one
+  process-wide static, and `observe_bridges(current, now)` marks every session it has seen but isn't
+  given as lapsed at `now`, with `or_insert`. The takeover test calls it twice, to see its session
+  with a bridge record and then without one ten minutes ago. If the parallel
+  `a_bridge_watched_codex_sibling_keeps_its_name` calls it with only its own session in between, the
+  takeover test's session is marked lapsed just now. The later call can't move that back, so the
+  grace hasn't passed and there's no takeover. The reverse can happen too: the takeover test's empty
+  call marks the sibling lapsed. A forced interleaving fails the same way. Done when: the tests in
+  that file that feed the observations hold one test-only mutex, daemon code is unchanged, and the
+  file passes repeatedly with `--test-threads` up to 32. Done (#66), merged in 1ae9717.
+- [ ] **MAR-67: Supporting: Tests that need a free or dead port keep it for as long as they use it.**
+  robust-warbler's run 42661142039 failed `spawn_e2e`'s `nothing_is_started_when_the_daemon_cant_be_reached`:
+  it bound port 0 and dropped the listener to get a dead port, and a parallel test's daemon took the
+  port before spawn connected. A survey at 914f06f found the same bind-then-drop pattern in four more
+  places. Done when: a test that needs a dead port holds a socket bound to it without listening, for
+  the whole test, so connecting is still refused and nothing else can bind it (`spawn_e2e`, and
+  doctor's `the_daemon_check_fails_when_nothing_listens`, as `link.rs`'s `refusing_address`). A test
+  that needs a free port binds the listener itself and hands it over (`hook_inbox_framing` through
+  `serve_until`, and the two `tui_proxy` tests straight to `run_tcp_tui_proxy`). The change is
+  test-only, and each test passes a local stress run. Conformance's `restart()` on the same ports is
+  left out: it needs a design call.
+- [ ] **MAR-69: Supporting: Conformance reruns a cell on fresh ports when a restart loses its bind.**
+  Left out of MAR-67: a cell's `restart()` starts the daemon again on the same ports, since the
+  same-address reconnect is what the restart cells test, and a lost bind there panicked the cell. The
+  first start already retried on new ports (MAR-21). Decided by the watchman (2026-11-09): rerun the
+  whole cell. Done when: a restart that finds a port taken unwinds with `RestartLostPorts`, `run_cell`
+  runs the whole cell again on fresh ports (both starts) up to 3 attempts, logging each retry, and
+  fails only when every attempt loses its port. A test forces the loss once (the cell passes on its
+  second run) and every time (it fails after 3). Test-only.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
@@ -182,13 +213,23 @@ launcher.
   Done when: Release's self-hosted jobs and the public CI jobs carry `if: github.repository ==
   'ignition-is-go/marshal'`, and the next merge's Release run on fork main ends skipped, not cancelled.
   Fork-only: never send this hunk upstream as-is.
+- [x] **MAR-63: Supporting: claude_hook's Windows tests read an accepted stream left non-blocking.**
+  Found in rally 0x7 (issues log, 2.1): `windows-native-wake` flakes in
+  `a_replacement_waiter_takes_over_after_the_old_process_releases_its_lock` with WouldBlock (10035)
+  on `stream.read`, because on Windows a stream accepted from a non-blocking listener is
+  non-blocking too. `boundary_listener`'s second accept has the same pattern. Test-only: every other
+  non-blocking listener is handed to tokio, which wants that. Done when: both accepted streams are
+  set back to blocking before they're read, and `windows-native-wake` passes 10 runs in a row on
+  the PR's head. Upstream has the same test, so the fix is its own commit, touching only
+  `crates/shim/tests/claude_hook.rs`, for a later upstream PR if the operator wants one.
+  Done (#67), merged in ea4299f.
 
 ## Later: other harnesses
 
-- [ ] **MAR-10: Later: Plugins ack a push only after the harness takes it.** From MUS-81. Pi, opencode
+- [x] **MAR-10: Later: Plugins ack a push only after the harness takes it.** From MUS-81. Pi, opencode
   and Prime Agent mark a push read as soon as it reaches the connection. Overlaps lobo235's upstream
   plugin PRs: coordinate, don't race. Done when: a push the harness didn't take stays unread for the
-  next drain, in each of the three plugins, with a test each.
+  next drain, in each of the three plugins, with a test each. Done (#33, #36, #37), last merged in 8a1582e.
 - [x] **MAR-11: Dropped: Resuming wakes re-pushes held mail to push sessions.** From MUS-82. Dropped
   with the wake pause ([muster-terminal-gap.md](muster-terminal-gap.md)); reopens only if the pause
   is ported. Marshal has no pause to resume, so there's nothing to fix.
@@ -219,17 +260,24 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
 
 ## Cutover
 
-- [ ] **MAR-59: Cutover: a kit to prove one session on Marshal.** Step 1 of the cutover runbook
+- [x] **MAR-59: Cutover: a kit to prove one session on Marshal.** Step 1 of the cutover runbook
   (rally's docs/cutover.md, RAL-119). Done when: [cutover-test-session.md](cutover-test-session.md)
   gives the project-local wiring, the checks with their expected output, and teardown, checked
   against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
-  doc is marked not yet run.
-- [ ] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
+  doc is marked not yet run. Done (#57), merged in 565688e.
+- [x] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
   `marshal-shim doctor` reads only `~/.claude/settings.json` and `~/.claude.json`, so it can't check a
   session wired by a project-local `.claude/settings.json` and `.mcp.json`, which is how the cutover
   moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
   `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
-  and its exit status unchanged, with tests.
+  and its exit status unchanged, with tests. Done (#58), merged in 2271713.
+- [ ] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
+  step 7 retires Muster "only after a full day with no traffic", which nothing defined. Done when:
+  [muster-no-traffic-check.md](muster-no-traffic-check.md) defines no traffic (no message and no
+  session event for 24 h, and no session registered) and gives a read-only query on the `muster`
+  database, with SELECTs only, for the latest message, the latest session event and the registered
+  sessions; the query has been run once on Murph with its output recorded; and cutover.md links it
+  (RAL-127).
 
 ## Parity with muster (gap survey, 2026-11-08)
 
@@ -240,37 +288,39 @@ muster stories no other entry here names found 23 already in Marshal, 11 portabl
 no-interruption cutover from muster's daemon needs first (rally#195's docs/cutover.md). MUS-92 is in
 MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
 
-- [ ] **MAR-44: Parity: A Claude waiter stands down when its session's id changes.** From MUS-104
+- [x] **MAR-44: Parity: A Claude waiter stands down when its session's id changes.** From MUS-104
   (muster `d96d678`). A `/clear` or compaction re-mints a Claude session's id, but a wait hook started
   before it keeps polling under the old id, so its row never ages out and mail to the old id still finds
   a waiter. Done when: each poll checks Claude's live manifest (`canonical_session_id`, as the shim's
   drift check does), a waiter whose id is no longer the session's exits, nothing changes with no
-  manifest, and a test shows it.
-- [ ] **MAR-45: Parity: Trust a Claude session manifest only if it's live.** From MUS-107 (muster
+  manifest, and a test shows it. Done (#40), merged in b75dbdc.
+- [x] **MAR-45: Parity: Trust a Claude session manifest only if it's live.** From MUS-107 (muster
   `183179e`, `3f42b7a`, `a089b57`). Claude leaves `~/.claude/sessions/<pid>.json` behind when it dies,
   so after the pid is reused another process's shim or waiter takes a dead session's id. Done when:
   discovery and `canonical_session_id` trust a manifest only if it names a live process that started
   when it says (Linux: `procStart` against `/proc/<pid>/stat`; elsewhere `startedAt` with 2 s slack),
-  what can't be read is trusted as today, with tests.
-- [ ] **MAR-46: Parity: The operator can forget a session.** From MUS-105 (muster `69f6e53`, `073bec9`,
+  what can't be read is trusted as today, with tests. Done (#41), merged in 2a7e12d.
+- [x] **MAR-46: Parity: The operator can forget a session.** From MUS-105 (muster `69f6e53`, `073bec9`,
   `3c84895`). A ghost row has no way off the roster but the sweeper. Done when: `marshal-daemon forget
   <id | 8+ char prefix | nickname>` makes the running daemon delete that session's row and refuse its
   hooks for 10 minutes, a target naming no session or several removes nothing, a nickname is resolved
-  once to its id, and tests cover each.
-- [ ] **MAR-47: Parity: Say what a send with no live channel means.** From MUS-99 (muster `9c1a0ca`).
+  once to its id, and tests cover each. Done (#47), merged in f8d609e.
+- [x] **MAR-47: Parity: Say what a send with no live channel means.** From MUS-99 (muster `9c1a0ca`).
   Under hook delivery every send says `live_push: unavailable`, and nothing tells the sender a reply
   will come at the recipient's next turn. Done when: the first such send in a shim carries a `note`
   saying the message waits in the inbox, shows at the recipient's next tool call or prompt, and wakes
   an idle recipient only when `wake` is `expected`; it's said once per shim, with a test.
-- [ ] **MAR-48: Parity: Push plugins get mail that waited out a reconnect.** From MUS-90 (muster
+  Done (#44), merged in e5c4ef9.
+- [x] **MAR-48: Parity: Push plugins get mail that waited out a reconnect.** From MUS-90 (muster
   `d839b97`, `10686af`). Pi, OpenCode and Prime Agent re-register on reconnect but don't pick up direct
   mail sent while they were away, which waits for the next user turn. Done when: after a reconnect each
   plugin shows mail that arrived while it was down, without a new message to trigger it, and a test per
-  plugin shows it. After MAR-10, which touches the same files.
-- [ ] **MAR-49: Parity: One error names every missing tool argument.** From MUS-100 (muster `ca3d6f9`,
+  plugin shows it. After MAR-10, which touches the same files. Done (#49), merged in b125be5.
+- [x] **MAR-49: Parity: One error names every missing tool argument.** From MUS-100 (muster `ca3d6f9`,
   `2d997b3`). Write tools fail one missing field at a time. Done when: one error names every missing or
   mistyped field (Codex's `asSession` too) and the keys given, the common aliases muster accepts stand
   in, the canonical name wins over an alias, the advertised schemas are unchanged, with tests.
+  Done (#59), merged in 8192330.
 - [x] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
   (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the
   old one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is
@@ -285,11 +335,11 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   Marshal, by the operator (2026-11-08: "we'll get macos tests ready when we perform the official swap");
   as for MAR-35, Rally hold 1418. Done when: a `macos-15` job runs the workspace tests on the fork's CI
   and passes. Keep the change to ci.yml small: every story edits it.
-- [ ] **MAR-53: Parity: Keep messages across a daemon restart without Postgres (opt-in).** From MUS-17
+- [x] **MAR-53: Parity: Keep messages across a daemon restart without Postgres (opt-in).** From MUS-17
   (muster `8b4b4c2`, `3dd12aa`, `d6b6cdf`; design in muster's local-persistence-design.md). Without
   Postgres a restart loses every message. Done when: with `MARSHAL_PERSIST=file` an unread message, read
   state and rooms survive a restart with no Postgres, the default is unchanged, and the conformance
-  suite's file-restart cells pass.
+  suite's file-restart cells pass. Done (#55), merged in 4d4d21e.
 
 ## Later: strengthen Marshal
 
@@ -302,6 +352,25 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
   [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), unsent. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
+- [ ] **MAR-66: Later: List what the fork could offer upstream as small additive PRs.** Beside
+  MAR-15, which is the single issue for default changes. From the watchman (2026-11-09), for Josh's
+  upstream decisions; nothing is sent. Done when: [upstream-offers.md](upstream-offers.md) lists
+  each merged fork story that could go upstream with its upstream-shaped commits, whether they
+  cherry-pick cleanly onto upstream `main` (checked with `git cherry-pick --no-commit` in a
+  throwaway worktree), what it's stacked on, and its size; marks default changes as MAR-15's; and
+  names what's fork-only.
+- [ ] **MAR-68: Later: The Codex bridge makes sure it's talking to the app-server it started.**
+  From the watchman's bind-then-drop survey (2026-11-09). `ephemeral_loopback_endpoint()` picks the
+  app-server's port by binding port 0 and closing it, and `wait_for_app_server` took the first TCP
+  connect as ready, so the bridge could talk to another process that took the port while Codex,
+  failing its own bind, exited. Upstream has the same code, so the fix is branched from upstream
+  `main`. Done when: an answer on the port counts only once the app-server has stayed up for a
+  settle window after it (500 ms); an app-server that exits before or just after an answer is
+  started again on a fresh port, up to 3 times, with an error naming every port lost; and tests,
+  with a fake app-server and a foreign listener on the port, show the foreign answer refused, a
+  healthy one accepted, the retry landing on a fresh port, and all three lost. Assumes Codex fails
+  its bind within the settle window; one that took longer would still be trusted. The proxy port
+  the bridge binds itself fails clearly if lost, and isn't retried.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
   `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
@@ -316,21 +385,21 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   them by name. Waits on the operator: licensing is Josh's to raise with upstream. Done when: the
   four crates carry a licence upstream, or the UI drops or replaces them, and the exclusion comes
   out of `deny.toml`.
-- [ ] **MAR-43: Later: Hold a shim's first write until it's registered, and retry one refused as
+- [x] **MAR-43: Later: Hold a shim's first write until it's registered, and retry one refused as
   unregistered.** From MUS-72, MUS-78 and MUS-79. A default change, so it's in MAR-15 for upstream and
   built on the fork first. An agent's first write can beat the shim's registration, or land on a row
   still bound to a dead connection, and the daemon refuses it as unregistered. Done when: a write waits
   up to 5 s for this session's bound row, sends the session again once after 1 s, and a write the
   daemon refuses as unregistered is retried once after sending the session again, with tests. MAR-18
-  then gives that refusal a stable code.
-- [ ] **MAR-18: Later: Stable error code for the unregistered refusal.** From MUS-80. The shim matches
+  then gives that refusal a stable code. Done (#38), merged in 6fb0bfa.
+- [x] **MAR-18: Later: Stable error code for the unregistered refusal.** From MUS-80. The shim matches
   the refusal's text. Done when: the refusal carries a code, the shim matches the code, and a test
-  covers both.
+  covers both. Done (#53), merged in efb1c66.
 - [x] **MAR-19: Later: Drop ended sessions from rooms.** From MUS-58. Done when: a session that ends
   leaves every room it was in, and `everyone` lists only live sessions, with a test.
 - [x] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
   branch unless the session set its own, with a test. Done (#34), in `crates/shim/src/main.rs`.
-- [ ] **MAR-58: Later: The roster says when a session's activity last changed.** The roster's
+- [x] **MAR-58: Later: The roster says when a session's activity last changed.** The roster's
   `activity` (`busy`, `idle` or `shell`, from Claude's per-PID manifest) says what a session is doing
   but not since when, so "idle for a minute" and "idle for an hour" look the same, and
   `last_activity_at` moves only on Marshal traffic. Claude's manifest already records the change as
@@ -340,7 +409,18 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   but has no timestamp; a shim restart or a canonical-id re-register keeps the manifest's time
   rather than resetting it; a session with no `activity` (Codex, older Claude builds) has none;
   everywhere the shim shows `activity` shows `activity_at` beside it (`marshal://roster`, the
-  `roster` tool and `marshal://whoami`); and tests cover each of those cases.
+  `marshal-shim roster` command and `marshal://whoami`); and tests cover each of those cases.
+  Done (#62), merged in e79d35a.
+- [x] **MAR-64: Later: `activity_at` moves when the manifest's time does, not only its activity.**
+  Follow-up to MAR-58, found reading #62. The publish loop pushed `activity_at` only when the
+  `activity` string changed, so a busy→idle→busy flip between two manifest reads kept the older
+  time. Additive, on MAR-58's upstream commit. Done when: the loop also pushes `activity_at`, on
+  its own, when the manifest's `statusUpdatedAt` moves under an unchanged `activity`, tracking the
+  last pushed value beside `pushed_activity`; without a `statusUpdatedAt`, or with no `activity`,
+  nothing is re-pushed; and unit tests cover a changed activity, a flip and back, and each case that
+  pushes nothing. Assumes Claude writes `statusUpdatedAt` only when it sets a status: a build that
+  rewrote the same status with a fresh time, as a heartbeat, would make `activity_at` mean "last
+  status write" rather than "in this activity since". Done (#68), merged in 700a1b2.
 - [x] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: every in-process
   hook listener in the tests takes a socket the test bound to port 0; every port a test's myko
   server or daemon still picks is retried on a lost bind instead of failing; and the e2e and
