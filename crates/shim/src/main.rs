@@ -416,6 +416,11 @@ async fn serve() -> Result<()> {
     };
     let session_name = manifest.as_ref().and_then(|m| m.name.clone());
     let activity = manifest.as_ref().and_then(|m| m.activity.clone());
+    let activity_at = session_discovery::activity_at(
+        activity.as_deref(),
+        manifest.as_ref().and_then(|m| m.status_updated_at),
+        Utc::now().timestamp_millis(),
+    );
     let kind = manifest.and_then(|m| m.kind);
 
     let session = Session {
@@ -428,6 +433,7 @@ async fn serve() -> Result<()> {
         current_task: default_current_task(&cwd, git_branch.as_deref()),
         session_name,
         activity,
+        activity_at,
         kind,
         connected_at: Utc::now().timestamp_millis(),
         last_activity_at: None,
@@ -898,6 +904,7 @@ async fn serve() -> Result<()> {
             // One read, push each field only when it actually changed.
             let manifest = parent_pid_for_publish.and_then(session_discovery::manifest_fields);
             let current_session_name = manifest.as_ref().and_then(|m| m.name.clone());
+            let status_updated_at = manifest.as_ref().and_then(|m| m.status_updated_at);
             let current_activity = manifest.and_then(|m| m.activity);
             if pushed_session_name != current_session_name {
                 let arc_name = current_session_name.as_deref().map(Arc::<str>::from);
@@ -915,15 +922,36 @@ async fn serve() -> Result<()> {
             }
             if pushed_activity != current_activity {
                 let arc_activity = current_activity.as_deref().map(Arc::<str>::from);
-                let _ = client_for_publish
-                    .send_command::<marshal_entities::SetSessionActivity, ()>(
+                log_if_refused(
+                    "activity",
+                    client_for_publish.send_command::<marshal_entities::SetSessionActivity, ()>(
                         &marshal_entities::SetSessionActivity {
                             id: session_id_for_publish.clone(),
                             activity: arc_activity,
                         },
-                    );
+                    ),
+                );
+                // MAR-58: when it changed, pushed right after the activity
+                // itself. A failure is logged, not retried: the next change
+                // or re-register sends it again, and a moment's skew between
+                // the two fields is acceptable.
+                let activity_at = session_discovery::activity_at(
+                    current_activity.as_deref(),
+                    status_updated_at,
+                    Utc::now().timestamp_millis(),
+                );
+                log_if_refused(
+                    "activity_at",
+                    client_for_publish.send_command::<marshal_entities::SetSessionActivityAt, ()>(
+                        &marshal_entities::SetSessionActivityAt {
+                            id: session_id_for_publish.clone(),
+                            activity_at,
+                        },
+                    ),
+                );
                 if let Ok(mut s) = session_for_publish.lock() {
                     s.activity = current_activity.clone();
+                    s.activity_at = activity_at;
                 }
                 pushed_activity = current_activity;
             }
@@ -1503,6 +1531,20 @@ fn detect_project_basename(cwd: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Log a setter the daemon refused or never answered, without holding up the
+/// publish loop or retrying (MAR-58: `activity` and `activity_at` are pushed as
+/// a pair, and either failing is logged).
+fn log_if_refused(
+    field: &'static str,
+    cell: hyphae::Cell<Option<Result<(), String>>, hyphae::CellImmutable>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = tools::await_command(cell, tokio::time::Duration::from_secs(10)).await {
+            log::warn!("[marshal-shim] pushing {field} failed: {e}");
+        }
+    });
+}
+
 /// Default the roster's free-form `current_task` from evidence the shim already
 /// holds at registration, so a busy session is never the unlabeled entry a peer
 /// routes a misdirected request to. Two sources, strongest first: the enclosing
@@ -1820,6 +1862,7 @@ mod tests {
                 current_task: None,
                 session_name: None,
                 activity: None,
+                activity_at: None,
                 kind: None,
                 connected_at: 0,
                 last_activity_at: None,
