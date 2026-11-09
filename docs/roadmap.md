@@ -252,6 +252,15 @@ launcher.
   Design only. Done when: [two-phase-delivery.md](two-phase-delivery.md) sets out the gap and what's
   already safe, proposes offer-then-confirm from the session's own transcript (and the smaller Codex
   gap), and lists what changes, the tests it needs and the questions for the operator (#100).
+- [ ] **MAR-82: Durability: Two-phase delivery for Claude sessions.** The build of MAR-79, with the
+  operator's answers (2026-11-09): confirm "seen" from the session's own transcript; re-offer after
+  6 h unconfirmed (at least once); Claude first, with Codex as its own story; built and proven on
+  the fork first, then offered upstream as one PR in the one-at-a-time queue. Done when: a Claude
+  session's waiter acks mail as offered, not read; a later hook finds the inbox block's ids in the
+  session's transcript (in `user` or `attachment` records, never `enqueue`) and marks it read; an
+  offer unconfirmed at SessionEnd or reap is unread again, so MAR-42 moves it; one unconfirmed for
+  6 h is offered again; and a test kills a session mid-turn and its mail is still unread (MAR-79's
+  check 5).
 
 ## Later: other harnesses
 
