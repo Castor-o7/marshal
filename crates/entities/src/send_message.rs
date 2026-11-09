@@ -580,6 +580,18 @@ pub(crate) fn resolve_mention(
 /// policy is unit-testable without a live command context.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn pick_operator_session(sessions: &[Arc<Session>], op: &str) -> Option<Arc<Session>> {
+    pick_operator_session_at(sessions, op, Utc::now().timestamp_millis())
+}
+
+/// [`pick_operator_session`] at `now_ms`. Clients report `lastActivityAt` themselves, so one later
+/// than now isn't activity: it ranks as none, or it would win the operator's mail for as long as
+/// it stays in the future (MAR-51, from muster's MUS-33).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn pick_operator_session_at(
+    sessions: &[Arc<Session>],
+    op: &str,
+    now_ms: i64,
+) -> Option<Arc<Session>> {
     sessions
         .iter()
         .filter(|s| {
@@ -590,8 +602,48 @@ pub(crate) fn pick_operator_session(sessions: &[Arc<Session>], op: &str) -> Opti
         .cloned()
         .max_by_key(|s| {
             let live = s.client_id.is_some() && s.channels_enabled != Some(false);
-            (live as i64, s.last_activity_at.unwrap_or(s.connected_at))
+            let active = s.last_activity_at.unwrap_or(s.connected_at);
+            (live as i64, if active > now_ms { 0 } else { active })
         })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod operator_routing_tests {
+    use super::*;
+
+    /// Built from JSON so only the fields routing reads are named.
+    fn session(id: &str, last_activity_at: i64) -> Arc<Session> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "pid": 0,
+                "cwd": "/repo",
+                "connectedAt": 0,
+                "lastActivityAt": last_activity_at,
+                "operator": "op@example.test",
+            }))
+            .expect("a session"),
+        )
+    }
+
+    #[test]
+    fn a_future_activity_time_does_not_win_operator_mail() {
+        let now = 10_000_000;
+        let sessions = [
+            session("honest", now - 1_000),
+            session("liar", now + 86_400_000),
+        ];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "honest");
+        // Without the future one, the most recently active still wins, as before.
+        let sessions = [session("older", now - 5_000), session("newer", now - 1_000)];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "newer");
+        // A time exactly now is real activity.
+        let sessions = [session("older", now - 5_000), session("now", now)];
+        let best = pick_operator_session_at(&sessions, "op@example.test", now).expect("a session");
+        assert_eq!(best.id.0.as_ref(), "now");
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
