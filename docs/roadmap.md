@@ -200,6 +200,20 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
 
 MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
 
+## Cutover
+
+- [ ] **MAR-59: Cutover: a kit to prove one session on Marshal.** Step 1 of the cutover runbook
+  (rally's docs/cutover.md, RAL-119). Done when: [cutover-test-session.md](cutover-test-session.md)
+  gives the project-local wiring, the checks with their expected output, and teardown, checked
+  against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
+  doc is marked not yet run.
+- [ ] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
+  `marshal-shim doctor` reads only `~/.claude/settings.json` and `~/.claude.json`, so it can't check a
+  session wired by a project-local `.claude/settings.json` and `.mcp.json`, which is how the cutover
+  moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
+  `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
+  and its exit status unchanged, with tests.
+
 ## Parity with muster (gap survey, 2026-11-08)
 
 Toward the operator's goal of bringing Marshal up to muster's capabilities. A survey of the 62 finished
@@ -240,10 +254,12 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   `2d997b3`). Write tools fail one missing field at a time. Done when: one error names every missing or
   mistyped field (Codex's `asSession` too) and the keys given, the common aliases muster accepts stand
   in, the canonical name wins over an alias, the advertised schemas are unchanged, with tests.
-- [ ] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
-  (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the old
-  one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is only in
-  its current `op:` room, with a test.
+- [x] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
+  (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the
+  old one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is
+  only in its current `op:` room, with a test. Done (#42): each auto-rooms dispatch removes the
+  session from other operators' `op:` rooms; a SET naming no operator leaves them.
+  `crates/daemon/tests/auto_rooms_operator.rs` shows it.
 - [ ] **MAR-51: Parity: A future lastActivityAt doesn't win operator mail.** The plain-mode part of
   MUS-33 (muster `9a0b61c`). Mail to an operator goes to their most active session, and a session can
   claim a far-future `lastActivityAt`. Done when: a `lastActivityAt` later than now doesn't outrank a
@@ -266,7 +282,8 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), a `MARSHAL_PERSIST` other than `file` stops startup (MAR-53: so a typo can't silently lose mail; before, the variable meant nothing), and
   optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
   (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
-  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. Done when: the draft is agreed with the
+  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
+  [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), unsent. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's

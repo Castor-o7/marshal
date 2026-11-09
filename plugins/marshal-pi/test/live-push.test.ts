@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { NotifyChannelMeta } from "../src/entities.ts";
 import { InboxPuller } from "../src/inbox-pull.ts";
-import { deliverLivePush, type LivePushTarget } from "../src/live-push.ts";
+import { deliverLivePush, deliverWaiting, type LivePushTarget } from "../src/live-push.ts";
 
 // A session: the daemon's unread set (a pushed message stays unread until
 // acked, as for a session with acksPushes), pi's injections, and the puller
@@ -144,5 +144,46 @@ describe("deliverLivePush", () => {
     const session = fakeSession([]);
     await deliverLivePush({}, "alice", session.target);
     expect(session.injected).toEqual([]);
+  });
+});
+
+// MAR-48: on a reconnect, the mail that waited out the drop is shown and acked.
+describe("deliverWaiting", () => {
+  test("shows the unread mail and acks it once pi has taken it", async () => {
+    const session = fakeSession(["m1", "m2"]);
+    expect(await deliverWaiting(session.target)).toBe(true);
+    expect(session.injected).toEqual(["m1,m2"]);
+    expect(session.acked).toEqual(["m1", "m2"]);
+  });
+
+  test("shows nothing when nothing is unread", async () => {
+    const session = fakeSession([]);
+    expect(await deliverWaiting(session.target)).toBe(false);
+    expect(session.injected).toEqual([]);
+  });
+
+  test("acks nothing when pi fails to take it, and the next pull shows it", async () => {
+    const session = fakeSession(["m1"], { injectFails: true });
+    await expect(deliverWaiting(session.target)).rejects.toThrow();
+    expect(session.acked).toEqual([]);
+    const pull = await session.puller.pull("s");
+    expect(pull?.text).toBe("m1");
+  });
+
+  test("leaves a message a push is handing over to that push", async () => {
+    const session = fakeSession(["m1", "m2"]);
+    const hold = session.puller.holdPush("s", "m1");
+    expect(await deliverWaiting(session.target)).toBe(true);
+    expect(session.injected).toEqual(["m2"]);
+    hold?.release();
+  });
+
+  test("a push that arrives while the waiting mail is held isn't shown twice", async () => {
+    const session = fakeSession(["m1"]);
+    const pull = await session.puller.pull("s");
+    await deliverLivePush(push("m1"), "alice", session.target);
+    expect(session.injected).toEqual([]);
+    await pull!.commit();
+    expect(session.acked).toEqual(["m1"]);
   });
 });
