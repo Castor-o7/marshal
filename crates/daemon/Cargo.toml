@@ -41,6 +41,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
 sha2 = "0.10"
+# Per-machine pairing (MAR-24): random tokens and invite secrets, and the
+# bearer-token side of myko#129's provider.
+getrandom = "0.3"
+base64 = "0.22"
+myko-auth = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
+futures-util = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # controls.rs checks a control file is owned by the daemon's own user.
@@ -52,8 +58,4 @@ chrono = { workspace = true }
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 hyphae = { workspace = true }
-# myko129_threat_model.rs (MAR-37) switches on myko#129's provider. Same rev as
-# the workspace's myko pin; back to crates.io with it.
-myko-auth = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
 tokio-tungstenite = { workspace = true }
-futures-util = { workspace = true }

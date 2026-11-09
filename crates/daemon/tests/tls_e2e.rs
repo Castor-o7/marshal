@@ -16,6 +16,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -63,6 +64,9 @@ fn try_start() -> Option<Daemon> {
         .env("MARSHAL_HOOK_BIND", "127.0.0.1:0")
         .env("MARSHAL_MYKO_BIND", format!("127.0.0.1:{}", free_port()))
         .env("MARSHAL_STATE_DIR", state.path())
+        // Its own home, so the local token (MAR-24) lands in the temp dir.
+        .env("HOME", state.path().join("home"))
+        .env_remove("XDG_CONFIG_HOME")
         .env("RUST_LOG", "info")
         .env_remove("MYKO_POSTGRES_URL")
         .env_remove("MARSHAL_PERSIST")
@@ -205,14 +209,30 @@ async fn a_pinned_client_reaches_myko_and_the_hooks_through_tls() {
     let written = std::fs::read_to_string(daemon._state.path().join("tls/fingerprint")).unwrap();
     assert_eq!(written.trim(), daemon.fingerprint);
 
-    // myko, through the TLS listener: the upgrade succeeds and a ping is answered.
+    // myko, through the TLS listener: the upgrade succeeds and a ping is
+    // answered. With --tls, myko wants a token (MAR-24): the host's own.
+    let token_path = daemon
+        ._state
+        .path()
+        .join("home/.config/marshal/local-token");
+    assert!(token_path.exists(), "no local token was written");
+    let local_token = std::fs::read_to_string(token_path)
+        .unwrap()
+        .trim()
+        .to_string();
     let tls = tls_connect(daemon.public, &daemon.fingerprint)
         .await
         .unwrap();
-    let (mut ws, response) =
-        tokio_tungstenite::client_async(format!("wss://{}/myko", daemon.public), tls)
-            .await
-            .expect("WebSocket upgrade through TLS");
+    let mut request = format!("wss://{}/myko", daemon.public)
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {local_token}").parse().unwrap(),
+    );
+    let (mut ws, response) = tokio_tungstenite::client_async(request, tls)
+        .await
+        .expect("WebSocket upgrade through TLS");
     assert_eq!(response.status(), 101);
     let ping = serde_json::json!({"event": "ws:m:ping", "data": {"id": "mar-23", "timestamp": 0}});
     ws.send(Message::Text(ping.to_string().into()))

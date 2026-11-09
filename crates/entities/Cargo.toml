@@ -40,6 +40,10 @@ myko = { workspace = true }
 myko-macros = { workspace = true }
 uuid = { version = "1", features = ["v5", "v7"] }
 log = { workspace = true }
+# Fork only (MAR-24): the pairing codes `marshal-daemon pair-code` prints and
+# `marshal-shim pair` reads, and the token hashes both sides compare.
+base64 = "0.22"
+sha2 = "0.10"
 # Only linked under `ts-export` (the macros' `#[derive(ts_rs::TS)]`). Same 12.0.1
 # as myko so the derived `TS` impls match the trait myko's typegen consumes.
 ts-rs = { version = "12.0.1", features = ["serde-json-impl"], optional = true }

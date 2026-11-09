@@ -596,6 +596,9 @@ pub(crate) fn registration_base(daemon: &str) -> String {
     {
         return base.trim_end_matches('/').to_string();
     }
+    if let Some(base) = crate::tls_link::paired_hook_base() {
+        return base;
+    }
     base_from_daemon(daemon)
 }
 
@@ -610,6 +613,10 @@ fn resolve_base(base_override: Option<&str>) -> String {
         && !b.is_empty()
     {
         return b.trim_end_matches('/').to_string();
+    }
+    // A paired machine knows the daemon's hook listener (MAR-24).
+    if let Some(base) = crate::tls_link::paired_hook_base() {
+        return base;
     }
     base_from_daemon(&crate::daemon_address())
 }
@@ -696,9 +703,14 @@ fn http_post_why(
     } else {
         crate::link::Stream::Plain(tcp)
     };
+    // This machine's token, when it has one, for a daemon that checks it
+    // (MAR-81); a plain daemon ignores the header.
+    let authorization = crate::tls_link::bearer()
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         {authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut bytes = req.as_bytes();

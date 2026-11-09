@@ -48,6 +48,9 @@ async fn main() -> Result<()> {
             println!("marshal-daemon {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Some("pair-code") => std::process::exit(pair_code(&args[1..])),
+        Some("unpair") => std::process::exit(unpair(&args[1..])),
+        Some("paired") if args.len() == 1 => std::process::exit(paired()),
         Some("forget") => {
             let target = match args.get(1).and_then(|a| a.to_str()) {
                 Some(t) if args.len() == 2 && !t.trim().is_empty() => t.trim().to_string(),
@@ -86,6 +89,7 @@ async fn main() -> Result<()> {
             }
         }
     }
+    let tls_flag = tls;
     let tls = tls.unwrap_or(false);
     // Before anything builds a rustls config (see `tls::install_provider`).
     daemon::tls::install_provider();
@@ -107,6 +111,63 @@ async fn main() -> Result<()> {
         None
     };
     let myko_bind = tls_front.as_ref().map_or(bind_addr, |front| front.myko);
+
+    // Pairing (MAR-24). With machines paired, running open would hand their
+    // sessions to anyone, so the daemon needs to be told which way to run.
+    // With --tls, every connection needs a paired machine's token or the
+    // host's own local token, checked by myko#129's provider.
+    let state_dir = daemon::controls::state_dir();
+    let pairing_store = state_dir.as_deref().map(daemon::pairing::Store::open);
+    match pairing_store
+        .as_ref()
+        .map(daemon::pairing::Store::any_pairings)
+    {
+        Some(Err(e)) => {
+            eprintln!(
+                "marshal-daemon: can't read the pairings in {}: {e}; refusing to start",
+                state_dir
+                    .as_deref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default()
+            );
+            std::process::exit(2);
+        }
+        Some(Ok(true)) if tls_flag.is_none() => {
+            eprintln!(
+                "marshal-daemon: machines are paired with this daemon, so it won't start \
+                 without being told how: --tls to serve them, or --plain to run open"
+            );
+            std::process::exit(2);
+        }
+        Some(Ok(true)) if !tls => {
+            log::warn!(
+                "marshal-daemon: machines are paired, but --plain was given: running open, and \
+                 the paired machines can't connect"
+            );
+        }
+        _ => {}
+    }
+    let auth_provider = if tls {
+        let config_dir = daemon::pairing::config_dir().ok_or_else(|| {
+            anyhow::anyhow!(
+                "marshal-daemon --tls: no config directory for the local token (set HOME)"
+            )
+        })?;
+        let local = daemon::pairing::ensure_local_token(&config_dir)
+            .context("marshal-daemon --tls: the local token")?;
+        let store = pairing_store
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("marshal-daemon --tls: no state directory (set HOME)"))?
+            .with_local_token(&local);
+        daemon::pairing::install(store.clone());
+        let provider = myko_auth::MykoAuthProvider::new(
+            Arc::new(daemon::pairing::PairingAuthenticator::new(store)),
+            Arc::new(daemon::pairing::AllowAll),
+        );
+        Some(Arc::new(provider))
+    } else {
+        None
+    };
 
     // Force-link entities + sagas so their `inventory` registrations aren't
     // dead-code-eliminated.
@@ -130,6 +191,7 @@ async fn main() -> Result<()> {
         // wait's refreshes shouldn't grow the event table.
         .with_persister_override("WakeWatcher", blackhole.clone())
         .with_persister_override("Session", session_filter.clone())
+        .with_auth_provider(auth_provider)
         .with_server_info(marshal_server_info());
 
     // Persistence: Postgres via myko when `MYKO_POSTGRES_URL` is set — durable,
@@ -448,11 +510,21 @@ to marshal-shim, marshal-tui and the agent plugins.
 
 Usage: marshal-daemon [OPTIONS]
        marshal-daemon forget <SESSION>
+       marshal-daemon pair-code <NAME> [--ttl SECS] [--address HOST:PORT] [--hooks HOST:PORT]
+       marshal-daemon unpair <NAME>
+       marshal-daemon paired
 
 Commands:
   forget SESSION  Ask the running daemon to remove a session from the roster
                   (its id, an 8+ char id prefix, or its nickname) and refuse its
                   hooks for a while, so a stale waiter can't put it back
+  pair-code NAME  Print a one-time code to pair a machine as NAME with a daemon
+                  run with --tls (good for 15 minutes unless --ttl says
+                  otherwise). --address is the daemon as that machine dials it;
+                  else MARSHAL_ADVERTISE, else MARSHAL_BIND. --hooks is its
+                  hook listener; else that host on MARSHAL_HOOK_BIND's port
+  unpair NAME     Forget a paired machine's token; its connections close
+  paired          List the paired machines
 
 Options:
   --tls          Serve TLS on MARSHAL_BIND and MARSHAL_HOOK_BIND with a
@@ -468,6 +540,7 @@ Environment:
   MARSHAL_HOOK_BIND  HTTP hook listen address (default {DEFAULT_HOOK_BIND})
   MARSHAL_MYKO_BIND  With --tls, myko's own listener behind MARSHAL_BIND;
                      loopback only (default {DEFAULT_MYKO_BIND})
+  MARSHAL_ADVERTISE  The host:port paired machines dial, for pair-code
   MYKO_POSTGRES_URL  Postgres URL for durable state; without it the daemon
                      runs ephemeral and keeps nothing across a restart
   MARSHAL_PERSIST    Set to `file`, with no Postgres, to keep messages, read
@@ -544,6 +617,162 @@ fn marshal_server_info() -> ServerInfo {
         // (no I/O); powers the `search` MCP tool.
         operation_index: Arc::new(myko::operation_index::build_operation_index()),
     }
+}
+
+/// `marshal-daemon pair-code <name> [--ttl SECS] [--address HOST:PORT]`.
+fn pair_code(args: &[std::ffi::OsString]) -> i32 {
+    let mut name = None;
+    let mut ttl = daemon::pairing::DEFAULT_INVITE_TTL;
+    let mut address = None;
+    let mut hooks = None;
+    let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--ttl" => match it.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(secs) if secs > 0 => ttl = std::time::Duration::from_secs(secs),
+                _ => return usage_error("--ttl takes a number of seconds"),
+            },
+            "--address" => match it.next() {
+                Some(a) if !a.trim().is_empty() => address = Some(a.trim().to_string()),
+                _ => return usage_error("--address takes host:port"),
+            },
+            "--hooks" => match it.next() {
+                Some(a) if !a.trim().is_empty() => hooks = Some(a.trim().to_string()),
+                _ => return usage_error("--hooks takes host:port"),
+            },
+            a if a.starts_with('-') => return usage_error(&format!("unknown option {a}")),
+            a if name.is_none() => name = Some(a.to_string()),
+            _ => return usage_error("one name"),
+        }
+    }
+    let Some(name) = name else {
+        return usage_error("a machine name");
+    };
+    let Some(state) = daemon::controls::state_dir() else {
+        eprintln!("marshal-daemon pair-code: no state directory (set MARSHAL_STATE_DIR)");
+        return 2;
+    };
+    let fingerprint = match std::fs::read_to_string(
+        daemon::tls::identity_dir(&state).join(daemon::tls::FINGERPRINT_FILE),
+    ) {
+        Ok(text) => text.trim().to_string(),
+        Err(_) => {
+            eprintln!(
+                "marshal-daemon pair-code: no TLS certificate yet in {}: start the daemon with \
+                 --tls once first",
+                state.display()
+            );
+            return 2;
+        }
+    };
+    let address = address
+        .or_else(|| {
+            std::env::var("MARSHAL_ADVERTISE")
+                .ok()
+                .filter(|a| !a.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("MARSHAL_BIND")
+                .ok()
+                .filter(|a| !a.trim().is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_BIND.to_string());
+    if address.starts_with("127.")
+        || address.starts_with("[::1]")
+        || address.starts_with("localhost")
+    {
+        eprintln!(
+            "marshal-daemon pair-code: the code names {address}, which another machine can't \
+             reach; give --address or MARSHAL_ADVERTISE"
+        );
+    }
+    // The hook listener is on the same host as the daemon, on
+    // MARSHAL_HOOK_BIND's port unless --hooks says otherwise.
+    let hooks = hooks.unwrap_or_else(|| {
+        let host = address
+            .rsplit_once(':')
+            .map_or(address.as_str(), |(h, _)| h);
+        let port = std::env::var("MARSHAL_HOOK_BIND")
+            .ok()
+            .and_then(|b| b.rsplit_once(':').map(|(_, p)| p.to_string()))
+            .unwrap_or_else(|| DEFAULT_HOOK_BIND.rsplit_once(':').unwrap().1.to_string());
+        format!("{host}:{port}")
+    });
+    let store = daemon::pairing::Store::open(&state);
+    let secret = match store.add_invite(&name, ttl) {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!("marshal-daemon pair-code: {e}");
+            return 2;
+        }
+    };
+    let invite = marshal_entities::pairing::Invite {
+        address,
+        hooks,
+        fingerprint,
+        invite: secret,
+        name: name.clone(),
+    };
+    println!("{}", invite.to_code());
+    eprintln!(
+        "On {name}: marshal-shim pair <that code>   (good for {} s, once)",
+        ttl.as_secs()
+    );
+    0
+}
+
+fn unpair(args: &[std::ffi::OsString]) -> i32 {
+    let name = match args {
+        [name] => name.to_string_lossy().into_owned(),
+        _ => return usage_error("marshal-daemon unpair <NAME>"),
+    };
+    let Some(state) = daemon::controls::state_dir() else {
+        eprintln!("marshal-daemon unpair: no state directory (set MARSHAL_STATE_DIR)");
+        return 2;
+    };
+    match daemon::pairing::Store::open(&state).remove(&name) {
+        Ok(true) => {
+            println!("unpaired {name}; its connections close within a second");
+            0
+        }
+        Ok(false) => {
+            println!("{name} isn't paired");
+            1
+        }
+        Err(e) => {
+            eprintln!("marshal-daemon unpair: {e}");
+            2
+        }
+    }
+}
+
+fn paired() -> i32 {
+    let Some(state) = daemon::controls::state_dir() else {
+        eprintln!("marshal-daemon paired: no state directory (set MARSHAL_STATE_DIR)");
+        return 2;
+    };
+    match daemon::pairing::Store::open(&state).names() {
+        Ok(names) if names.is_empty() => {
+            println!("no machines are paired");
+            0
+        }
+        Ok(names) => {
+            for name in names {
+                println!("{name}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("marshal-daemon paired: {e}");
+            2
+        }
+    }
+}
+
+fn usage_error(what: &str) -> i32 {
+    eprintln!("marshal-daemon: expected {what}");
+    eprintln!("Try 'marshal-daemon --help'.");
+    2
 }
 
 fn init_logging() {

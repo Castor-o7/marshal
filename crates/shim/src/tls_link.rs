@@ -29,6 +29,13 @@ use sha2::{Digest as _, Sha256};
 pub const PIN_ENV: &str = "MARSHAL_TLS_PIN";
 /// The pin file, in the shim's config directory.
 pub const PIN_FILE: &str = "tls-pin";
+/// The bearer token variable (MAR-24).
+pub const TOKEN_ENV: &str = "MARSHAL_TOKEN";
+/// This machine's pairing, as a code, in the config directory (MAR-24).
+pub const PAIRING_FILE: &str = "pairing";
+/// The daemon host's own token, written by the daemon to its config directory
+/// (MAR-24). A shim on the same host reads it.
+pub const LOCAL_TOKEN_FILE: &str = "local-token";
 
 /// The SNI name sent. The certificate is pinned by fingerprint, so the name
 /// is never checked; it matches the one the daemon puts in its certificate.
@@ -67,6 +74,162 @@ pub fn pin() -> Option<String> {
                 None
             })
         })
+        .or_else(|| load_pairing().map(|p| p.fingerprint))
+}
+
+/// This machine's pairing, if `marshal-shim pair` made one.
+pub fn load_pairing() -> Option<marshal_entities::pairing::Pairing> {
+    crate::config_file_candidates(PAIRING_FILE)
+        .into_iter()
+        .find_map(|path| {
+            let code = std::fs::read_to_string(&path).ok()?;
+            match marshal_entities::pairing::Pairing::from_code(&code) {
+                Ok(pairing) => Some(pairing),
+                Err(e) => {
+                    log::warn!("[marshal-shim] ignoring {}: {e}", path.display());
+                    None
+                }
+            }
+        })
+}
+
+/// The hook listener's base URL from this machine's pairing, if it has one:
+/// `https://<hooks>`, since a paired daemon serves its hooks over TLS.
+pub fn paired_hook_base() -> Option<String> {
+    load_pairing().map(|p| format!("https://{}", p.hooks))
+}
+
+/// The bearer this shim presents to a `--tls` daemon: `MARSHAL_TOKEN`, else
+/// the pairing's token, else the daemon host's local token (same host, same
+/// user). `None` means it presents nothing, which a `--tls` daemon refuses
+/// and a plain one never asks for.
+pub fn bearer() -> Option<String> {
+    if let Some(token) = crate::address_env(TOKEN_ENV) {
+        return Some(token);
+    }
+    if let Some(pairing) = load_pairing() {
+        return Some(pairing.token);
+    }
+    crate::config_file_candidates(LOCAL_TOKEN_FILE)
+        .into_iter()
+        .find_map(|path| {
+            let text = std::fs::read_to_string(path).ok()?;
+            let token = text.lines().next().unwrap_or("").trim();
+            (!token.is_empty()).then(|| token.to_string())
+        })
+}
+
+/// Point `client` at `address`, through the TLS tunnel when it's `wss://`
+/// with a pin, and give it this machine's bearer when there is one.
+pub fn connect(client: &myko::client::MykoClient, address: String) {
+    client.set_address(Some(myko_address(address)));
+    if let Some(token) = bearer()
+        && let Err(e) = client.set_bearer_token(token)
+    {
+        log::warn!("[marshal-shim] can't set the bearer token: {e}");
+    }
+}
+
+/// `marshal-shim pair <code>`: exchange the invite at the daemon's `/pair`,
+/// pinned by the fingerprint in the code, and keep the pairing. Also writes
+/// `daemon-address` and `tls-pin`, so every other command finds the daemon.
+pub fn pair_with_code(code: &str) -> io::Result<String> {
+    use marshal_entities::pairing::{Invite, Pairing};
+    let invite =
+        Invite::from_code(code).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let body = serde_json::json!({ "invite": invite.invite }).to_string();
+    let reply = post_pinned(&invite.hooks, "/pair", &body, &invite.fingerprint)?;
+    let token = serde_json::from_str::<serde_json::Value>(&reply)
+        .ok()
+        .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(str::to_string))
+        .ok_or_else(|| io::Error::other("the daemon's answer had no token"))?;
+    let pairing = Pairing {
+        address: invite.address.clone(),
+        hooks: invite.hooks.clone(),
+        fingerprint: invite.fingerprint.clone(),
+        token,
+        name: invite.name.clone(),
+    };
+    let path = save_config(PAIRING_FILE, &format!("{}\n", pairing.to_code()), true)?;
+    save_config(
+        "daemon-address",
+        &format!("wss://{}\n", invite.address),
+        false,
+    )?;
+    save_config(PIN_FILE, &format!("{}\n", invite.fingerprint), false)?;
+    Ok(format!("{} (kept in {})", pairing.masked(), path.display()))
+}
+
+/// Remove this machine's pairing and what `pair` wrote with it. Returns
+/// whether there was one.
+pub fn remove_pairing() -> io::Result<bool> {
+    let mut removed = false;
+    for name in [PAIRING_FILE, PIN_FILE, "daemon-address"] {
+        for path in crate::config_file_candidates(name) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed |= name == PAIRING_FILE,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn save_config(name: &str, contents: &str, private: bool) -> io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let path = crate::config_file_candidates(name)
+        .into_iter()
+        .next()
+        .ok_or_else(|| io::Error::other("no config directory (is HOME set?)"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(if private { 0o600 } else { 0o644 });
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    options.open(&path)?.write_all(contents.as_bytes())?;
+    Ok(path)
+}
+
+/// A blocking `POST path` to `authority` over TLS pinned by `pin`, with a
+/// JSON body. Returns the reply's body on 2xx.
+fn post_pinned(authority: &str, path: &str, body: &str, pin: &str) -> io::Result<String> {
+    use std::io::Write as _;
+    use std::net::ToSocketAddrs as _;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let addrs: Vec<_> = authority.to_socket_addrs()?.collect();
+    let tcp = crate::link::connect_any(addrs.as_slice(), deadline)
+        .ok_or_else(|| io::Error::other(format!("can't reach the daemon at {authority}")))?;
+    let mut stream = crate::link::Stream::Tls(Box::new(connect_https_pinned(tcp, pin)?));
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.write_all(request.as_bytes())?;
+    match crate::link::read_reply(&mut stream, deadline) {
+        Ok(reply) => Ok(reply.body),
+        Err(crate::link::PostFailure::Status(401)) => Err(io::Error::other(
+            "the daemon refused the code: unknown, already used, or expired",
+        )),
+        Err(crate::link::PostFailure::Status(404)) => Err(io::Error::other(
+            "the daemon isn't running with --tls, so it has no pairing",
+        )),
+        Err(crate::link::PostFailure::Status(status)) => {
+            Err(io::Error::other(format!("the daemon answered {status}")))
+        }
+        Err(crate::link::PostFailure::Unreachable) => {
+            Err(io::Error::other("no usable answer from the daemon"))
+        }
+    }
 }
 
 fn valid_pin(value: &str) -> Option<String> {
@@ -302,6 +465,12 @@ pub fn connect_https(tcp: TcpStream) -> io::Result<HttpsStream> {
             "an https:// hook address needs the daemon's TLS fingerprint in {PIN_ENV} or {PIN_FILE}"
         ))
     })?;
+    connect_https_pinned(tcp, &pin)
+}
+
+/// [`connect_https`] with the pin given.
+pub fn connect_https_pinned(tcp: TcpStream, pin: &str) -> io::Result<HttpsStream> {
+    let pin = pin.to_string();
     let connection = rustls::ClientConnection::new(client_config(&pin)?, server_name())
         .map_err(io::Error::other)?;
     let mut stream = rustls::StreamOwned::new(connection, tcp);

@@ -152,6 +152,12 @@ async fn handle_conn(
         return handle_wait(stream, query, &body, &ctx, stopping).await;
     }
 
+    // Pairing (MAR-24): exchange a one-time invite for a token. Only with a
+    // store, which the daemon has with --tls.
+    if path == "/pair" {
+        return handle_pair(&mut stream, &body).await;
+    }
+
     match hooks::dispatch(path, query, &body, &ctx) {
         Some(outcome) => {
             // A caller that says it will ack (`ack=client`) gets the ids in
@@ -177,6 +183,36 @@ async fn handle_conn(
             Ok(())
         }
         None => write_response(&mut stream, 404, "not found").await,
+    }
+}
+
+/// `POST /pair` with `{"invite": "<secret>"}`: a fresh token for the invite's
+/// name, once. An unknown, spent or expired invite gets 401, and a daemon
+/// with no pairing store (plain mode) 404.
+async fn handle_pair(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    let Some(store) = crate::pairing::store() else {
+        return write_response(stream, 404, "not found").await;
+    };
+    let secret = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("invite").and_then(|s| s.as_str()).map(str::to_string));
+    let Some(secret) = secret.filter(|s| !s.is_empty()) else {
+        return write_response(stream, 400, "expected {\"invite\": \"...\"}").await;
+    };
+    match store.redeem(&secret) {
+        Ok(Some((name, token))) => {
+            log::info!("[pairing] a machine paired as {name} with a one-time invite");
+            let body = serde_json::json!({ "name": name, "token": token }).to_string();
+            write_response(stream, 200, &body).await
+        }
+        Ok(None) => {
+            log::warn!("[pairing] refused an unknown, spent or expired invite");
+            write_response(stream, 401, "unknown, spent or expired invite").await
+        }
+        Err(e) => {
+            log::warn!("[pairing] can't read the invites: {e}");
+            write_response(stream, 500, "can't read the invites").await
+        }
     }
 }
 
