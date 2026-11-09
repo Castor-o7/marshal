@@ -709,13 +709,79 @@ fn spawn_waiter_with(base: &str, config: &std::path::Path, input: &str) -> std::
 }
 
 fn wait_input(event: &str, transcript: &std::path::Path) -> String {
+    wait_input_from(event, "startup", transcript)
+}
+
+fn wait_input_from(event: &str, source: &str, transcript: &std::path::Path) -> String {
     serde_json::json!({
         "session_id": "itest-claude",
         "cwd": "/tmp/proj",
         "hook_event_name": event,
+        "source": source,
         "transcript_path": transcript,
     })
     .to_string()
+}
+
+#[test]
+fn a_session_start_in_the_same_process_doesnt_take_back_offers() {
+    // Claude Code fires SessionStart for `compact` and `clear` too, in the
+    // same process, where a held rewake still lands at the turn's end:
+    // withdrawing it then would show it twice. Only `startup` and `resume`
+    // are a new process.
+    for source in ["compact", "clear"] {
+        let (base, seen) = routed_listener(3, "", &[OFFERED_ID]);
+        let config = temp_config(&format!("no-withdraw-on-{source}"));
+        std::fs::create_dir_all(config.join("marshal")).unwrap();
+        std::fs::write(offered_marker(&config), "").unwrap();
+        let transcript = transcript_with(&config, "enqueue");
+
+        let mut waiter = spawn_waiter_with(
+            &base,
+            &config,
+            &wait_input_from("SessionStart", source, &transcript),
+        );
+        let seen = requests(&seen);
+        let _ = waiter.kill();
+        let _ = waiter.wait();
+
+        assert!(
+            seen.iter()
+                .any(|s| s.request_line.starts_with("POST /hook/offers")),
+            "{source}: it must have looked"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|s| s.request_line.starts_with("POST /hook/ack")),
+            "{source}: withdrew an offer in the same process"
+        );
+    }
+}
+
+#[test]
+fn a_resumed_session_takes_back_offers_its_transcript_doesnt_show() {
+    let (base, seen) = routed_listener(3, "", &[OFFERED_ID]);
+    let config = temp_config("withdraw-on-resume");
+    std::fs::create_dir_all(config.join("marshal")).unwrap();
+    std::fs::write(offered_marker(&config), "").unwrap();
+    let transcript = transcript_with(&config, "enqueue");
+
+    let mut waiter = spawn_waiter_with(
+        &base,
+        &config,
+        &wait_input_from("SessionStart", "resume", &transcript),
+    );
+    let seen = requests(&seen);
+    let _ = waiter.kill();
+    let _ = waiter.wait();
+
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("a withdrawal");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert_eq!(ack["phase"], "withdrawn", "{ack}");
 }
 
 #[test]

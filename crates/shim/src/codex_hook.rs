@@ -202,8 +202,16 @@ pub fn wait_hook(base_override: Option<&str>) {
     let base = resolve_base(base_override);
     let unseen = confirm_seen(&base, sid, transcript.as_deref());
     // A new process for this session: anything still offered and not in its
-    // transcript was lost with the old one (MAR-82).
-    if v.get("hook_event_name").and_then(|e| e.as_str()) == Some("SessionStart") {
+    // transcript was lost with the old one (MAR-82). Only a SessionStart for a
+    // new process counts: Claude Code also fires SessionStart for `compact`
+    // and `clear` in the same process, where a held rewake still lands at the
+    // turn's end, and withdrawing it then would show it twice.
+    let new_process = v.get("hook_event_name").and_then(|e| e.as_str()) == Some("SessionStart")
+        && matches!(
+            v.get("source").and_then(|s| s.as_str()),
+            Some("startup" | "resume")
+        );
+    if new_process {
         withdraw(&base, sid, &unseen);
     }
     let delivered = wait_for_mail(
@@ -342,7 +350,6 @@ fn wait_for_mail(
                     // confirm it from the transcript (MAR-82). A lost ack means
                     // the mail comes again, which beats losing it.
                     if !reply.ack_ids.is_empty() {
-                        mark_offered(session_id);
                         let ack = serde_json::json!({
                             "session_id": session_id,
                             "message_ids": reply.ack_ids,
@@ -354,6 +361,9 @@ fn wait_for_mail(
                                 "marshal-shim watch: couldn't ack delivered mail, so it may arrive again: {e}"
                             );
                         }
+                        // Only now, with the offer recorded (MAR-82): see
+                        // `confirm_seen` on why the order matters.
+                        mark_offered(session_id);
                     }
                     if once {
                         return true;
@@ -434,9 +444,13 @@ fn confirm_seen(base: &str, session_id: &str, transcript: Option<&std::path::Pat
     if !marker.exists() {
         return Vec::new();
     }
-    // A waiter can write the marker for a new offer while this runs. Only a
-    // marker older than this request may be removed, or that offer would wait
-    // out the whole timeout unconfirmed.
+    // A waiter can write the marker for a new offer while this runs. It writes
+    // it only once its offered ack has landed, so a marker older than this
+    // request means every offer it stands for is in the answer below. Only
+    // such a marker may be removed, or a newer offer would wait out the whole
+    // timeout unconfirmed. (This assumes the filesystem keeps mtimes finer
+    // than the gap between a waiter's ack and a hook's request, as ext4,
+    // btrfs and APFS do, to the nanosecond.)
     let asked = std::time::SystemTime::now();
     let body = serde_json::json!({ "session_id": session_id }).to_string();
     let Ok(reply) = http_post_why(base, "/hook/offers", &body, Instant::now() + ACK_TIMEOUT) else {
