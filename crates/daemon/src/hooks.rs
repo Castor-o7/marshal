@@ -105,6 +105,9 @@ const PEER_HANDLE_MAX_UTF16: usize = 128;
 pub struct HookOutcome {
     pub body: String,
     pub deferred_ack: Option<(SessionId, Vec<MessageId>)>,
+    /// 200, or a refusal (MAR-81: 403 when the session belongs to another
+    /// principal).
+    pub status: u16,
 }
 
 impl HookOutcome {
@@ -112,8 +115,47 @@ impl HookOutcome {
         Self {
             body,
             deferred_ack: None,
+            status: 200,
         }
     }
+
+    fn refused(status: u16, body: &str) -> Self {
+        Self {
+            body: body.to_string(),
+            deferred_ack: None,
+            status,
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The verified owner of the token a hook request carried (MAR-81), set
+    /// by the hook listener around `dispatch` and `begin_wait`. Unset in
+    /// plain mode, or when the listener has no pairing store.
+    static CALLER: Option<myko_auth::Principal>;
+}
+
+/// Run `f` with `caller` as the request's verified principal.
+pub fn with_caller<R>(caller: Option<myko_auth::Principal>, f: impl FnOnce() -> R) -> R {
+    CALLER.sync_scope(caller, f)
+}
+
+fn caller() -> Option<myko_auth::Principal> {
+    CALLER.try_with(Clone::clone).ok().flatten()
+}
+
+/// Why a hook for `sid` is refused under auth, if it is: the session belongs
+/// to another principal. Binding happens on registration; this is the check
+/// a later hook makes.
+fn refused_for(sid: &str) -> Option<HookOutcome> {
+    let caller = caller()?;
+    if crate::auth::session_binding::bind(sid, &caller) {
+        return None;
+    }
+    Some(HookOutcome::refused(
+        403,
+        "this session belongs to another machine, so its hooks are refused",
+    ))
 }
 
 /// How long surfaced mail stays out of other readers' way while its reader
@@ -357,6 +399,9 @@ fn handle_session_register(query: &str, body: &[u8], ctx: &Arc<MykoServerContext
     let Some((sid, cmd_ctx)) = register_hook_session(query, body, ctx, Activity::Active) else {
         return HookOutcome::text(String::new());
     };
+    if let Some(refused) = refused_for(&sid) {
+        return refused;
+    }
     let nickname = crate::nickname_assign::ensure_assigned(&cmd_ctx, &sid)
         .unwrap_or_else(|_| marshal_entities::nickname(&sid));
     HookOutcome::text(
@@ -372,6 +417,9 @@ fn handle_session_start(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     let Some((sid, cmd_ctx)) = register_hook_session(query, body, ctx, Activity::Active) else {
         return HookOutcome::text(String::new());
     };
+    if let Some(refused) = refused_for(&sid) {
+        return refused;
+    }
 
     // Inject the agent's own marshal identity for context — recognising
     // itself in the roster, addressing self-sends. Persists in context across
@@ -412,6 +460,7 @@ fn handle_session_start(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     HookOutcome {
         body: out,
         deferred_ack: (!ids.is_empty()).then(|| (SessionId(Arc::from(sid)), ids)),
+        status: 200,
     }
 }
 
@@ -558,9 +607,19 @@ fn register_hook_session(
     if let Err(e) = result {
         log::warn!("[hook] session SET failed for {sid}: {e:?}");
     } else {
-        // A session the hook listener registers belongs to the local
-        // principal, when a binding with one is installed (MAR-80).
-        crate::auth::session_binding::bind_local(&sid);
+        // A session the hook listener registers belongs to the verified
+        // owner of the request's token (MAR-81), or, with no token checked,
+        // to the local principal when a binding with one is installed
+        // (MAR-80). Taken by another principal, the hook is refused by the
+        // handler through `refused_for`; this only records.
+        match caller() {
+            Some(principal) => {
+                crate::auth::session_binding::bind(&sid, &principal);
+            }
+            None => {
+                crate::auth::session_binding::bind_local(&sid);
+            }
+        }
     }
     Some((sid, cmd_ctx))
 }
@@ -574,6 +633,9 @@ fn handle_prompt_submit(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     let Some((sid, cmd_ctx)) = register_hook_session(query, body, ctx, Activity::Active) else {
         return HookOutcome::text(String::new());
     };
+    if let Some(refused) = refused_for(&sid) {
+        return refused;
+    }
 
     let (inbox, ids) = surface_unread(&cmd_ctx, &sid);
     // MUS-3: a session that took a predecessor's nickname over after it
@@ -585,6 +647,7 @@ fn handle_prompt_submit(query: &str, body: &[u8], ctx: &Arc<MykoServerContext>) 
     HookOutcome {
         body,
         deferred_ack: (!ids.is_empty()).then(|| (SessionId(Arc::from(sid)), ids)),
+        status: 200,
     }
 }
 
@@ -605,8 +668,14 @@ pub fn begin_wait(
     query: &str,
     body: &[u8],
     ctx: &Arc<MykoServerContext>,
-) -> Option<(String, CommandContext)> {
-    register_hook_session(query, body, ctx, Activity::Waiting)
+) -> Result<Option<(String, CommandContext)>, HookOutcome> {
+    let Some((sid, cmd_ctx)) = register_hook_session(query, body, ctx, Activity::Waiting) else {
+        return Ok(None);
+    };
+    if let Some(refused) = refused_for(&sid) {
+        return Err(refused);
+    }
+    Ok(Some((sid, cmd_ctx)))
 }
 
 /// How long a `WakeWatcher` counts without being refreshed, which is how long a
@@ -719,6 +788,7 @@ pub fn poll_wait(cmd_ctx: &CommandContext, sid: &str) -> Option<HookOutcome> {
     (!ids.is_empty()).then(|| HookOutcome {
         body: inbox,
         deferred_ack: Some((SessionId(Arc::from(sid)), ids)),
+        status: 200,
     })
 }
 

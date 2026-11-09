@@ -872,7 +872,21 @@ fn http_post_why(
         }
         bytes = &bytes[written..];
     }
-    crate::link::read_reply(&mut stream, deadline)
+    let reply = crate::link::read_reply(&mut stream, deadline);
+    // A refusal by a daemon that checks tokens (MAR-81) is the operator's to
+    // fix, so it's said here, where the hooks run before logging starts.
+    match reply {
+        Err(PostFailure::Status(401)) => eprintln!(
+            "marshal-shim: the daemon's hook listener at {hostport} wants a token it knows: the \
+             daemon host's local-token (config directory) or this machine's pairing (marshal-shim pair)"
+        ),
+        Err(PostFailure::Status(403)) => eprintln!(
+            "marshal-shim: the daemon's hook listener at {hostport} says this session belongs to \
+             another machine"
+        ),
+        _ => {}
+    }
+    reply
 }
 
 fn resolve_within(hostport: String, limit: Duration) -> Option<Vec<SocketAddr>> {
