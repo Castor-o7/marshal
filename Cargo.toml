@@ -20,14 +20,16 @@ notify-debouncer-mini = "0.7"
 futures-util = "0.3"
 tokio-tungstenite = "0.29"
 
-# Myko stack — pulled from crates.io. Stock (no fork patch): ships the
-# HTTP MCP router (POST /myko/mcp request/response + SSE) and the
-# `mcp::filter` tool-visibility allowlist the pull model relies on.
-# Keep the core and code-generating macros on the same release.
-myko = "=6.11.5"
-myko-macros = "=6.11.5"
-myko-server = "=6.11.5"
-myko-leptos = "=6.11.5"
+# Myko stack. Fork only (MAR-37, operator 2026-11-09): pinned to
+# ignition-is-go/myko#129 (trevorsargent's auth PR) by rev, so the fork builds
+# its opt-in auth on myko's own provider. Back to crates.io once #129 is
+# released; never send this hunk upstream. `version` keeps cargo-deny from
+# counting the git pins as wildcards. Keep the core and code-generating
+# macros on the same rev.
+myko = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
+myko-macros = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
+myko-server = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
+myko-leptos = { git = "https://github.com/ignition-is-go/myko", rev = "59db024ac95393be6faa85204ee67646d922ddad", version = "6.11.6" }
 hyphae = "3.1.2"
 
 # Local crates. `version` is required so `cargo publish` accepts the
