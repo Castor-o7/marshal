@@ -1,8 +1,7 @@
 # Cutover kit: prove one session on Marshal (MAR-59)
 
-**Not yet run.** This kit is for step 1 of the cutover runbook (rally's `docs/cutover.md`, RAL-119): "prove
-one session". It's ready to use, but whether and when to run it is Josh's call. Nothing here has been
-started. Fork-only.
+**Run once, on Murph, 2026-11-09 (MAR-70): every check passed.** The record is under [(d) Run 1](#d-run-1-2026-11-09-mar-70), with what it changed in the steps below. This kit is for step 1 of the cutover
+runbook (rally's `docs/cutover.md`, RAL-119): "prove one session". Fork-only.
 
 The goal is one fresh Claude Code session wired only to Marshal, with nothing user-wide changed. It
 must show on Marshal's roster, wake when idle on `marshal-shim tell`, and get its unread mail after
@@ -29,8 +28,10 @@ session opened in the test directory with plain `claude` would run muster's hook
   muster hooks don't run.
 - `--strict-mcp-config --mcp-config .mcp.json` loads only the `marshal` server.
 
-`marshal-shim doctor` reads the user-wide `~/.claude/settings.json`, not the project's, so it can't
-check this session's wiring. The checks below do that instead.
+Run `marshal-shim doctor` in the test directory too. Since MAR-60 it reads a project's own
+`.claude/settings.json` and `.mcp.json` as well, and it should say `ok` for `claude mcp` and `claude hook`.
+Until MAR-71 is deployed, its `daemon` line says FAIL ("answered HTTP 404") against a healthy daemon.
+That's doctor's bug, not the daemon's: `roster` working shows the daemon is fine.
 
 ## (a) Setup
 
@@ -139,16 +140,25 @@ Expected: `tell` prints the session with `in inbox, wake expected but not observ
 honest answer for a hook-delivered session: the waiter is held, but `tell` can't see the wake
 happen. `in inbox, wake not observed` instead means no waiter was held, so stop and check the
 `/hooks` list. Within a few seconds the session wakes by itself and shows the message, prefixed
-`[from a terminal on Murph; it can't receive replies]`, without anyone typing into it.
+`[from a terminal on Murph; it can't receive replies]`, without anyone typing into it. The sender is
+shown under a fresh nickname, a different one for each `tell` (run 1 saw giant-serow, crimson-brill and
+rapid-jackdaw). That nickname belongs to the short-lived `terminal` session each run registers and
+removes on exit (`terminal_send.rs`). It isn't a peer, and the prefix is what tells the session it
+can't reply.
 
 **4. Mail survives a daemon restart.**
 This restarts the live Marshal daemon. On Murph only the test session should be on Marshal at this
 point; check `marshal-shim roster` first, and stop if anyone else is on it. Restarting the daemon is
-the lamplighter's job (cobalt-bream), with Josh's go-ahead.
+the lamplighter's job: ask them, and agree the moment, because the token has to go out first.
 
-1. Make the session busy for a while, so it won't take the mail until its next hook. Prompt it: "Run
-   `sleep 90` in the shell, then tell me it's done."
-2. While it sleeps, send a token, then restart the daemon:
+1. Make the session busy for a while, so it won't take the mail until its next hook. Claude Code
+   blocks a bare foreground `sleep`, and a session asked to sleep may put it in the background and go
+   idle. Either way it takes the mail at once, and the check proves nothing. So prompt it: "For the
+   cutover test I need you busy in one foreground tool call. Run this single Bash command in the
+   foreground with timeout 600000: for i in $(seq 1 40); do date +%T; sleep 10; done. Then say
+   done." Check that the pane shows the command still running before going on.
+2. While it's busy, send a token, then have the daemon restarted. The restart must come after the
+   token:
 
    ```sh
    T="cutover check: survives restart $(date +%s)"
@@ -173,3 +183,35 @@ the time of the restart, rather than going on with the cutover.
 4. Mail the checks sent stays in Marshal's database, as any message does (14-day TTL).
 
 Rollback is nothing more: the user-wide muster wiring was never touched.
+
+## (d) Run 1, 2026-11-09 (MAR-70)
+
+Run by cobalt-bream on Murph, for the watchman (mellow-weevil). Restarts were done by the lamplighter
+(eager-cobra). Claude Code 2.1.319, marshal-shim 0.58.1, marshal-daemon on 15295bb. The test session was
+started in a detached tmux window (`tmux new-session -d -s mar70 …` with the launch line in (a)) and
+driven with `tmux send-keys`. Marshal's roster was empty before it started. Nothing user-wide was
+changed, and muster-daemon wasn't touched.
+
+| Check | Result |
+|---|---|
+| doctor in the test dir | `ok` binary, `ok` claude mcp ("marshal-shim in .mcp.json"), `ok` claude hook ("all five in .claude/settings.json"); **FAIL** daemon: `ws://127.0.0.1:6155 answered HTTP 404 … isn't a Marshal daemon`. The daemon serves its WebSocket at `/myko` only, and doctor probed `/`. That bug is MAR-71 (#79); with it, doctor says `ok daemon accepted a handshake at ws://127.0.0.1:6155/myko` |
+| 1. Only Marshal wired | Pass. `/mcp`: `marshal` (6 tools) and Claude Code's built-in `claude-in-chrome`, and no `muster`. `/hooks`: "5 hooks on 4 events", all `[Project]` |
+| 2. On Marshal's roster | Pass. `elder-caracal /home/joshd/src/marshal-cutover-test waiting bound=True`; not on muster's roster (`muster-shim roster \| grep -c marshal-cutover-test` → 0) |
+| 3. Idle wake | Pass. 13:55:53, `tell` → `in inbox, wake expected but not observed`; the session woke by itself through its Stop hook in a few seconds, and said the message came from a terminal that can't receive replies |
+| 4. Mail survives a restart | Pass, on the second attempt. Token `cutover check: survives restart 1794250728` sent at 13:58:49 while the session was in the foreground loop; daemon restarted at 13:59:08 (PID 603362 → 1195712); after the loop ended at 14:05:01 the session showed the token once. Roster afterwards: `elder-caracal … waiting bound=True`, the same nickname |
+| 3 again | Pass. 14:05:55, the idle session woke on `tell` again |
+| Teardown | 14:07, `/exit`, tmux killed, directory removed; no `marshal-shim` processes left; Marshal's roster empty by 14:08:25 |
+
+What went wrong on the way, and is now in the steps above:
+
+- **The first try at check 4 didn't count.** The `sleep` prompt didn't submit (a long line sent with
+  `tmux send-keys … Enter` sat in the input box), so the session was idle and took the token at once.
+  The restart for it (13:56:48) also came 4 s before the token. A second prompt to `sleep` was run in
+  the background, and a foreground `sleep 480` was refused by Claude Code's harness. The foreground
+  `for … date; sleep 10` loop worked. When driving the session through tmux, send the text and the
+  `Enter` as two `send-keys` calls, and check the pane.
+- **Each `tell` shows a new sender nickname.** That's by design (see check 3), but the kit didn't say,
+  and the session first called each one "a peer".
+- **The kit named the wrong lamplighter**, and said doctor can't read project-local wiring, which
+  stopped being true at MAR-60.
+
