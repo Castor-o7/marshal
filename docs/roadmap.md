@@ -61,6 +61,13 @@ fork's `main`.
   self-hosted runners, which the fork has none of, so every fork run sat queued. Done when: `check` and
   `windows-cross-check` run on `ubuntu-latest` on the fork, Release stays untouched, and it's merged
   (Castor #3).
+- [ ] **MAR-61: Foundation: The wake-leader failover test polls with a delay.** Main's `check` job
+  failed twice in a row (runs 42544039558 and 42544694495) at
+  `bridges_elect_one_wake_leader_and_fail_over`'s "second acquires released wake-leader lock". The
+  test polled 100 times back to back, so a released lock still held for a moment (likely a child
+  another test forked holding a copy of the fd until its exec) outlasted every poll on a hosted
+  runner. Done when: the test sleeps between polls, bounded at about 5 s, and main's `check` job is
+  green on the merge.
 
 ## Goal 1: Codex live delivery
 
