@@ -327,6 +327,17 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   leaves every room it was in, and `everyone` lists only live sessions, with a test.
 - [ ] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
   branch unless the session set its own, with a test.
+- [ ] **MAR-58: Later: The roster says when a session's activity last changed.** The roster's
+  `activity` (`busy`, `idle` or `shell`, from Claude's per-PID manifest) says what a session is doing
+  but not since when, so "idle for a minute" and "idle for an hour" look the same, and
+  `last_activity_at` moves only on Marshal traffic. Claude's manifest already records the change as
+  `statusUpdatedAt`. Additive: a new optional `activity_at` field on `Session`, epoch milliseconds.
+  Done when: the shim sets `activity_at` at registration and with every `activity` push, taking
+  the manifest's `statusUpdatedAt` when it's there and its own clock when the change was seen
+  but has no timestamp; a shim restart or a canonical-id re-register keeps the manifest's time
+  rather than resetting it; a session with no `activity` (Codex, older Claude builds) has none;
+  everywhere the shim shows `activity` shows `activity_at` beside it (`marshal://roster`, the
+  `roster` tool and `marshal://whoami`); and tests cover each of those cases.
 - [x] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: every in-process
   hook listener in the tests takes a socket the test bound to port 0; every port a test's myko
   server or daemon still picks is retried on a lost bind instead of failing; and the e2e and
