@@ -58,6 +58,8 @@ exceptions = [
   { name = "myko-server", allow = ["AGPL-3.0-or-later"] },
   { name = "myko-leptos", allow = ["AGPL-3.0-or-later"] },
   { name = "autosocket", allow = ["AGPL-3.0-or-later"] },
+  # Draft branch only (MAR-37): myko#129 adds this crate, same licence as the rest of myko.
+  { name = "myko-auth", allow = ["AGPL-3.0-or-later"] },
 ]
 
 [bans]

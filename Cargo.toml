@@ -24,10 +24,10 @@ tokio-tungstenite = "0.29"
 # HTTP MCP router (POST /myko/mcp request/response + SSE) and the
 # `mcp::filter` tool-visibility allowlist the pull model relies on.
 # Keep the core and code-generating macros on the same release.
-myko = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4" }
-myko-macros = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4" }
-myko-server = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4" }
-myko-leptos = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4" }
+myko = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4", version = "6.11.6" }
+myko-macros = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4", version = "6.11.6" }
+myko-server = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4", version = "6.11.6" }
+myko-leptos = { git = "https://github.com/ignition-is-go/myko", rev = "fcdbc52bdec5cb59003cf52516be957d2239e6a4", version = "6.11.6" }
 hyphae = "3.1.2"
 
 # Local crates. `version` is required so `cargo publish` accepts the
