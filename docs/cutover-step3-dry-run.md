@@ -1,6 +1,6 @@
 # Cutover step 3, dry run: moving the watchman and the lamplighter to Marshal
 
-**A checklist. Nothing in it has been done.** It prepares step 3 of the cutover runbook (rally's
+**A checklist. The lamplighter's dry run has passed (see "Dry-run results"). Nothing has moved.** It prepares step 3 of the cutover runbook (rally's
 `docs/cutover.md`, RAL-119): "move the watchman and lamplighter first". The watchman (mellow-weevil)
 asked for it on 2026-11-09 (MAR-72). Josh made the switch the rally's goal, to happen when there'll be no interruption, and asked not to be
 asked when. So the watchman confirms readiness, the lamplighter runs the steps, and Josh restarts the
@@ -168,8 +168,40 @@ Give it one prompt: "Say hello, then wait."
 
 - [ ] `/exit` each stand-in.
 - [ ] `marshal-daemon forget <nickname>` for each (MAR-46), or wait for `STALE_AFTER`.
-- [ ] If the move doesn't follow straight away: remove `~/Documents/Caster/.claude/` and `.mcp.json`, and
-      `~/src/lamplighter`, so that a plain restart of the watchman doesn't pick them up.
+- [ ] If the move doesn't follow straight away: remove `~/Documents/Caster/.claude/` and `.mcp.json`, so
+      that a plain restart of the watchman doesn't pick them up. `~/src/lamplighter`'s two files can stay
+      (the lamplighter asked to keep them): nothing starts there except by the launch command above.
+- [ ] Delete `~/.config/marshal/cutover/user-settings-no-hooks.json`. It goes stale whenever
+      `~/.claude/settings.json` changes, so make it again at the move.
+
+## Dry-run results (2026-11-09)
+
+**Lamplighter stand-in: checks 1 to 3 passed.** Run by silken-beetle with eager-cobra's OK, on Claude Code
+2.1.321. The stand-in was `regnal-boulder`, launched from `~/src/lamplighter` with
+`--setting-sources project --settings <copy minus hooks> --strict-mcp-config --mcp-config .mcp.json`, and
+told it was a dry run, not the lamplighter, and to only observe.
+
+| Check | Result |
+|---|---|
+| 1. Only Marshal is wired | `/mcp`: `marshal` (6 tools) and the built-in `claude-in-chrome`, no `muster`. `/hooks`: exactly the five `[Project]` `marshal-shim claude-hook …` hooks. `marshal-shim doctor` in the directory: `ok` for `.mcp.json` and for all five hooks |
+| 2. The user's settings came through | It started in auto mode. `/permissions` → Allow lists `Bash(gh pr merge:*)` and `Bash(git push:*)`. `gh pr merge --help -R Castor-o7/marshal` and `rally show MAR-72` both ran without a prompt. **So `--settings` does apply under `--setting-sources project`**, which was problem 1's open question |
+| 3. On Marshal's roster, not Muster's | `marshal-shim roster`: bound, `wake: waiting`, with its status set. `muster-shim roster`: not there |
+
+Teardown: `/exit`, then `marshal-daemon forget regnal-boulder` (its hooks refused for 600 s), and the
+settings copy deleted. `~/src/lamplighter/.claude/settings.json` and `.mcp.json` were kept for the move.
+
+Found along the way:
+
+- **`marshal-shim doctor`'s daemon check failed** against the live daemon: "ws://127.0.0.1:6155 answered
+  HTTP 404". It probed the bare address, while myko-server 6.11 upgrades only at `/myko`. The daemon was
+  fine: `marshal-shim roster` worked. This is MAR-71 (#79). Until a `marshal-shim` with it is deployed,
+  ignore that one line of check 1.
+- **Claude Code's auto-memory is kept per working directory** (the lamplighter's point). A session started
+  in `~/src/lamplighter` reads `~/.claude/projects/-home-joshd-src-lamplighter/memory/`, which the dry run
+  created empty, not `-home-joshd-src/memory/`. The move carries it: step 4 below.
+- The watchman's directory doesn't change, so its memory (`-home-joshd-Documents-Caster`) comes with it.
+
+Not run yet: checks 4 to 7 for the lamplighter, and any watchman stand-in.
 
 ## The move itself (step 3), once the dry run passes
 
@@ -186,14 +218,21 @@ second, when the lamplighter has confirmed it can reach both rosters from its ne
 3. **Announce on Muster first.** The session broadcasts on Muster: its role, that it's moving to Marshal,
    when it'll be back, and how to reach it meanwhile (the lamplighter, or the other role, relays). Say how
    cross-daemon mail works (problem 3).
-4. **Restart with Marshal's wiring.** For the watchman, Josh does this step. `/exit`, then the launch command above, from the role's directory.
+4. **Carry the lamplighter's memory (the lamplighter only).** The old memory directory,
+   `~/.claude/projects/-home-joshd-src/memory/`, is **shared** by every session started in `~/src`, so it
+   is never moved, linked or edited. Instead, before its restart, the lamplighter names its own entries,
+   by file name (at least `lamplighter-role.md`). It copies just those, with `cp`, not `mv`, into
+   `~/.claude/projects/-home-joshd-src-lamplighter/memory/`. Then it writes that directory's `MEMORY.md`
+   with one pointer line per copied file, taken from the old index. After the move, the new session reads
+   its index and confirms the standing deploy rules are there before it does anything else.
+5. **Restart with Marshal's wiring.** For the watchman, Josh does this step. `/exit`, then the launch command above, from the role's directory.
    Give it the role in its first prompt (or `--resume <old session id>` with the same flags, if its context
    matters more than a clean start; test `--resume` in the dry run first if you plan to use it).
-5. **Announce on Marshal after.** The new session broadcasts on Marshal: its new nickname and the old one.
+6. **Announce on Marshal after.** The new session broadcasts on Marshal: its new nickname and the old one.
    On Muster, the lamplighter (or the other role) posts the new nickname for anyone still there.
-6. **Record the succession.** The watchman (or Josh, when the watchman is the one moving) runs
+7. **Record the succession.** The watchman (or Josh, when the watchman is the one moving) runs
    `rally rally-session add <new nickname> --succeeds <old nickname> --note "cutover step 3"` (RAL-108).
-7. **Run the check again** after a few minutes, for mail that reached the old identity during the move, and
+8. **Run the check again** after a few minutes, for mail that reached the old identity during the move, and
    relay any with `marshal-shim tell <new nickname>`, quoting the sender and when it was sent.
 
 ## Rollback
@@ -202,7 +241,8 @@ The move changes only the two directories. To go back, `/exit` the moved session
 `.claude/settings.json` and `.mcp.json` (or `~/src/lamplighter`), and start it again with plain `claude`. It
 comes back on Muster with the user-wide wiring, which was never touched. Announce the rollback on both
 daemons. Mail sent to it on Marshal stays in the `marshal` database. Read it with `marshal-shim`, or relay
-it by hand.
+it by hand. The lamplighter's copied memory stays in `-home-joshd-src-lamplighter`, where nothing reads it.
+Anything it learned while moved and wants to keep, it copies back by hand.
 
 ## Open questions
 
