@@ -1,9 +1,9 @@
 # Cutover kit: prove one session on Marshal (MAR-59)
 
-**Run once, on Murph, 2026-11-09 (MAR-70): checks 1 to 3 passed, but check 4 as written doesn't test what it says.**
-The session's held wait hook took the token at once, so no mail was unread in the daemon when it
-restarted (see check 4 and [(d) Run 1](#d-run-1-2026-11-09-mar-70)). A check 4 with mail provably
-unread at the restart is MAR-70's rerun. This kit is for step 1 of the cutover
+**Run twice on Murph, 2026-11-09 (MAR-70): every check passes.** Run 1's check 4 didn't test what it
+said: the session's held wait hook took the token before the restart, so nothing was unread in the
+daemon (see [(d) Run 1](#d-run-1-2026-11-09-mar-70)). Check 4 below is the method of
+[(e) Run 2](#e-run-2-2026-11-09-mar-70-check-4-rerun), which showed the mail unread in the database across the restart. This kit is for step 1 of the cutover
 runbook (rally's `docs/cutover.md`, RAL-119): "prove one session". Fork-only.
 
 The goal is one fresh Claude Code session wired only to Marshal, with nothing user-wide changed. It
@@ -151,36 +151,46 @@ can't reply.
 
 **4. Mail survives a daemon restart.**
 
-> **This check, as written, doesn't leave mail unread in the daemon.** The `claude-hook wait` that
-> SessionStart and Stop start has `asyncRewake`, so it keeps running in the background while the
-> session works through a turn. It takes a message as soon as it's sent and acks it (Marshal records
-> a `MessageRead` within a second), and Claude Code holds the message until the turn ends. A busy
-> session therefore doesn't leave the token unread. What the steps below do show is that mail a hook
-> has already taken isn't lost or offered twice across a daemon restart, and that the nickname
-> survives the restart. Mail unread in the daemon across a restart needs a session with no client
-> holding its waiter when the token is sent. Check it in the `marshal` database, read-only: no
-> `MessageRead` for the token before the restart, and one after. MAR-70's rerun does this.
-This restarts the live Marshal daemon. On Murph only the test session should be on Marshal at this
-point; check `marshal-shim roster` first, and stop if anyone else is on it. Restarting the daemon is
-the lamplighter's job: ask them, and agree the moment, because the token has to go out first.
+The token has to be **unread in the daemon** when it restarts, as the `marshal` database shows. A
+session's `claude-hook wait` (started by SessionStart and Stop, with `asyncRewake`) runs in the
+background even during a turn, and takes mail the moment it's sent. So keeping the session busy isn't
+enough: run 1 did that, and the token was taken 19 s before the restart (see (d)). Instead, stop the
+session's waiters so nothing takes the mail, and check the database on both sides of the restart.
 
-1. Make the session busy for a while, so it won't take the mail until its next hook. Claude Code
-   blocks a bare foreground `sleep`, and a session asked to sleep may put it in the background and go
-   idle. Either way it takes the mail at once, and the check proves nothing. So prompt it: "For the
-   cutover test I need you busy in one foreground tool call. Run this single Bash command in the
-   foreground with timeout 600000: for i in $(seq 1 40); do date +%T; sleep 10; done. Then say
-   done." Check that the pane shows the command still running before going on.
-2. While it's busy, send a token, then have the daemon restarted. The restart must come after the
-   token:
+This restarts the live Marshal daemon, which drops every Marshal session for a moment. Check
+`marshal-shim roster` first, and tell anyone else on it. Restarting the daemon is the lamplighter's job:
+ask them. With the waiters stopped the token stays unread, so the moment doesn't need agreeing.
+
+1. With the session idle after its first reply, stop its waiters. They're the `marshal-shim
+   claude-hook wait` children of the session's own `claude` process. Kill only those, not the MCP
+   server (`marshal-shim` with no arguments):
 
    ```sh
-   T="cutover check: survives restart $(date +%s)"
-   MARSHAL_DAEMON_ADDRESS=ws://127.0.0.1:6155 ~/.cargo/bin/marshal-shim tell <nickname> "$T"
-   systemctl --user restart marshal-daemon
+   pstree -p "$(tmux list-panes -t <window> -F '#{pane_pid}')"   # find the session's claude PID
+   ps -o pid,args --ppid <claude PID>   # two `marshal-shim claude-hook wait`, one bare `marshal-shim`
+   kill -TERM <the two wait PIDs>
    ```
-3. Expected: when the sleep finishes, the session's next hook shows the `$T` message, once. After it
-   goes idle again, `marshal-shim roster` shows it with the **same nickname** (MAR-9) and `wake:
-   "waiting"`. Then check 3 passes again.
+
+   `marshal-shim roster` then shows the session with `wake: "none"` and still `bound: true`.
+2. Send a token. `tell` says `in inbox, wake not observed`, and the session doesn't wake:
+
+   ```sh
+   T="cutover check 4: unread across restart $(date +%s)"
+   MARSHAL_DAEMON_ADDRESS=ws://127.0.0.1:6155 ~/.cargo/bin/marshal-shim tell <nickname> "$T"
+   ```
+3. Read the database, read-only. Find the token's message id, and check it has no `MessageRead`:
+
+   ```sh
+   q() { PGOPTIONS='-c default_transaction_read_only=on' psql -h /run/user/$UID/marshal-pg -d marshal -X -A -t -c "$1"; }
+   q "select id, created_at, item_id from myko_events where item_type='Message' and event->'item'->>'body' like '%${T##* }%'"
+   q "select count(*) from myko_events where item_type='MessageRead' and event->'item'->>'messageId'='<item_id>'"   # 0
+   ```
+4. Have the lamplighter run `systemctl --user restart marshal-daemon`. Once it's back, the count in
+   step 3 is still 0, and the roster shows the session `bound: true` again.
+5. Prompt the session, for example "Say hi, and tell me exactly what any peer or terminal messages you
+   just received say". Its UserPromptSubmit hook takes the mail. Expected: the session shows the `$T`
+   message once, the step-3 query now finds exactly one `MessageRead`, dated after the restart, and the
+   roster shows the **same nickname** (MAR-9).
 
 If the message doesn't show, that's a regression: MAR-14's restart cells on Postgres, merged and run in
 CI, show unread mail surviving a restart. Stop there and report it to the watchman, with the token and
@@ -227,4 +237,25 @@ What went wrong on the way, and is now in the steps above:
   and the session first called each one "a peer".
 - **The kit named the wrong lamplighter**, and said doctor can't read project-local wiring, which
   stopped being true at MAR-60.
+
+## (e) Run 2, 2026-11-09 (MAR-70, check 4 rerun)
+
+Run by cobalt-bream on Murph, with the restart by the lamplighter (eager-cobra). Claude Code 2.1.319,
+marshal-shim and marshal-daemon on 98da488 (with MAR-71). The setup was as in (a), in a fresh
+`~/src/marshal-cutover-test`, in tmux session `mar70b`. Marshal's roster was empty before it started.
+
+| Step | Result |
+|---|---|
+| doctor | `ok` binary, `ok daemon accepted a handshake at ws://127.0.0.1:6155/myko`, `ok` claude mcp, `ok` claude hook |
+| Session | `aurora-ibis /home/joshd/src/marshal-cutover-test waiting bound=True` after its first reply |
+| 1. Waiters stopped | 15:13, the two `claude-hook wait` children of the session's `claude` (PID 1630348) sent SIGTERM, leaving the MCP server; roster: `aurora-ibis none True` |
+| 2. Token sent | 15:13:10, `cutover check 4 rerun: unread across restart 1794255190` → `in inbox, wake not observed`; the session didn't wake |
+| 3. Unread before | `Message` event 1189 (created 15:13:10.71), id `01a1c1f1-7ab6-7b93-b529-71d184728a5a`; `MessageRead` for it: **0** |
+| 4. Restart | 15:31:58, PID 1581365 → 1693091. `MessageRead` for it at 15:32:13 and 15:32:15: still **0**; roster `aurora-ibis none True` |
+| 5. Taken after | 15:32:27, prompt sent; `MessageRead` event 1230 at 15:32:27.766, the only one. The session quoted the token verbatim, once, from a sender shown as gusty-dorado (a `tell` terminal session) |
+| Teardown | 15:33, tmux killed, directory removed |
+
+So unread mail kept in the daemon's Postgres store survived a `marshal-daemon` restart, and reached
+the session once, at its next hook, with its nickname kept. This is the check MAR-14's CI cells make,
+now seen on Murph.
 
