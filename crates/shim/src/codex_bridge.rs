@@ -91,6 +91,14 @@ const REGISTRATION_RETRY: Duration = Duration::from_secs(2);
 /// missing from the roster (MUS-76).
 const REREGISTER_COOLDOWN: Duration = Duration::from_secs(5);
 const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the Codex app-server must stay up after something first answers
+/// on its port before the bridge trusts that answer (MAR-68). The port is
+/// picked by binding port 0 and closing it, so another process can take it
+/// first; Codex then fails its own bind and exits, and the answer was the
+/// other process's.
+const APP_SERVER_SETTLE: Duration = Duration::from_millis(500);
+/// Fresh ports the bridge tries before giving up on starting the app-server.
+const APP_SERVER_PORT_ATTEMPTS: usize = 3;
 /// How often the leading bridge tells the daemon, again, which threads it can wake (MAR-12).
 /// Well inside the daemon's two-minute `WakeWatcher` lifetime, which it extends only when due.
 const WATCH_REFRESH: Duration = Duration::from_secs(30);
@@ -1071,19 +1079,20 @@ fn managed_daemon_version_is_behind(encoded: &[u8]) -> bool {
 }
 
 fn launch_isolated_app_server(codex: &str) -> Result<LaunchedAppServer> {
-    let endpoint = ephemeral_loopback_endpoint()?;
-    let mut child = Command::new(codex)
-        .args(["app-server", "--listen", &endpoint])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("starting local Codex app-server via `{codex}`"))?;
-    if let Err(error) = wait_for_app_server(&mut child, &endpoint) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
+    let (endpoint, child) = start_app_server_on_a_free_port(
+        ephemeral_loopback_endpoint,
+        |endpoint| {
+            Command::new(codex)
+                .args(["app-server", "--listen", endpoint])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("starting local Codex app-server via `{codex}`"))
+        },
+        APP_SERVER_START_TIMEOUT,
+        APP_SERVER_SETTLE,
+    )?;
 
     let proxy_endpoint = ephemeral_loopback_endpoint()?;
     Ok(LaunchedAppServer {
@@ -1110,21 +1119,113 @@ fn ephemeral_loopback_endpoint() -> Result<String> {
     Ok(format!("ws://127.0.0.1:{port}"))
 }
 
-fn wait_for_app_server(child: &mut Child, endpoint: &str) -> Result<()> {
-    let address = loopback_address(endpoint)?;
-    let deadline = Instant::now() + APP_SERVER_START_TIMEOUT;
-    loop {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return Ok(());
-        }
-        if let Some(status) = child
+/// The app-server process, as [`start_app_server_on_a_free_port`] needs it:
+/// whether it has exited, and stopping it. A trait so tests can stand in for
+/// Codex, which they don't have.
+trait AppServerChild {
+    /// `Some` with how it ended once it has exited.
+    fn exited(&mut self) -> Result<Option<String>>;
+    fn stop(&mut self);
+}
+
+impl AppServerChild for Child {
+    fn exited(&mut self) -> Result<Option<String>> {
+        Ok(self
             .try_wait()
             .context("checking local Codex app-server")?
-        {
-            anyhow::bail!("local Codex app-server exited before it was ready: {status}");
+            .map(|status| status.to_string()))
+    }
+
+    fn stop(&mut self) {
+        let _ = self.kill();
+        let _ = self.wait();
+    }
+}
+
+/// Why an app-server start didn't come up.
+#[derive(Debug)]
+enum AppServerStart {
+    /// It exited before anything answered on its port, as Codex does when
+    /// its bind fails.
+    ExitedBeforeReady(String),
+    /// Something answered on its port, then it exited: the answer came from
+    /// another process holding the port (MAR-68).
+    ExitedAfterAnAnswer(String),
+    TimedOut,
+    Failed(anyhow::Error),
+}
+
+/// Start the app-server with `spawn` on a port from `pick`, and wait until
+/// it's ready: something answers on the port and the process stays up for
+/// `settle` after. When it exits instead, which is what a lost port looks
+/// like, it's started again on a fresh port, up to
+/// [`APP_SERVER_PORT_ATTEMPTS`] times (MAR-68).
+fn start_app_server_on_a_free_port<C: AppServerChild>(
+    mut pick: impl FnMut() -> Result<String>,
+    mut spawn: impl FnMut(&str) -> Result<C>,
+    timeout: Duration,
+    settle: Duration,
+) -> Result<(String, C)> {
+    let mut lost = Vec::new();
+    for _ in 0..APP_SERVER_PORT_ATTEMPTS {
+        let endpoint = pick()?;
+        let mut child = spawn(&endpoint)?;
+        match wait_for_app_server(&mut child, &endpoint, timeout, settle) {
+            Ok(()) => return Ok((endpoint, child)),
+            Err(AppServerStart::ExitedBeforeReady(status)) => {
+                lost.push(format!("{endpoint}: exited before it was ready ({status})"));
+            }
+            Err(AppServerStart::ExitedAfterAnAnswer(status)) => {
+                lost.push(format!(
+                    "{endpoint}: something answered there, then the app-server exited \
+                     ({status}), so another process holds that port"
+                ));
+            }
+            Err(AppServerStart::TimedOut) => {
+                child.stop();
+                anyhow::bail!("timed out waiting for the local Codex app-server at {endpoint}");
+            }
+            Err(AppServerStart::Failed(error)) => {
+                child.stop();
+                return Err(error);
+            }
+        }
+        child.stop();
+    }
+    anyhow::bail!(
+        "the local Codex app-server didn't start on any of {APP_SERVER_PORT_ATTEMPTS} ports: {}",
+        lost.join("; ")
+    )
+}
+
+fn wait_for_app_server(
+    child: &mut impl AppServerChild,
+    endpoint: &str,
+    timeout: Duration,
+    settle: Duration,
+) -> std::result::Result<(), AppServerStart> {
+    let address = loopback_address(endpoint).map_err(AppServerStart::Failed)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.exited().map_err(AppServerStart::Failed)? {
+            return Err(AppServerStart::ExitedBeforeReady(status));
+        }
+        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            // Trust the answer only once the process outlives the window in
+            // which a failed bind would have ended it.
+            let trusted_at = Instant::now() + settle;
+            loop {
+                if let Some(status) = child.exited().map_err(AppServerStart::Failed)? {
+                    return Err(AppServerStart::ExitedAfterAnAnswer(status));
+                }
+                if Instant::now() >= trusted_at {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for the local Codex app-server at {endpoint}");
+            return Err(AppServerStart::TimedOut);
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -2869,6 +2970,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 1,
             last_activity_at: None,
@@ -2899,6 +3001,150 @@ mod tests {
             body: "hello".into(),
             sent_at: 2,
         })
+    }
+
+    /// Stands in for the Codex app-server (MAR-68): it exits at `exits_at`,
+    /// as Codex does when its bind fails, or stays up.
+    #[derive(Debug)]
+    struct FakeAppServer {
+        exits_at: Option<Instant>,
+        stopped: bool,
+    }
+
+    impl AppServerChild for FakeAppServer {
+        fn exited(&mut self) -> Result<Option<String>> {
+            Ok(self
+                .exits_at
+                .filter(|at| Instant::now() >= *at)
+                .map(|_| "exit status: 1".to_string()))
+        }
+
+        fn stop(&mut self) {
+            self.stopped = true;
+        }
+    }
+
+    fn endpoint_of(listener: &TcpListener) -> String {
+        format!("ws://{}", listener.local_addr().unwrap())
+    }
+
+    #[test]
+    fn an_answer_from_another_process_on_the_port_is_not_the_app_server() {
+        // Another process took the port: it answers, and Codex, failing its
+        // bind, exits a moment later. Before MAR-68 the answer alone counted.
+        let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut codex = FakeAppServer {
+            exits_at: Some(Instant::now() + Duration::from_millis(100)),
+            stopped: false,
+        };
+        let outcome = wait_for_app_server(
+            &mut codex,
+            &endpoint_of(&foreign),
+            Duration::from_secs(5),
+            Duration::from_millis(400),
+        );
+        assert!(
+            matches!(outcome, Err(AppServerStart::ExitedAfterAnAnswer(_))),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_app_server_that_answers_and_stays_up_is_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut codex = FakeAppServer {
+            exits_at: None,
+            stopped: false,
+        };
+        let outcome = wait_for_app_server(
+            &mut codex,
+            &endpoint_of(&listener),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    #[test]
+    fn an_app_server_that_exits_before_answering_is_reported() {
+        let (_held, refused) = held_unlistened_port();
+        let mut codex = FakeAppServer {
+            exits_at: Some(Instant::now()),
+            stopped: false,
+        };
+        let outcome = wait_for_app_server(
+            &mut codex,
+            &format!("ws://{refused}"),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+        assert!(
+            matches!(outcome, Err(AppServerStart::ExitedBeforeReady(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// A port bound but not listening, so a connect is refused and nothing
+    /// else can take it while it's held.
+    fn held_unlistened_port() -> (socket2::Socket, std::net::SocketAddr) {
+        use socket2::{Domain, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let addr = socket.local_addr().unwrap().as_socket().unwrap();
+        (socket, addr)
+    }
+
+    #[test]
+    fn a_lost_port_is_given_up_for_a_fresh_one() {
+        // The first port is held by another process; the second is free, and
+        // the app-server started on it comes up.
+        let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut ports = vec![endpoint_of(&ours), endpoint_of(&foreign)];
+        let mut started = Vec::new();
+        let (endpoint, child) = start_app_server_on_a_free_port(
+            || Ok(ports.pop().unwrap()),
+            |endpoint: &str| {
+                started.push(endpoint.to_string());
+                let lost = endpoint == endpoint_of(&foreign);
+                Ok(FakeAppServer {
+                    exits_at: lost.then(|| Instant::now() + Duration::from_millis(100)),
+                    stopped: false,
+                })
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(400),
+        )
+        .unwrap();
+        assert_eq!(endpoint, endpoint_of(&ours));
+        assert_eq!(started, [endpoint_of(&foreign), endpoint_of(&ours)]);
+        assert!(!child.stopped);
+    }
+
+    #[test]
+    fn every_port_lost_is_an_error_naming_each() {
+        let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+        let error = start_app_server_on_a_free_port(
+            || Ok(endpoint_of(&foreign)),
+            |_: &str| {
+                Ok(FakeAppServer {
+                    exits_at: Some(Instant::now() + Duration::from_millis(50)),
+                    stopped: false,
+                })
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("didn't start on any of 3 ports"), "{error}");
+        assert_eq!(
+            error.matches("another process holds that port").count(),
+            3,
+            "{error}"
+        );
     }
 
     #[test]
@@ -3593,9 +3839,12 @@ mod tests {
             .await
             .unwrap();
         let app_address = app_listener.local_addr().unwrap();
-        let reserved = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let proxy_address = reserved.local_addr().unwrap();
-        drop(reserved);
+        // Bound here and handed to the proxy, so no parallel test can take the
+        // port between finding it and binding it (MAR-67).
+        let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("launcher.json");
         let launcher = Arc::new(tokio::sync::Mutex::new(LauncherStateWriter::new(
@@ -3604,15 +3853,11 @@ mod tests {
             None,
         )));
 
-        let proxy = spawn_tui_proxy(
-            Some(AppServerEndpoint::WebSocket(format!(
-                "ws://{proxy_address}"
-            ))),
-            AppServerEndpoint::WebSocket(format!("ws://{app_address}")),
+        let proxy = tokio::spawn(run_tcp_tui_proxy(
+            proxy_listener,
+            format!("ws://{app_address}"),
             Some(launcher),
-        )
-        .await
-        .unwrap();
+        ));
         let app_server = tokio::spawn(async move {
             let (stream, _) = app_listener.accept().await.unwrap();
             let mut websocket = accept_async(stream).await.unwrap();
@@ -3677,9 +3922,12 @@ mod tests {
             .await
             .unwrap();
         let app_address = app_listener.local_addr().unwrap();
-        let reserved = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let proxy_address = reserved.local_addr().unwrap();
-        drop(reserved);
+        // Bound here and handed to the proxy, so no parallel test can take the
+        // port between finding it and binding it (MAR-67).
+        let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("launcher.json");
         let launcher = Arc::new(tokio::sync::Mutex::new(LauncherStateWriter::new(
@@ -3688,15 +3936,11 @@ mod tests {
             None,
         )));
 
-        let proxy = spawn_tui_proxy(
-            Some(AppServerEndpoint::WebSocket(format!(
-                "ws://{proxy_address}"
-            ))),
-            AppServerEndpoint::WebSocket(format!("ws://{app_address}")),
+        let proxy = tokio::spawn(run_tcp_tui_proxy(
+            proxy_listener,
+            format!("ws://{app_address}"),
             Some(launcher),
-        )
-        .await
-        .unwrap();
+        ));
         let app_server = tokio::spawn(async move {
             let (stream, _) = app_listener.accept().await.unwrap();
             let mut websocket = accept_async(stream).await.unwrap();

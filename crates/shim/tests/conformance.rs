@@ -217,10 +217,20 @@ impl Daemon {
         cmd
     }
 
-    /// Start it again on the same ports, as a restart does.
+    /// Start it again on the same ports, as a restart does. If another
+    /// process took one of them while it was down, it can't be started on
+    /// them again, and the cell's same-address reconnect can't be tested on
+    /// these ports. So it unwinds with [`RestartLostPorts`], and `run_cell`
+    /// runs the whole cell again on fresh ports (MAR-69).
     fn spawn(&mut self) {
-        if let Err(log) = self.try_spawn() {
-            panic!("marshal-daemon didn't come up; log:\n{log}");
+        match self.try_spawn() {
+            Ok(()) => {}
+            Err(log) if log.contains("in use") => {
+                let ports = format!("{} {} {}", self.bind, self.hook, self.myko);
+                eprintln!("marshal-daemon lost its ports ({ports}) across a restart; log:\n{log}");
+                std::panic::panic_any(RestartLostPorts(ports));
+            }
+            Err(log) => panic!("marshal-daemon didn't come up; log:\n{log}"),
         }
     }
 
@@ -1907,10 +1917,6 @@ const MARSHAL_NOT_APPLICABLE: &[(&str, &str)] = &[
         "resume-wakes-held-mail",
         "Marshal has no operator pause to resume (MUS-10)",
     ),
-    (
-        "unread-mail-follows-a-restart",
-        "Marshal doesn't hand a successor its predecessor's mail yet (muster's MUS-47)",
-    ),
 ];
 
 const TLS_EXCLUDED: &str = "Marshal has no TLS gate yet (MAR-23); runs as plain mode would";
@@ -2106,8 +2112,8 @@ fn unread_mail_follows_a_restart(c: &mut Cell) -> Result<(), String> {
 /// Scenario 12 (MUS-3): A second session in the same working directory,
 /// while the first is live, gets a nickname of its own, and the first keeps
 /// its nickname past the quiet time. For Codex the first is an idle thread
-/// with no client, which the daemon can't tell from a dead one until MUS-77,
-/// so it must never be taken over.
+/// with no client: only a bridge record that has since ended (MAR-54) lets
+/// the daemon take it over, so it must keep its name here.
 fn live_sibling_keeps_its_name(c: &mut Cell) -> Result<(), String> {
     c.harness.arm_idle();
     let first = c.recipient();
@@ -2267,6 +2273,13 @@ const OPENCODE_NOT_APPLICABLE: &[(&str, &str)] = &[
     ),
 ];
 
+/// The unwind from [`Daemon::spawn`] when a restart finds one of its ports
+/// taken, naming them (`bind hook myko`).
+struct RestartLostPorts(String);
+
+/// How many times a cell is run before ports lost across its restart fail it.
+const RESTART_ATTEMPTS: usize = 3;
+
 enum Outcome {
     Pass,
     Fail(String),
@@ -2308,41 +2321,63 @@ fn run_cell(harness: &Harness, scenario: Scenario, name: &str) -> Outcome {
         .iter()
         .find(|(h, s, _)| *h == harness.name && *s == name)
         .map(|(_, _, story)| *story);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut cell = Cell::new(
-            harness.mode,
-            (harness.make)(),
-            postgres.as_deref(),
-            FILE_SCENARIOS.contains(&name),
-        );
-        let result = scenario(&mut cell);
-        // CONFORMANCE_DAEMON_LOG=1 prints it for passing cells too.
-        if std::env::var_os("CONFORMANCE_DAEMON_LOG").is_some() && result.is_ok() {
-            eprintln!(
-                "--- {} / {name} passed\n--- daemon log:\n{}--- end of daemon log",
-                harness.name,
-                daemon_log_excerpt(&cell.daemon.log())
+    let mut lost = Vec::new();
+    let result = loop {
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cell = Cell::new(
+                harness.mode,
+                (harness.make)(),
+                postgres.as_deref(),
+                FILE_SCENARIOS.contains(&name),
             );
+            let result = scenario(&mut cell);
+            // CONFORMANCE_DAEMON_LOG=1 prints it for passing cells too.
+            if std::env::var_os("CONFORMANCE_DAEMON_LOG").is_some() && result.is_ok() {
+                eprintln!(
+                    "--- {} / {name} passed\n--- daemon log:\n{}--- end of daemon log",
+                    harness.name,
+                    daemon_log_excerpt(&cell.daemon.log())
+                );
+            }
+            if let Err(e) = &result {
+                // CI keeps no daemon logs, so a failure (FLAKY ones too) prints
+                // the daemon's identity and hook lines, where a missed takeover
+                // or a lost delivery shows its cause (MUS-93).
+                eprintln!(
+                    "--- {} / {name} failed: {e}\n--- daemon log ([identity], [hook], warnings):\n{}--- end of daemon log",
+                    harness.name,
+                    daemon_log_excerpt(&cell.daemon.log())
+                );
+            }
+            result
+        }));
+        match attempt {
+            Ok(result) => break result,
+            Err(panic) => match panic.downcast::<RestartLostPorts>() {
+                Ok(ports) => {
+                    lost.push(ports.0);
+                    if lost.len() == RESTART_ATTEMPTS {
+                        break Err(format!(
+                            "marshal-daemon lost its ports across the restart on all {RESTART_ATTEMPTS} attempts: {lost:?}"
+                        ));
+                    }
+                    eprintln!(
+                        "--- {} / {name}: the restart lost its ports ({}), so the cell runs again on fresh ports, attempt {} of {RESTART_ATTEMPTS}",
+                        harness.name,
+                        lost.last().unwrap(),
+                        lost.len() + 1
+                    );
+                }
+                Err(panic) => {
+                    break Err(panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "panicked".into()));
+                }
+            },
         }
-        if let Err(e) = &result {
-            // CI keeps no daemon logs, so a failure (FLAKY ones too) prints
-            // the daemon's identity and hook lines, where a missed takeover
-            // or a lost delivery shows its cause (MUS-93).
-            eprintln!(
-                "--- {} / {name} failed: {e}\n--- daemon log ([identity], [hook], warnings):\n{}--- end of daemon log",
-                harness.name,
-                daemon_log_excerpt(&cell.daemon.log())
-            );
-        }
-        result
-    }))
-    .unwrap_or_else(|panic| {
-        Err(panic
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_else(|| "panicked".into()))
-    });
+    };
     if let Some(story) = flaky {
         return Outcome::Flaky(story, result.is_ok());
     }
@@ -2398,6 +2433,55 @@ fn every_flaky_cell_is_in_the_grid() {
             "{scenario} ({story})"
         );
     }
+}
+
+static TAKEN_ONCE_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TAKEN_ALWAYS_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Restart the daemon, with its WebSocket port taken while it's down when `take`.
+fn restart_with_port_taken(c: &mut Cell, take: bool) {
+    c.daemon.stop();
+    let _taken = take.then(|| TcpListener::bind(("127.0.0.1", c.daemon.bind)).unwrap());
+    c.daemon.spawn();
+}
+
+/// A cell whose first run loses its port across the restart, and whose
+/// second doesn't.
+fn loses_its_port_once(c: &mut Cell) -> Result<(), String> {
+    let run = TAKEN_ONCE_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    restart_with_port_taken(c, run == 0);
+    Ok(())
+}
+
+/// A cell that loses its port across the restart every time.
+fn always_loses_its_port(c: &mut Cell) -> Result<(), String> {
+    TAKEN_ALWAYS_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    restart_with_port_taken(c, true);
+    Ok(())
+}
+
+/// MAR-69: a restart that finds its port taken runs the whole cell again on
+/// fresh ports, and fails only when every attempt loses it.
+#[test]
+#[ignore = "needs `cargo build --workspace` first; run with --ignored"]
+fn a_restart_that_loses_its_port_runs_the_cell_again() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let harness = &HARNESSES[0];
+    assert!(matches!(
+        run_cell(harness, loses_its_port_once, "test-loses-its-port-once"),
+        Outcome::Pass
+    ));
+    assert_eq!(
+        TAKEN_ONCE_RUNS.load(SeqCst),
+        2,
+        "run once more, then passed"
+    );
+
+    match run_cell(harness, always_loses_its_port, "test-always-loses-its-port") {
+        Outcome::Fail(e) => assert!(e.contains("on all 3 attempts"), "{e}"),
+        _ => panic!("losing the port every time should fail the cell"),
+    }
+    assert_eq!(TAKEN_ALWAYS_RUNS.load(SeqCst), RESTART_ATTEMPTS);
 }
 
 #[test]

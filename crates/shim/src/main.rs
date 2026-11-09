@@ -416,6 +416,11 @@ async fn serve() -> Result<()> {
     };
     let session_name = manifest.as_ref().and_then(|m| m.name.clone());
     let activity = manifest.as_ref().and_then(|m| m.activity.clone());
+    let activity_at = session_discovery::activity_at(
+        activity.as_deref(),
+        manifest.as_ref().and_then(|m| m.status_updated_at),
+        Utc::now().timestamp_millis(),
+    );
     let kind = manifest.and_then(|m| m.kind);
 
     let session = Session {
@@ -428,6 +433,7 @@ async fn serve() -> Result<()> {
         current_task: default_current_task(&cwd, git_branch.as_deref()),
         session_name,
         activity,
+        activity_at,
         kind,
         connected_at: Utc::now().timestamp_millis(),
         last_activity_at: None,
@@ -660,8 +666,17 @@ async fn serve() -> Result<()> {
                 if current == last_branch {
                     return;
                 }
-                last_branch = current.clone();
-                let id = session_for_watch.lock().unwrap().id.clone();
+                let previous_branch = std::mem::replace(&mut last_branch, current.clone());
+                let (id, followed) = {
+                    let s = session_for_watch.lock().unwrap();
+                    let followed = followed_current_task(
+                        &cwd_for_watch,
+                        previous_branch.as_deref(),
+                        current.as_deref(),
+                        s.current_task.as_deref(),
+                    );
+                    (s.id.clone(), followed)
+                };
                 let arc_branch = current.as_deref().map(Arc::<str>::from);
                 let _ = client_for_watch.send_command::<marshal_entities::SetSessionGitBranch, ()>(
                     &marshal_entities::SetSessionGitBranch {
@@ -669,8 +684,20 @@ async fn serve() -> Result<()> {
                         git_branch: arc_branch,
                     },
                 );
+                if let Some(task) = &followed {
+                    let _ = client_for_watch
+                        .send_command::<marshal_entities::SetSessionCurrentTask, ()>(
+                            &marshal_entities::SetSessionCurrentTask {
+                                id: session_for_watch.lock().unwrap().id.clone(),
+                                current_task: task.as_deref().map(Arc::<str>::from),
+                            },
+                        );
+                }
                 if let Ok(mut s) = session_for_watch.lock() {
                     s.git_branch = current;
+                    if let Some(task) = followed {
+                        s.current_task = task;
+                    }
                 }
                 log::info!(
                     "[marshal-shim] git branch changed -> {last_branch:?}; pushed to roster"
@@ -782,6 +809,10 @@ async fn serve() -> Result<()> {
             session_for_publish.lock().unwrap().session_name.clone();
         let mut pushed_activity: Option<String> =
             session_for_publish.lock().unwrap().activity.clone();
+        // The `activity_at` (MAR-58) last pushed with it, seeded the same way;
+        // not `pushed_activity_at`, which tracks `last_activity_at`.
+        let mut pushed_activity_changed_at: Option<i64> =
+            session_for_publish.lock().unwrap().activity_at;
         // Consecutive ticks our own session was absent from the roster.
         let mut missing_from_roster: u32 = 0;
         loop {
@@ -877,6 +908,7 @@ async fn serve() -> Result<()> {
             // One read, push each field only when it actually changed.
             let manifest = parent_pid_for_publish.and_then(session_discovery::manifest_fields);
             let current_session_name = manifest.as_ref().and_then(|m| m.name.clone());
+            let status_updated_at = manifest.as_ref().and_then(|m| m.status_updated_at);
             let current_activity = manifest.and_then(|m| m.activity);
             if pushed_session_name != current_session_name {
                 let arc_name = current_session_name.as_deref().map(Arc::<str>::from);
@@ -892,19 +924,47 @@ async fn serve() -> Result<()> {
                 }
                 pushed_session_name = current_session_name;
             }
-            if pushed_activity != current_activity {
-                let arc_activity = current_activity.as_deref().map(Arc::<str>::from);
-                let _ = client_for_publish
-                    .send_command::<marshal_entities::SetSessionActivity, ()>(
-                        &marshal_entities::SetSessionActivity {
-                            id: session_id_for_publish.clone(),
-                            activity: arc_activity,
-                        },
+            match session_discovery::activity_push(
+                pushed_activity.as_deref(),
+                pushed_activity_changed_at,
+                current_activity.as_deref(),
+                status_updated_at,
+                Utc::now().timestamp_millis(),
+            ) {
+                session_discovery::ActivityPush::Nothing => {}
+                session_discovery::ActivityPush::ActivityAndTime(activity_at) => {
+                    let arc_activity = current_activity.as_deref().map(Arc::<str>::from);
+                    log_if_refused(
+                        "activity",
+                        client_for_publish
+                            .send_command::<marshal_entities::SetSessionActivity, ()>(
+                                &marshal_entities::SetSessionActivity {
+                                    id: session_id_for_publish.clone(),
+                                    activity: arc_activity,
+                                },
+                            ),
                     );
-                if let Ok(mut s) = session_for_publish.lock() {
-                    s.activity = current_activity.clone();
+                    // MAR-58: when it changed, pushed right after the activity
+                    // itself. A failure is logged, not retried: the next change
+                    // or re-register sends it again, and a moment's skew between
+                    // the two fields is acceptable.
+                    push_activity_at(&client_for_publish, &session_id_for_publish, activity_at);
+                    if let Ok(mut s) = session_for_publish.lock() {
+                        s.activity = current_activity.clone();
+                        s.activity_at = activity_at;
+                    }
+                    pushed_activity = current_activity;
+                    pushed_activity_changed_at = activity_at;
                 }
-                pushed_activity = current_activity;
+                session_discovery::ActivityPush::TimeOnly(at) => {
+                    // The same activity, set again since the last read (a flip
+                    // and back): only its time moves.
+                    push_activity_at(&client_for_publish, &session_id_for_publish, Some(at));
+                    if let Ok(mut s) = session_for_publish.lock() {
+                        s.activity_at = Some(at);
+                    }
+                    pushed_activity_changed_at = Some(at);
+                }
             }
 
             let last_activity_at = activity_for_publish.last_activity_ms();
@@ -1482,14 +1542,41 @@ fn detect_project_basename(cwd: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Log a setter the daemon refused or never answered, without holding up the
+/// publish loop or retrying (MAR-58: `activity` and `activity_at` are pushed as
+/// a pair, and either failing is logged).
+fn log_if_refused(
+    field: &'static str,
+    cell: hyphae::Cell<Option<Result<(), String>>, hyphae::CellImmutable>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = tools::await_command(cell, tokio::time::Duration::from_secs(10)).await {
+            log::warn!("[marshal-shim] pushing {field} failed: {e}");
+        }
+    });
+}
+
+/// Push a session's `activity_at` (MAR-58), logging a refusal.
+fn push_activity_at(client: &MykoClient, id: &SessionId, activity_at: Option<i64>) {
+    log_if_refused(
+        "activity_at",
+        client.send_command::<marshal_entities::SetSessionActivityAt, ()>(
+            &marshal_entities::SetSessionActivityAt {
+                id: id.clone(),
+                activity_at,
+            },
+        ),
+    );
+}
+
 /// Default the roster's free-form `current_task` from evidence the shim already
 /// holds at registration, so a busy session is never the unlabeled entry a peer
 /// routes a misdirected request to. Two sources, strongest first: the enclosing
 /// `pulse work` workspace (`.workspaces/<name>/…`, named for its task) and then
 /// a non-trunk git branch. Trunk names carry no routing signal and stay `None`.
 /// An explicit `set_status` always overwrites this. The workspace source is
-/// fixed for the session's life; the branch source is read once and the HEAD
-/// watcher does not re-derive it on checkout.
+/// fixed for the session's life; the branch source follows checkouts through
+/// [`followed_current_task`] (MUS-26).
 fn default_current_task(cwd: &str, git_branch: Option<&str>) -> Option<String> {
     let mut components = std::path::Path::new(cwd).components();
     while let Some(component) = components.next() {
@@ -1502,6 +1589,25 @@ fn default_current_task(cwd: &str, git_branch: Option<&str>) -> Option<String> {
     git_branch
         .filter(|branch| !matches!(*branch, "main" | "master" | "dev" | "develop" | "trunk"))
         .map(str::to_string)
+}
+
+/// The `current_task` a checkout should leave behind (MUS-26), or `None` to
+/// leave it alone. The task follows the branch only while it still holds the
+/// default derived from the branch being left, so text a session set with
+/// `set_status` is never overwritten. The one blind spot: text that happens to
+/// equal that default is indistinguishable from it.
+fn followed_current_task(
+    cwd: &str,
+    previous_branch: Option<&str>,
+    new_branch: Option<&str>,
+    current_task: Option<&str>,
+) -> Option<Option<String>> {
+    let was_default = default_current_task(cwd, previous_branch);
+    if current_task != was_default.as_deref() {
+        return None;
+    }
+    let next = default_current_task(cwd, new_branch);
+    (next != was_default).then_some(next)
 }
 
 /// Resolve which HUMAN drives this session, as an email — the canonical id
@@ -1647,7 +1753,8 @@ mod tests {
     }
     use super::{
         DEFAULT_DAEMON_ADDRESS, ROSTER_MISS_TICKS, default_current_task, detect_git_branch,
-        first_daemon_address, registered_on_roster, resolve_git_head_dir, roster_miss_step,
+        first_daemon_address, followed_current_task, registered_on_roster, resolve_git_head_dir,
+        roster_miss_step,
     };
     use marshal_entities::{Session, SessionId};
     use std::process::Command;
@@ -1680,6 +1787,54 @@ mod tests {
         assert_eq!(
             default_current_task("/root/pulse/.workspaces", Some("lv-a57b")),
             Some("lv-a57b".into())
+        );
+    }
+
+    #[test]
+    fn current_task_follows_a_checkout_while_it_is_the_default() {
+        // The roadmap's case: the roster said feature/comments on feature/search.
+        assert_eq!(
+            followed_current_task(
+                "/repo",
+                Some("feature/comments"),
+                Some("feature/search"),
+                Some("feature/comments"),
+            ),
+            Some(Some("feature/search".into()))
+        );
+        // Onto trunk the default is no task, so the stale branch name clears.
+        assert_eq!(
+            followed_current_task("/repo", Some("feature/x"), Some("main"), Some("feature/x")),
+            Some(None)
+        );
+        // Off trunk with no task set, the new branch becomes the task.
+        assert_eq!(
+            followed_current_task("/repo", Some("main"), Some("fix/y"), None),
+            Some(Some("fix/y".into()))
+        );
+    }
+
+    #[test]
+    fn current_task_keeps_text_the_session_set() {
+        assert_eq!(
+            followed_current_task(
+                "/repo",
+                Some("feature/x"),
+                Some("feature/y"),
+                Some("reviewing #140"),
+            ),
+            None
+        );
+        // Cleared with set_status on a branch: stays cleared.
+        assert_eq!(
+            followed_current_task("/repo", Some("feature/x"), Some("feature/y"), None),
+            None
+        );
+        // A pulse workspace name is fixed for the session's life.
+        let cwd = "/root/pulse/.workspaces/lv-1141/muster";
+        assert_eq!(
+            followed_current_task(cwd, Some("a"), Some("b"), Some("lv-1141")),
+            None
         );
     }
 
@@ -1731,6 +1886,7 @@ mod tests {
                 current_task: None,
                 session_name: None,
                 activity: None,
+                activity_at: None,
                 kind: None,
                 connected_at: 0,
                 last_activity_at: None,

@@ -397,6 +397,7 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
         })
         .collect();
     crate::succession::observe(&rows, &live_client_ids, now_ms);
+    crate::succession::observe_bridges(&bridged_sessions(ctx, now_ms), now_ms);
     let held = held_waits(ctx, now_ms);
     let mut to_delete: Vec<Arc<str>> = Vec::new();
     let mut still_disconnected: HashSet<Arc<str>> = HashSet::new();
@@ -468,6 +469,26 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
     }
 }
 
+/// Sessions a Codex bridge's current wake record names (MAR-54): a record
+/// with its own `session_id` (a held `/hook/wait`'s has none) and an `until`
+/// still ahead.
+fn bridged_sessions(ctx: &MykoServerContext, now_ms: i64) -> HashSet<Arc<str>> {
+    let Some(store) = ctx.registry.get(WakeWatcher::ENTITY_NAME_STATIC) else {
+        return HashSet::new();
+    };
+    store
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .filter_map(|(_, item)| {
+            let w = downcast_item::<WakeWatcher>(&item)?;
+            let session = w.session_id.as_ref()?;
+            (w.until > now_ms).then(|| session.0.clone())
+        })
+        .collect()
+}
+
 /// Sessions with a held wait that counts now: a `WakeWatcher` whose `until`
 /// is in the future but within `HELD_WAIT_HORIZON_MS`.
 fn held_waits(ctx: &MykoServerContext, now_ms: i64) -> HashSet<Arc<str>> {
@@ -524,6 +545,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 0,
             last_activity_at: Some(last_activity_at),
@@ -594,6 +616,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 0,
             last_activity_at: None,

@@ -376,6 +376,54 @@ pub(crate) struct ManifestFields {
     pub activity: Option<String>,
     /// `kind` — `interactive` / `bg`. Static over a session's life.
     pub kind: Option<String>,
+    /// `statusUpdatedAt` — epoch millis when Claude last set `status`.
+    pub status_updated_at: Option<i64>,
+}
+
+/// `Session::activity_at` (MAR-58) for a session whose activity is `activity`:
+/// the manifest's `statusUpdatedAt` when it has one, so a shim that starts (or
+/// re-registers) after the change still reports when it happened; else `now_ms`,
+/// the moment the shim saw it. `None` when there's no activity to date.
+pub(crate) fn activity_at(
+    activity: Option<&str>,
+    status_updated_at: Option<i64>,
+    now_ms: i64,
+) -> Option<i64> {
+    activity?;
+    Some(status_updated_at.unwrap_or(now_ms))
+}
+
+/// What the publish loop should push for a session's activity (MAR-58).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ActivityPush {
+    /// Nothing changed.
+    Nothing,
+    /// The activity changed: push it, then this `activity_at`.
+    ActivityAndTime(Option<i64>),
+    /// The activity reads the same but the manifest's `statusUpdatedAt`
+    /// moved, as a busy→idle→busy flip between two reads leaves it: push
+    /// only `activity_at`, so the roster doesn't keep the older time.
+    TimeOnly(i64),
+}
+
+/// Decide [`ActivityPush`] from what was last pushed (`pushed_activity`,
+/// `pushed_activity_at`) and what the manifest says now. Without a
+/// `statusUpdatedAt` only a change of activity counts, since the shim's own
+/// clock moves every read.
+pub(crate) fn activity_push(
+    pushed_activity: Option<&str>,
+    pushed_activity_at: Option<i64>,
+    activity: Option<&str>,
+    status_updated_at: Option<i64>,
+    now_ms: i64,
+) -> ActivityPush {
+    if pushed_activity != activity {
+        return ActivityPush::ActivityAndTime(activity_at(activity, status_updated_at, now_ms));
+    }
+    match (activity, status_updated_at) {
+        (Some(_), Some(at)) if pushed_activity_at != Some(at) => ActivityPush::TimeOnly(at),
+        _ => ActivityPush::Nothing,
+    }
 }
 
 /// Parse the live fields from the per-PID manifest. Full JSON parse (not the
@@ -386,7 +434,13 @@ pub(crate) struct ManifestFields {
 /// propagates to the roster in near real time.
 pub(crate) fn manifest_fields(parent_pid: u32) -> Option<ManifestFields> {
     let content = std::fs::read_to_string(session_manifest_path(parent_pid)?).ok()?;
-    let m: serde_json::Value = serde_json::from_str(&content).ok()?;
+    parse_manifest_fields(&content)
+}
+
+/// The parsing half of [`manifest_fields`], separate so tests needn't write a
+/// manifest under a fake home.
+fn parse_manifest_fields(content: &str) -> Option<ManifestFields> {
+    let m: serde_json::Value = serde_json::from_str(content).ok()?;
     let str_field = |k: &str| {
         m.get(k)
             .and_then(|v| v.as_str())
@@ -398,6 +452,10 @@ pub(crate) fn manifest_fields(parent_pid: u32) -> Option<ManifestFields> {
         name: str_field("name"),
         activity: str_field("status"),
         kind: str_field("kind"),
+        status_updated_at: m
+            .get("statusUpdatedAt")
+            .and_then(|v| v.as_i64())
+            .filter(|t| *t > 0),
     })
 }
 
@@ -990,6 +1048,95 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    // ── MAR-58: when a session's activity last changed ────────────────
+
+    #[test]
+    fn manifest_fields_read_status_updated_at() {
+        let m = parse_manifest_fields(
+            r#"{"pid":1,"sessionId":"s","status":"idle","statusUpdatedAt":1794186070745}"#,
+        )
+        .unwrap();
+        assert_eq!(m.activity.as_deref(), Some("idle"));
+        assert_eq!(m.status_updated_at, Some(1_794_186_070_745));
+    }
+
+    #[test]
+    fn manifest_fields_without_a_usable_status_updated_at() {
+        for json in [
+            r#"{"status":"busy"}"#,
+            r#"{"status":"busy","statusUpdatedAt":null}"#,
+            r#"{"status":"busy","statusUpdatedAt":"1794186070745"}"#,
+            r#"{"status":"busy","statusUpdatedAt":0}"#,
+        ] {
+            let m = parse_manifest_fields(json).unwrap();
+            assert_eq!(m.activity.as_deref(), Some("busy"), "{json}");
+            assert_eq!(m.status_updated_at, None, "{json}");
+        }
+    }
+
+    #[test]
+    fn activity_at_takes_the_manifest_time_over_the_shim_clock() {
+        // A shim that starts, or re-registers, long after the change keeps
+        // the manifest's time rather than resetting it to now.
+        assert_eq!(activity_at(Some("idle"), Some(1_000), 9_000), Some(1_000));
+    }
+
+    #[test]
+    fn activity_at_falls_back_to_the_shim_clock() {
+        assert_eq!(activity_at(Some("busy"), None, 9_000), Some(9_000));
+    }
+
+    #[test]
+    fn no_activity_has_no_activity_at() {
+        assert_eq!(activity_at(None, Some(1_000), 9_000), None);
+        assert_eq!(activity_at(None, None, 9_000), None);
+    }
+
+    #[test]
+    fn a_changed_activity_pushes_it_and_its_time() {
+        assert_eq!(
+            activity_push(Some("idle"), Some(1_000), Some("busy"), Some(2_000), 9_000),
+            ActivityPush::ActivityAndTime(Some(2_000))
+        );
+        assert_eq!(
+            activity_push(Some("idle"), Some(1_000), Some("busy"), None, 9_000),
+            ActivityPush::ActivityAndTime(Some(9_000))
+        );
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), None, None, 9_000),
+            ActivityPush::ActivityAndTime(None)
+        );
+    }
+
+    #[test]
+    fn a_flip_and_back_between_reads_still_moves_activity_at() {
+        // busy at 1_000, idle at 1_500, busy again at 2_000, all between two
+        // reads: the string is the same, but the time the roster shows must not
+        // stay at 1_000.
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), Some("busy"), Some(2_000), 9_000),
+            ActivityPush::TimeOnly(2_000)
+        );
+    }
+
+    #[test]
+    fn an_unchanged_activity_and_time_push_nothing() {
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), Some("busy"), Some(1_000), 9_000),
+            ActivityPush::Nothing
+        );
+        // No manifest time: the shim's clock alone never re-pushes.
+        assert_eq!(
+            activity_push(Some("busy"), Some(1_000), Some("busy"), None, 9_000),
+            ActivityPush::Nothing
+        );
+        // No activity: nothing to date, whatever the manifest's time says.
+        assert_eq!(
+            activity_push(None, None, None, Some(2_000), 9_000),
+            ActivityPush::Nothing
+        );
+    }
 
     // ── Tier 0: Claude's per-PID sessions manifest ────────────────────
 

@@ -30,7 +30,7 @@ missed one only costs a fresh nickname. So the rules lean towards missing.
 |---|---|
 | Had a client (a Claude MCP shim) | The client left at least the grace ago (`MARSHAL_SUCCESSION_GRACE_SECS`, 30 s), it has no waiter, and it hasn't hooked since the client dropped. |
 | Never had a client (hooks only) | It has no waiter, and nothing for the quiet time (`MARSHAL_SUCCESSION_QUIET_SECS`, 600 s). |
-| A Codex row still on the roster | Never, until MUS-77 gives the daemon a way to see the bridge's threads. |
+| A Codex row still on the roster | This daemon saw a Codex bridge's wake record for it, that record has been gone at least the bridge grace (`MARSHAL_SUCCESSION_BRIDGE_GRACE_SECS`, 120 s, no shorter than the record's 2 min lifetime, so a bridge handover's gap isn't a death), it has no waiter, it hasn't hooked since the record ended, and it's been quiet for the quiet time. One never seen with a bridge record (no bridge, or a bridge that died before this daemon started) never counts as dead (MAR-54). |
 | Gone | This daemon saw it go: Codex's SessionEnd, or a reap. After a daemon restart every row is gone, and none counts as dead until it's seen again. |
 
 A role is never taken over while any session holding it is live.
@@ -66,9 +66,17 @@ In one step, the daemon:
 - writes a `Succession` record: who took over from whom, the nickname, the
   key, why the predecessor counted as dead, and any alias.
 
-Mail to the old session id follows the record to the new session. Handing the
-predecessor's unread mail to its successor is muster's MUS-47, not ported yet,
-so the conformance cell `unread-mail-follows-a-restart` is n/a.
+It also hands the predecessor's unread direct mail to the successor (MAR-42,
+from muster's MUS-47): each such message is readdressed to the successor, so
+its next hook shows it once, as its own, and the record lists the ids. Mail
+the predecessor had read stays in its history. Mail sent afterwards to the
+old id, the old nickname or a late takeover's alias reaches the successor
+through addressing, below.
+
+One case can still show a message twice. The predecessor's waiter printed
+it, then its ack was lost, and then it died. The mail is still unread, so the
+successor gets it as well. That's the at-least-once rule every Marshal
+delivery follows.
 
 ## Default change
 

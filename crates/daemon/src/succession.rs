@@ -19,8 +19,10 @@
 //! - **Unobservable rows**, which never had a client (Codex hooks, or a Claude
 //!   session whose MCP shim never attached), also need no activity for the
 //!   quiet time (`MARSHAL_SUCCESSION_QUIET_SECS`, 600 s). A Codex row still on
-//!   the roster never counts as dead until MUS-77 lands
-//!   ([`CODEX_PRESENT_ROWS_CAN_BE_DEAD`]).
+//!   the roster counts as dead only once this daemon saw its bridge's wake
+//!   record end, at least the bridge grace (`MARSHAL_SUCCESSION_BRIDGE_GRACE_SECS`,
+//!   120 s) ago, with no hook since (MAR-54). One never seen with a bridge
+//!   record never counts as dead.
 //! - **A removed row** counts as dead only if this daemon saw it go (a session
 //!   end or a reap). After a daemon restart every row is gone, and nothing
 //!   counts as dead until it's seen again.
@@ -42,23 +44,25 @@ use std::{
 };
 
 use marshal_entities::{
-    GetAllRoomMembers, GetAllRooms, GetAllSessionIdentitys, GetAllSessionNicknames, GetAllSessions,
-    GetAllSuccessions, GetAllWakeWatchers, Room, RoomKind, RoomMember, RoomMemberId, Session,
-    SessionId, SessionIdentity, SessionIdentityId, SessionNickname, SessionNicknameId, Succession,
-    SuccessionId,
+    GetAllMessageReads, GetAllMessages, GetAllRoomMembers, GetAllRooms, GetAllSessionIdentitys,
+    GetAllSessionNicknames, GetAllSessions, GetAllSuccessions, GetAllWakeWatchers, Message,
+    MessageRead, Room, RoomKind, RoomMember, RoomMemberId, Session, SessionId, SessionIdentity,
+    SessionIdentityId, SessionNickname, SessionNicknameId, Succession, SuccessionId,
 };
 use myko::command::{CommandContext, CommandError};
 use myko::prelude::EventPublishing as _;
 
-/// MUS-77: a Codex row has no client and gets activity only on hooks, so an
-/// idle, live Codex thread looks like a dead one. Until the bridge publishes a
-/// `WakeWatcher` for each thread it can wake (MUS-77), a Codex row still on
-/// the roster never counts as dead, and only a Codex session whose row has
-/// gone (its session end, or a reap after a day of silence) can be taken
-/// over. Once MUS-77 is on main, set this to true: a present Codex row then
-/// counts as dead with no watcher and the quiet time passed, as any other
-/// unobservable row. `codex_rows_wait_for_mus_77` pins the current behaviour.
-pub const CODEX_PRESENT_ROWS_CAN_BE_DEAD: bool = false;
+// MAR-54: a Codex row has no client and gets activity only on hooks, so an
+// idle, live Codex thread looks like a dead one by those alone. The leading
+// app-server bridge refreshes a `WakeWatcher` for each thread it can wake
+// every 30 s (MAR-12), and the record lasts 2 min. So a present Codex row
+// counts as dead only once this daemon saw such a record end, at least the
+// bridge grace ago (no shorter than the record's lifetime, since a bridge
+// leadership handover or an app-server restart can leave a gap of a refresh
+// or more before the next record), with no waiter and no hook since. A Codex
+// row never seen with a bridge record (a thread with no bridge, or a bridge
+// that died before this daemon started) never counts as dead; only its row
+// going (its session end, or a reap) frees its nickname.
 
 /// The timings, in ms.
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +79,9 @@ pub struct Config {
     /// predecessor still looked live then, only because its client was still
     /// connected or its waiter still registered (MUS-92).
     pub settle_ms: i64,
+    /// How long a Codex row's bridge wake record must have been gone before
+    /// the row counts as dead (MAR-54). At least the record's 2 min lifetime.
+    pub bridge_grace_ms: i64,
 }
 
 impl Config {
@@ -93,6 +100,7 @@ impl Config {
             window_ms: secs("MARSHAL_SUCCESSION_WINDOW_SECS", 600),
             alias_ms: secs("MARSHAL_SUCCESSION_ALIAS_SECS", 600),
             settle_ms: secs("MARSHAL_SUCCESSION_SETTLE_SECS", 60),
+            bridge_grace_ms: secs("MARSHAL_SUCCESSION_BRIDGE_GRACE_SECS", 120),
         }
     }
 }
@@ -142,6 +150,10 @@ pub struct Facts<'a> {
     pub removed_at: Option<i64>,
     /// Its row was on the roster at the sweeper's last tick.
     pub known: bool,
+    /// This daemon has seen a Codex bridge's wake record for it (MAR-54).
+    pub bridge_seen: bool,
+    /// When the daemon first saw that bridge record gone, if it's gone now.
+    pub bridge_gone_at: Option<i64>,
 }
 
 /// Whether a predecessor is dead. Pure, so it can be tested on its own.
@@ -165,11 +177,6 @@ pub fn verdict(f: &Facts, now: i64, cfg: &Config) -> Verdict {
     if row.client_id.is_some() && f.client_live {
         return Verdict::Live("its client is connected".into());
     }
-    if row.harness.as_deref() == Some("codex") && !CODEX_PRESENT_ROWS_CAN_BE_DEAD {
-        return Verdict::Live(
-            "a Codex row on the roster can't be told from an idle live thread until MUS-77".into(),
-        );
-    }
     let last_signal = [
         row.last_activity_at,
         row.last_tool_at,
@@ -179,6 +186,9 @@ pub fn verdict(f: &Facts, now: i64, cfg: &Config) -> Verdict {
     .flatten()
     .max()
     .unwrap_or(0);
+    if row.harness.as_deref() == Some("codex") {
+        return codex_verdict(f, last_signal, now, cfg);
+    }
     match f.client_gone_at {
         Some(gone_at) => {
             // The hooked_since guard: a session still hooking after its client
@@ -226,6 +236,51 @@ pub fn verdict(f: &Facts, now: i64, cfg: &Config) -> Verdict {
     }
 }
 
+/// A present Codex row with no waiter and no live client (MAR-54): dead only
+/// once its bridge's wake record has been gone for the bridge grace, with no
+/// hook since.
+fn codex_verdict(f: &Facts, last_signal: i64, now: i64, cfg: &Config) -> Verdict {
+    let Some(gone_at) = f.bridge_gone_at else {
+        return Verdict::Live(if f.bridge_seen {
+            "its Codex bridge can wake it".into()
+        } else {
+            "a Codex row never seen with a bridge record can't be told from an idle live thread"
+                .into()
+        });
+    };
+    if last_signal > gone_at {
+        return Verdict::Live(format!(
+            "it hooked {}s after its bridge record ended",
+            (last_signal - gone_at) / 1000
+        ));
+    }
+    let gone_for = now - gone_at;
+    if gone_for < cfg.bridge_grace_ms {
+        return Verdict::Pending(format!(
+            "its bridge record ended {}s ago, inside the {}s bridge grace",
+            gone_for / 1000,
+            cfg.bridge_grace_ms / 1000
+        ));
+    }
+    // A bridge can die while its thread's TUI lives on, so the row must also
+    // be as quiet as any row with no client.
+    let quiet_for = now - last_signal;
+    if quiet_for < cfg.quiet_ms {
+        return Verdict::Pending(format!(
+            "its bridge record ended {}s ago, but it was active {}s ago (quiet time {}s)",
+            gone_for / 1000,
+            quiet_for / 1000,
+            cfg.quiet_ms / 1000
+        ));
+    }
+    Verdict::Dead(format!(
+        "its bridge record ended {}s ago, with no waiter and no hook since, and it has been \
+         quiet for {}s",
+        gone_for / 1000,
+        quiet_for / 1000
+    ))
+}
+
 // ─── What the sweeper observes ──────────────────────────────────────────────
 
 #[derive(Default)]
@@ -234,6 +289,10 @@ struct Observed {
     client_gone_at: HashMap<Arc<str>, i64>,
     known_rows: HashSet<Arc<str>>,
     removed_at: HashMap<Arc<str>, i64>,
+    /// Sessions a Codex bridge's wake record has named (MAR-54).
+    bridge_seen: HashSet<Arc<str>>,
+    /// When each of those was first seen without a current bridge record.
+    bridge_gone_at: HashMap<Arc<str>, i64>,
     /// Sessions to check again for a late takeover, and until when (ms).
     pending: HashMap<Arc<str>, i64>,
 }
@@ -268,9 +327,31 @@ pub fn observe(rows: &[(Arc<str>, Option<Arc<str>>)], live_clients: &HashSet<Arc
     for id in gone {
         o.removed_at.insert(id.clone(), now);
         o.client_gone_at.remove(&id);
+        o.bridge_seen.remove(&id);
+        o.bridge_gone_at.remove(&id);
     }
     o.removed_at.retain(|_, at| now - *at < REMEMBER_REMOVED_MS);
     o.known_rows = current;
+}
+
+/// The sweeper's view each tick of which sessions a Codex bridge's wake
+/// record currently names (MAR-54). A session seen before and missing now is
+/// timed from the first tick it's missing.
+pub fn observe_bridges(current: &HashSet<Arc<str>>, now: i64) {
+    let mut o = OBSERVED.lock().unwrap_or_else(|e| e.into_inner());
+    for id in current {
+        o.bridge_seen.insert(id.clone());
+        o.bridge_gone_at.remove(id);
+    }
+    let lapsed: Vec<Arc<str>> = o
+        .bridge_seen
+        .iter()
+        .filter(|id| !current.contains(*id))
+        .cloned()
+        .collect();
+    for id in lapsed {
+        o.bridge_gone_at.entry(id).or_insert(now);
+    }
 }
 
 /// The sessions off the roster that a later session may still take over:
@@ -324,6 +405,8 @@ fn facts_for<'a>(
         client_gone_at: o.client_gone_at.get(id).copied(),
         removed_at: o.removed_at.get(id).copied(),
         known: o.known_rows.contains(id),
+        bridge_seen: o.bridge_seen.contains(id),
+        bridge_gone_at: o.bridge_gone_at.get(id).copied(),
     }
 }
 
@@ -354,7 +437,7 @@ fn find_predecessor(
     let watching: HashSet<&str> = watchers
         .iter()
         .filter(|w| w.until > now)
-        .map(|w| w.id.0.as_ref())
+        .map(|w| w.session())
         .collect();
     let me = session.id.0.as_ref();
     let o = OBSERVED.lock().unwrap_or_else(|e| e.into_inner());
@@ -467,6 +550,8 @@ fn take_over(
     // its auto-rooms. `joined_at` is kept, so the successor sees the room's
     // history from when its predecessor joined.
     move_adhoc_memberships(ctx, pred, successor)?;
+    // MUS-47: its unread direct mail is the successor's now.
+    let handed_over = hand_over_unread(ctx, pred, successor)?;
     // Retire the predecessor's row if it's still there, so its fallback
     // nickname doesn't name it too. Its mail is kept (MUS-46).
     let sessions: Vec<Arc<Session>> = ctx.exec_query(GetAllSessions {})?;
@@ -496,8 +581,45 @@ fn take_over(
         alias,
         alias_until,
         told: false,
+        handed_over,
     })?;
     Ok(())
+}
+
+/// Readdress `from`'s unread direct messages to `to` (MUS-47), so the
+/// successor's inbox shows each once, as its own. Read mail stays with the
+/// predecessor's history. Returns the ids moved.
+fn hand_over_unread(
+    ctx: &CommandContext,
+    from: &str,
+    to: &str,
+) -> Result<Vec<String>, CommandError> {
+    let messages: Vec<Arc<Message>> = ctx.exec_query(GetAllMessages {})?;
+    let reads: Vec<Arc<MessageRead>> = ctx.exec_query(GetAllMessageReads {})?;
+    let read: HashSet<&str> = reads
+        .iter()
+        .filter(|r| r.session_id.0.as_ref() == from)
+        .map(|r| r.message_id.0.as_ref())
+        .collect();
+    let mut moved = Vec::new();
+    for m in messages.iter().filter(|m| {
+        m.to_session_id
+            .as_ref()
+            .is_some_and(|t| t.0.as_ref() == from)
+            && !read.contains(m.id.0.as_ref())
+    }) {
+        let mut readdressed = (**m).clone();
+        readdressed.to_session_id = Some(SessionId(Arc::from(to)));
+        ctx.emit_set(&readdressed)?;
+        moved.push(m.id.0.to_string());
+    }
+    if !moved.is_empty() {
+        log::info!(
+            "[identity] handed {} unread message(s) from {from} to {to}",
+            moved.len()
+        );
+    }
+    Ok(moved)
 }
 
 /// Give `to` each ad hoc room `from` is a member of, keeping when it joined.
@@ -699,6 +821,7 @@ mod tests {
             window_ms: 600_000,
             alias_ms: 600_000,
             settle_ms: 60_000,
+            bridge_grace_ms: 120_000,
         }
     }
 
@@ -713,6 +836,7 @@ mod tests {
             current_task: None,
             session_name: None,
             activity: None,
+            activity_at: None,
             kind: None,
             connected_at: 0,
             last_activity_at: Some(last),
@@ -824,23 +948,99 @@ mod tests {
         assert!(dead(verdict(&f, 1_000 + 600_000, &cfg())));
     }
 
-    /// Flip with `CODEX_PRESENT_ROWS_CAN_BE_DEAD` once MUS-77 is on main.
+    /// MAR-54: a present Codex row's verdict follows its bridge's wake record.
     #[test]
-    fn codex_rows_wait_for_mus_77() {
+    fn a_codex_row_is_dead_only_after_its_bridge_record_has_been_gone_the_grace() {
         let r = row("codex", None, 0);
-        let f = Facts {
+        let at = |bridge_seen, bridge_gone_at| Facts {
             row: Some(&r),
+            bridge_seen,
+            bridge_gone_at,
             ..Default::default()
         };
-        assert_eq!(
-            dead(verdict(&f, 100_000_000, &cfg())),
-            CODEX_PRESENT_ROWS_CAN_BE_DEAD,
-            "a live idle Codex thread must not be taken over before MUS-77"
+        let late = 100_000_000;
+        assert!(
+            matches!(verdict(&at(false, None), late, &cfg()), Verdict::Live(_)),
+            "never seen with a bridge record: never dead"
         );
-        // Turning it on means changing this line too, with a test of the
-        // MUS-77 watcher: a present Codex row with no watcher, quiet past the
-        // quiet time, then counts as dead.
-        const { assert!(!CODEX_PRESENT_ROWS_CAN_BE_DEAD) };
+        assert!(
+            matches!(verdict(&at(true, None), late, &cfg()), Verdict::Live(_)),
+            "its bridge record is current: live"
+        );
+        let gone = late - 60_000;
+        assert!(
+            matches!(
+                verdict(&at(true, Some(gone)), late, &cfg()),
+                Verdict::Pending(_)
+            ),
+            "inside the bridge grace: pending"
+        );
+        let gone = late - 120_000;
+        assert!(
+            dead(verdict(&at(true, Some(gone)), late, &cfg())),
+            "gone the grace, no hook since, quiet: dead"
+        );
+        // A hook after the record ended: it's alive.
+        let hooked = row("codex", None, gone + 1_000);
+        let f = Facts {
+            row: Some(&hooked),
+            bridge_seen: true,
+            bridge_gone_at: Some(gone),
+            ..Default::default()
+        };
+        assert!(matches!(verdict(&f, late, &cfg()), Verdict::Live(_)));
+        // Gone the grace but active inside the quiet time: not yet.
+        let recent = row("codex", None, late - 300_000);
+        let f = Facts {
+            row: Some(&recent),
+            bridge_seen: true,
+            bridge_gone_at: Some(late - 200_000),
+            ..Default::default()
+        };
+        assert!(matches!(verdict(&f, late, &cfg()), Verdict::Pending(_)));
+        // A waiter beats everything.
+        let f = Facts {
+            waiting: true,
+            ..at(true, Some(gone))
+        };
+        assert!(matches!(verdict(&f, late, &cfg()), Verdict::Live(_)));
+    }
+
+    /// MAR-54: a bridge leadership handover (MAR-4) ends the old leader's
+    /// record before the new leader's appears. A 45 s gap never makes the row
+    /// dead.
+    #[test]
+    fn a_bridge_handover_gap_keeps_a_codex_row_live() {
+        let id: Arc<str> = Arc::from(format!("handover-{}", uuid::Uuid::new_v4()).as_str());
+        let r = row("codex", None, 0);
+        let none: HashSet<Arc<str>> = HashSet::new();
+        let some: HashSet<Arc<str>> = [id.clone()].into_iter().collect();
+        let check = |now: i64| {
+            let o = OBSERVED.lock().unwrap_or_else(|e| e.into_inner());
+            let watching = HashSet::new();
+            verdict(&facts_for(&o, &id, Some(&r), &watching), now, &cfg())
+        };
+        let t0 = 50_000_000;
+        observe_bridges(&some, t0 - 30_000);
+        assert!(matches!(check(t0 - 30_000), Verdict::Live(_)));
+        // The old leader's record ends; ticks every 3 s through the gap.
+        for t in (t0..t0 + 45_000).step_by(3_000) {
+            observe_bridges(&none, t);
+            assert!(
+                !dead(check(t)),
+                "dead {}s into the handover gap",
+                (t - t0) / 1000
+            );
+        }
+        // The new leader's record appears 45 s later.
+        observe_bridges(&some, t0 + 45_000);
+        for t in (t0 + 45_000..t0 + 400_000).step_by(30_000) {
+            observe_bridges(&some, t);
+            assert!(
+                matches!(check(t), Verdict::Live(_)),
+                "live after the handover"
+            );
+        }
     }
 
     #[test]
@@ -894,6 +1094,7 @@ mod tests {
                 alias: None,
                 alias_until: None,
                 told: false,
+                handed_over: Vec::new(),
             })
         };
         let chain = vec![rec("a", "b"), rec("b", "c")];
