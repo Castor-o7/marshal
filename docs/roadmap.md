@@ -285,6 +285,15 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   database, with SELECTs only, for the latest message, the latest session event and the registered
   sessions; the query has been run once on Murph with its output recorded; and cutover.md links it
   (RAL-127).
+- [ ] **MAR-71: Cutover: doctor probes the daemon where the shim connects.** Found running MAR-70 on
+  Murph: `marshal-shim doctor` said "FAIL daemon ws://127.0.0.1:6155 answered HTTP 404 … isn't a Marshal
+  daemon" against the live daemon. The daemon serves its WebSocket at `/myko` only, and myko's client
+  turns an address with no path into `/myko` (`normalize_myko_address`), but doctor handshook at the
+  address as written, so it reached `/`. Its test server took a handshake on any path, so the tests
+  missed it. Done when: doctor resolves the address as myko's client does (no scheme means `ws://`, an
+  empty or `/` path means `/myko`, no port means 5155), names that URL in its finding, and a test
+  server that serves `/myko` only passes; doctor built from the branch, run against the live daemon on
+  Murph, says `ok daemon`.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
