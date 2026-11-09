@@ -3010,9 +3010,17 @@ mod tests {
         );
 
         drop(first);
+        // Dropping `first` releases the lock only once no other process
+        // holds a copy of its descriptor. Another test in this binary can
+        // fork a child between our open and its exec, and that child keeps
+        // the lock held until it execs. On a busy CI runner that takes
+        // milliseconds, so poll on the wall clock rather than all at once.
         let takeover = now + WAKE_LEADER_SETTLE + Duration::from_millis(1);
-        let acquired_at = (0..100)
+        let acquired_at = (0..500)
             .find_map(|attempt| {
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 let poll = takeover + Duration::from_millis(attempt);
                 assert!(
                     !second
