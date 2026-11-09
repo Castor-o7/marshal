@@ -557,6 +557,10 @@ fn register_hook_session(
         });
     if let Err(e) = result {
         log::warn!("[hook] session SET failed for {sid}: {e:?}");
+    } else {
+        // A session the hook listener registers belongs to the local
+        // principal, when a binding with one is installed (MAR-80).
+        crate::auth::session_binding::bind_local(&sid);
     }
     Some((sid, cmd_ctx))
 }
@@ -755,6 +759,7 @@ fn handle_session_end(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome 
     } else {
         // MUS-3: an ended session can be taken over by its successor.
         crate::succession::record_removed(sid, chrono::Utc::now().timestamp_millis());
+        crate::auth::session_binding::release(sid);
     }
     end_all_waits(&cmd_ctx, sid);
     drop_offers(&cmd_ctx, sid);
