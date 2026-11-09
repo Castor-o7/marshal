@@ -304,10 +304,22 @@ async fn a_session_can_claim_another_unless_the_authorizer_checks_as_session() -
         error.contains("asSession 'bob' is not on the roster"),
         "gap: with no asSession check, the handler ran as bob (it said: {error:?})"
     );
+
+    let checked = daemon(Some(Policy::OwnSessionsOnly)).await?;
+    let mut alice = connect(&checked, Some("alice"), None).await?;
+    let (event, error) = send_as(&mut alice, "bob", "impersonate-2").await?;
+    assert_eq!(
+        (event.as_str(), error.as_str()),
+        ("ws:m:command-error", "permission denied")
+    );
     let (_, own) = send_as(&mut alice, "alice", "own-session").await?;
     assert!(
         own.contains("asSession 'alice' is not on the roster"),
         "alice may act as alice, so her own command reaches the handler (it said: {own:?})"
+    );
+    assert!(
+        !closes_within(&mut alice, Duration::from_millis(300)).await,
+        "a denied command doesn't end the connection"
     );
     Ok(())
 }
