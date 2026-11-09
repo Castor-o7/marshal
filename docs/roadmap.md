@@ -352,7 +352,7 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   but has no timestamp; a shim restart or a canonical-id re-register keeps the manifest's time
   rather than resetting it; a session with no `activity` (Codex, older Claude builds) has none;
   everywhere the shim shows `activity` shows `activity_at` beside it (`marshal://roster`, the
-  `roster` tool and `marshal://whoami`); and tests cover each of those cases.
+  `marshal-shim roster` command and `marshal://whoami`); and tests cover each of those cases.
 - [x] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: every in-process
   hook listener in the tests takes a socket the test bound to port 0; every port a test's myko
   server or daemon still picks is retried on a lost bind instead of failing; and the e2e and

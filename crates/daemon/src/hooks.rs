@@ -481,6 +481,7 @@ fn register_hook_session(
                 // Codex has no per-PID name manifest; identity is hook-owned.
                 session_name: None,
                 activity: None,
+                activity_at: None,
                 kind: None,
                 connected_at: now,
                 last_activity_at: active_at,
@@ -676,6 +677,7 @@ fn handle_session_end(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome 
         current_task: None,
         session_name: None,
         activity: None,
+        activity_at: None,
         kind: None,
         connected_at: 0,
         last_activity_at: None,

@@ -41,6 +41,7 @@ fn session(id: &str, client_id: Option<&str>) -> Session {
         current_task: None,
         session_name: None,
         activity: None,
+        activity_at: None,
         kind: None,
         connected_at: 100,
         last_activity_at: None,
