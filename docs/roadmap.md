@@ -152,11 +152,15 @@ launcher.
   with it. Done when: the conformance cell `unread-mail-follows-a-restart` passes on claude and codex, a
   daemon test shows unread mail moving and read mail staying, and the change is listed in MAR-15.
 - [ ] **MAR-54: Supporting: Codex rows on the roster can count as dead, from the bridge's signal.**
-  Follow-up to MAR-9. Succession never treats a Codex row still on the roster as dead
+  Follow-up to MAR-9. Succession never treated a Codex row still on the roster as dead
   (`CODEX_PRESENT_ROWS_CAN_BE_DEAD`, "until MUS-77"), but MAR-12 has since given the roster the bridge's
-  wake path. Done when: it's decided from the bridge's records whether a present Codex row can count as
-  dead, and either the switch is turned on with a test that a live Codex sibling keeps its name, or the
-  reason it stays off is written in `stable-identity.md`.
+  wake path. Scope agreed with the watchman (2026-11-08). Done when: a present Codex row counts as dead
+  only once this daemon saw its bridge record end at least `MARSHAL_SUCCESSION_BRIDGE_GRACE_SECS` (120 s)
+  ago, with no other waiter and no hook since, and a row never seen with one never does, with verdict
+  tests including a 45 s bridge handover gap; succession finds waiters by `WakeWatcher::session()`, with
+  a test; a daemon test shows a bridge-watched Codex sibling keeping its name and one whose record ended
+  taken over with its unread mail; the codex conformance cells still pass; and `stable-identity.md`
+  says so.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
