@@ -16,6 +16,7 @@ pub mod http_listener;
 pub mod liveness_filter;
 pub mod nickname_assign;
 pub mod succession;
+pub mod tls;
 
 pub fn link() {
     auto_rooms::link();

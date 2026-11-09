@@ -28,6 +28,10 @@ const DEFAULT_BIND: &str = "127.0.0.1:6155";
 /// second port because it speaks plain HTTP, not MCP — see `http_listener`.
 const DEFAULT_HOOK_BIND: &str = "127.0.0.1:6156";
 
+/// With `--tls`, myko's own listener moves here, behind the TLS listener on
+/// `MARSHAL_BIND` (MAR-23). Loopback only.
+const DEFAULT_MYKO_BIND: &str = "127.0.0.1:6157";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Answer `--help` / `--version` before anything starts, and refuse any
@@ -58,21 +62,31 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    // The daemon always runs in the foreground. `--foreground` stays accepted,
-    // alone, because earlier docs told people to pass it, so a unit file
-    // written from them keeps working.
-    let unknown = match args.first() {
-        Some(first) if first.as_os_str() == "--foreground" => args.get(1),
-        first => first,
-    };
-    if let Some(arg) = unknown {
-        eprintln!(
-            "marshal-daemon: unknown argument: {}",
-            arg.to_string_lossy()
-        );
-        eprintln!("Try 'marshal-daemon --help'.");
-        std::process::exit(2);
+    // The daemon always runs in the foreground. `--foreground` stays accepted
+    // because earlier docs told people to pass it, so a unit file written from
+    // them keeps working. `--tls` turns on TLS (MAR-23); `--plain` says plainly
+    // that it's off, which is the default.
+    let mut tls = None;
+    for arg in &args {
+        match arg.to_str() {
+            Some("--foreground") => {}
+            Some("--tls") if tls != Some(false) => tls = Some(true),
+            Some("--plain") if tls != Some(true) => tls = Some(false),
+            Some("--tls" | "--plain") => {
+                eprintln!("marshal-daemon: --tls and --plain can't both be given");
+                std::process::exit(2);
+            }
+            _ => {
+                eprintln!(
+                    "marshal-daemon: unknown argument: {}",
+                    arg.to_string_lossy()
+                );
+                eprintln!("Try 'marshal-daemon --help'.");
+                std::process::exit(2);
+            }
+        }
     }
+    let tls = tls.unwrap_or(false);
 
     init_logging();
 
@@ -81,6 +95,16 @@ async fn main() -> Result<()> {
     // mesh IP being reassigned (next start re-resolves).
     let bind_addr = resolve_bind("MARSHAL_BIND", DEFAULT_BIND)?;
     let hook_bind = resolve_bind("MARSHAL_HOOK_BIND", DEFAULT_HOOK_BIND)?;
+
+    // With `--tls` (MAR-23), the public addresses get TLS listeners, bound now
+    // so a taken port stops startup, and myko and the hook listener move to
+    // loopback behind them. Without it, nothing here runs.
+    let tls_front = if tls {
+        Some(TlsFront::start(bind_addr, hook_bind).await?)
+    } else {
+        None
+    };
+    let myko_bind = tls_front.as_ref().map_or(bind_addr, |front| front.myko);
 
     // Force-link entities + sagas so their `inventory` registrations aren't
     // dead-code-eliminated.
@@ -97,7 +121,7 @@ async fn main() -> Result<()> {
     // (lv-6731). Late-bound to the Postgres producer after build below.
     let session_filter = Arc::new(daemon::liveness_filter::SessionLivenessFilter::new());
     let mut builder = MykoServer::builder()
-        .with_bind_addr(bind_addr)
+        .with_bind_addr(myko_bind)
         .with_persister_override("Client", blackhole.clone())
         .with_persister_override("Server", blackhole.clone())
         // A wait dies with the daemon, so there's nothing to replay, and a held
@@ -227,14 +251,34 @@ async fn main() -> Result<()> {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     {
         let hook_ctx = Arc::new(server.ctx());
+        let hook_inner = tls_front.as_ref().map(|front| front.take_hook_listener());
         tokio::spawn(async move {
-            if let Err(e) = daemon::http_listener::run_until(hook_bind, hook_ctx, stop_rx).await {
+            let result = match hook_inner {
+                Some(listener) => {
+                    daemon::http_listener::serve_until(listener, hook_ctx, stop_rx).await
+                }
+                None => daemon::http_listener::run_until(hook_bind, hook_ctx, stop_rx).await,
+            };
+            if let Err(e) = result {
                 log::error!("[hook] listener exited: {e}");
             }
         });
     }
 
-    log::info!("marshal-daemon listening on ws://{bind_addr}, hooks on http://{hook_bind}");
+    match &tls_front {
+        Some(front) => log::info!(
+            "marshal-daemon listening on wss://{}, hooks on https://{} (TLS, fingerprint {}; \
+             myko on ws://{} and hooks on http://{}, loopback only)",
+            front.public,
+            front.public_hooks,
+            front.fingerprint,
+            front.myko,
+            front.hooks_inner,
+        ),
+        None => {
+            log::info!("marshal-daemon listening on ws://{bind_addr}, hooks on http://{hook_bind}");
+        }
+    }
     // The sweeper starts only once myko has replayed Postgres (MAR-19, from
     // MUS-58). `build` starts the replay in the background and only `run`
     // waits for it. See `cleanup::run_sweeper_when_ready`.
@@ -254,6 +298,79 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+/// The TLS listeners in front of myko and the hook listener (MAR-23).
+struct TlsFront {
+    /// The public WebSocket and MCP address, as bound.
+    public: SocketAddr,
+    /// The public hook address, as bound.
+    public_hooks: SocketAddr,
+    /// myko's loopback listener, behind `public`.
+    myko: SocketAddr,
+    /// The hook listener's loopback address, behind `public_hooks`.
+    hooks_inner: SocketAddr,
+    fingerprint: String,
+    hook_listener: std::sync::Mutex<Option<tokio::net::TcpListener>>,
+}
+
+impl TlsFront {
+    async fn start(bind: SocketAddr, hook_bind: SocketAddr) -> Result<Self> {
+        let myko = resolve_bind("MARSHAL_MYKO_BIND", DEFAULT_MYKO_BIND)?;
+        daemon::tls::require_loopback("MARSHAL_MYKO_BIND", myko)?;
+        let dir = daemon::controls::state_dir().ok_or_else(|| {
+            anyhow::anyhow!(
+                "marshal-daemon --tls: the state directory: HOME is not set; set MARSHAL_STATE_DIR"
+            )
+        })?;
+        daemon::controls::ensure_state_dir(&dir)
+            .with_context(|| format!("marshal-daemon --tls: state directory {}", dir.display()))?;
+        let identity = daemon::tls::load_or_create_identity(&daemon::tls::identity_dir(&dir))
+            .context("marshal-daemon --tls: the TLS certificate")?;
+        let acceptor = daemon::tls::acceptor(&identity)?;
+        // The hook listener is the daemon's own, so it can take a listener
+        // bound here on any loopback port. myko binds its own, on `myko`.
+        let loopback = if hook_bind.is_ipv6() {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        };
+        let hook_listener = tokio::net::TcpListener::bind(loopback)
+            .await
+            .context("marshal-daemon --tls: the loopback hook listener")?;
+        let hooks_inner = hook_listener.local_addr()?;
+        let public_listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("marshal-daemon --tls: binding {bind}"))?;
+        let public_hooks_listener = tokio::net::TcpListener::bind(hook_bind)
+            .await
+            .with_context(|| format!("marshal-daemon --tls: binding {hook_bind}"))?;
+        let public = public_listener.local_addr()?;
+        let public_hooks = public_hooks_listener.local_addr()?;
+        tokio::spawn(daemon::tls::serve(public_listener, acceptor.clone(), myko));
+        tokio::spawn(daemon::tls::serve(
+            public_hooks_listener,
+            acceptor,
+            hooks_inner,
+        ));
+        Ok(Self {
+            public,
+            public_hooks,
+            myko,
+            hooks_inner,
+            fingerprint: identity.fingerprint(),
+            hook_listener: std::sync::Mutex::new(Some(hook_listener)),
+        })
+    }
+
+    /// The loopback hook listener, once.
+    fn take_hook_listener(&self) -> tokio::net::TcpListener {
+        self.hook_listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the hook listener is taken once")
+    }
+}
+
 /// Put stored entities straight into myko's stores, as myko's own Postgres
 /// consumer does at boot (`apply_remote_event`): no cascades, which already
 /// ran when they were written, and nothing written back to the store file.
@@ -328,12 +445,19 @@ Commands:
                   hooks for a while, so a stale waiter can't put it back
 
 Options:
+  --tls          Serve TLS on MARSHAL_BIND and MARSHAL_HOOK_BIND with a
+                 self-signed certificate kept in the state directory; clients
+                 pin its fingerprint (state directory's tls/fingerprint).
+                 myko and the hook listener move to loopback behind it
+  --plain        No TLS (the default)
   -h, --help     Print this help and exit
   -V, --version  Print the version and exit
 
 Environment:
   MARSHAL_BIND       WebSocket and MCP listen address (default {DEFAULT_BIND})
   MARSHAL_HOOK_BIND  HTTP hook listen address (default {DEFAULT_HOOK_BIND})
+  MARSHAL_MYKO_BIND  With --tls, myko's own listener behind MARSHAL_BIND;
+                     loopback only (default {DEFAULT_MYKO_BIND})
   MYKO_POSTGRES_URL  Postgres URL for durable state; without it the daemon
                      runs ephemeral and keeps nothing across a restart
   MARSHAL_PERSIST    Set to `file`, with no Postgres, to keep messages, read
