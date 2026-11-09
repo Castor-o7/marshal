@@ -12,7 +12,11 @@ Goal: bring the muster features the ignition-is-go team asked for into Marshal, 
 
 Everything else here supports those three, or follows them.
 
-## Direction (operator, 2026-11-08)
+## Direction (operator, 2026-11-08, updated 2026-11-09)
+
+**Today's primary goal (operator, 2026-11-09):** Marshal gets muster's capabilities while staying
+lightweight and durable, working in both Codex and Claude Code TUIs, and is deployed as soon as
+possible. Each green fork `main` is deployed on Murph by the lamplighter.
 
 Muster is frozen. Castor-o7/marshal is the only active line, and muster is kept as the archive the
 ports come from. The ignition-is-go lead's invitation was to help Marshal rather than run a separate
@@ -25,14 +29,15 @@ The goals are security, durability and portability, and Marshal's core concept s
 message bus with a roster, for many harnesses. Work sits in one of three layers:
 
 1. **Upstream Marshal, the bus.** Additive or opt-in changes only, so a user who changes nothing
-   sees no difference. Default changes go to upstream as one issue (MAR-15).
+   sees no difference. Default changes go upstream as PRs with working solutions, one at a time
+   (MAR-15; operator, 2026-11-09).
 2. **This fork, where changes get tested.** Changes are proven on Murph before they're offered upstream.
 3. **Outside Marshal.** Rally, the watchman and the team process. These never go upstream.
 
-Most of Goals 1–3 and the conformance suite (MAR-14) are built and verified, waiting for their
-ticks. Next comes security (MAR-37, MAR-38, then the gate stories), with durability and portability
-stories filling the gaps. MAR-14 is test-only, which makes it the most useful thing to offer
-upstream next.
+Goals 1–3 and the conformance suite (MAR-14) are built and verified. The biggest gap left to muster
+is its gate. The fork has taken myko#129 (MAR-37, #97), so the gate is now built fork-side on #129's
+hooks (MAR-23, MAR-24, MAR-80, MAR-81; mapped in [gate-on-myko-129.md](gate-on-myko-129.md)) and goes
+upstream later as a draft PR (MAR-38).
 
 This file lives on the Castor fork (Castor-o7/marshal) only, for Rally (project MAR); never send it
 upstream. The operator's planning doc is
@@ -50,8 +55,9 @@ fork's `main`.
 2. Open a PR on Castor-o7/marshal, with the story ID in the title and commits.
 3. Ask the watchman for a read at the PR's head, and merge only after it and a green CI.
 4. Once fork `main` is green, the lamplighter deploys it as Murph's live daemon.
-5. Upstream, later, and only when the operator decides: one small additive PR at a time. Default
-   changes go to upstream as one issue (MAR-15), not as PRs.
+5. Upstream, later, and only when the operator decides: one small PR at a time, the next only
+   once the previous is merged or answered. Default changes go as PRs with working solutions too
+   (MAR-15), and opt-in auth as a draft PR on myko#129 (MAR-38) (operator, 2026-11-09).
 
 ## In flight
 
@@ -144,6 +150,13 @@ launcher.
   accepts a connection, and whether Claude Code has the MCP server and every hook in
   `plugins/marshal-shim/hooks/hooks.json` once each; it changes nothing, and exits non-zero on any
   failure.
+- [ ] **MAR-78: Goal 3: A terminal's tell is named as a terminal on its machine.** Found in MAR-70:
+  each `marshal-shim tell` sends from a short-lived terminal session with a throwaway nickname, so
+  recipients took it for a new peer. Done when: a message records its sender's kind and machine from
+  the sender's roster row at send time; the hook inbox, the live-push banner and the MCP messages view
+  name a terminal's message as "a terminal on <machine>" from that record, never from the body; a peer
+  can't pose as a terminal by writing the prefix; and a sender that changes kind later doesn't relabel
+  earlier mail, with tests through the real hook listener (#99).
 
 - [ ] **MAR-78: Goal 3: A terminal's tell is named as a terminal on its machine.** Found in MAR-70:
   a recipient saw each `tell` as "from gusty-dorado", a throwaway nickname that's new on every run,
@@ -242,6 +255,25 @@ launcher.
   the PR's head. Upstream has the same test, so the fix is its own commit, touching only
   `crates/shim/tests/claude_hook.rs`, for a later upstream PR if the operator wants one.
   Done (#67), merged in ea4299f.
+- [ ] **MAR-79: Design: two-phase delivery, so mail taken mid-turn isn't lost.** A Claude session's
+  background `claude-hook wait` acks mail when it hands it over, so the daemon marks it read while
+  Claude Code still holds it until the turn ends, and a crash or `/exit` in between loses it.
+  Design only. Done when: [two-phase-delivery.md](two-phase-delivery.md) sets out the gap and what's
+  already safe, proposes offer-then-confirm from the session's own transcript (and the smaller Codex
+  gap), and lists what changes, the tests it needs and the questions for the operator (#100).
+- [ ] **MAR-82: Durability: Two-phase delivery for Claude sessions.** The build of MAR-79, with the
+  operator's answers (2026-11-09): confirm "seen" from the session's own transcript; re-offer after
+  6 h unconfirmed (at least once); Claude first, with Codex as its own story; built and proven on
+  the fork first, then offered upstream as one PR in the one-at-a-time queue. Done when: a Claude
+  session's waiter acks mail as offered, not read; a later hook finds the inbox block's ids in the
+  session's transcript (in `user` or `attachment` records, never `enqueue`) and marks it read; the
+  transcript matcher is isolated and tested against records captured from Claude Code, so a format
+  change fails safe (nothing matches and the mail stays offered, never lost); a session whose
+  transcript already shows a message isn't handed it again; an offer unconfirmed at SessionEnd or
+  reap is dropped, so the mail is unread again for that session or, by MAR-42, its successor; one
+  unconfirmed for 6 h is offered again; a shim that sends no phase keeps today's behaviour (the ack
+  marks it read); and a test kills a session mid-turn and its mail is still unread (MAR-79's check
+  5).
 
 - [ ] **MAR-79: Supporting: Design two-phase delivery, so mail taken mid-turn isn't lost.** Found in
   MAR-70 and MAR-73: a Claude session's background `claude-hook wait` takes a message as soon as it's
@@ -264,19 +296,26 @@ launcher.
 - [x] **MAR-13: Later: OpenCode plugin declares its channel.** From MUS-89. Done when: the plugin
   reports its channel state when it registers, and the roster's `wake` for it matches what it can do.
 
-## Security: agree the shape with upstream first
+## Security: muster's gate, on myko#129
 
-The gate stories below (MAR-23 to MAR-25) wait on myko#129, trevorsargent's PR that adds auth
-providers, machine credentials and authenticated gateways to myko itself. So the gate is built on
-that PR, not on a patched myko-server, and its shape is agreed upstream before any code.
+The gate is built on myko#129, trevorsargent's PR that adds auth providers and machine credentials
+to myko itself, not on a patched myko-server. The fork pins #129 by `rev` until it's released
+(MAR-37). The gate stories are written fork-side (watchman, 2026-11-09). Upstream gets them later
+as a draft PR (MAR-38), and its answers may still change them. Every piece is opt-in: plain mode
+stays the default and behaves as it does today.
 
-- [ ] **MAR-37: Security: Help land myko#129 and check it against the threat model.** Done when:
-  myko#129's auth provider and machine credentials have been tried against muster's four attackers
-  (a web page, one compromised session, a LAN device, a stolen machine), and what it covers and
-  doesn't is posted on myko#129 as a review or comment, by Josh or with his OK.
-- [ ] **MAR-38: Security: Propose opt-in authentication upstream as a design issue.** Draft in
-  [upstream-auth-issue-draft.md](upstream-auth-issue-draft.md). Needs the operator: Josh files it.
-  Done when: the issue is filed on ignition-is-go/marshal, and the gate stories are revised to
+- [ ] **MAR-37: Security: Try myko#129 against the threat model, and take it on the fork.** Done
+  when: #129's auth provider has been tried with Marshal's commands against muster's four attackers
+  (a web page, one compromised session, a LAN device, a stolen machine), with the result in
+  [myko-129-review-notes.md](myko-129-review-notes.md) (#81, #87); and the fork's myko crates are
+  pinned to #129 with `myko-auth`'s licence allowed in `deny.toml` and the threat-model tests in CI
+  (#97). The operator shelved the draft comment for #129 (2026-11-09): it isn't posted.
+- [ ] **MAR-38: Security: Offer opt-in authentication upstream as a draft PR on myko#129.** The
+  operator chose a PR over a design issue (2026-11-09). The draft issue text
+  ([upstream-auth-issue-draft.md](upstream-auth-issue-draft.md)) becomes the PR's description.
+  Done when: a draft PR on ignition-is-go/marshal, cut from upstream `main`, adds opt-in auth on
+  #129, off by default, built from what MAR-23, MAR-24, MAR-80 and MAR-81 proved on the fork, with
+  their tests. It says plainly that it waits on #129's release, and the gate stories are revised to
   match the maintainers' answers.
 - [x] **MAR-39: Docs: README says the daemon binds 0.0.0.0, but it binds 127.0.0.1.** Found while
   reading myko#129 for MAR-37: `DEFAULT_BIND` in `crates/daemon/src/main.rs` is `127.0.0.1:6155`,
@@ -284,7 +323,52 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
   it stands. Done when: the README matches the code, merged on the fork, and Josh has the branch to
   send upstream.
 
-MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
+- [ ] **MAR-76: Security: Map the gate stories onto myko#129's hooks.** From the watchman
+  (2026-11-09). Docs only. Done when: [gate-on-myko-129.md](gate-on-myko-129.md) says, for each piece
+  of muster's gate and for MAR-23, 24, 25 and 8, which #129 hook at `f6028125` it would use, what
+  Marshal still writes, and which of MAR-38's questions it waits on, with proposed revisions to the
+  gate stories that aren't applied until MAR-38 is answered. Done (#95), merged in 0380d4a; the
+  watchman then had the revisions applied fork-side.
+- [ ] **MAR-23: Security: Gate: opt-in TLS.** From MAR-76's map, with MAR-25's remnant folded in.
+  `marshal-daemon --tls`; plain stays the default. #129 has no TLS, so the daemon terminates it.
+  Done when: with `--tls`, a TLS listener on `MARSHAL_BIND` serves a self-signed certificate made at
+  first start and kept in the state directory; myko and the hook listener bind loopback only behind
+  it, and requests are forwarded to them by path; the shim, hooks and tools connect through it with
+  the certificate's SHA-256 fingerprint pinned, and a wrong pin is refused; without `--tls` nothing
+  changes; e2e tests cover a pinned connect and delivery, a wrong pin, and plain mode unchanged; and
+  the PR says what it adds to the binaries' size and dependencies (rustls is already in the
+  daemon's tree, through myko's telemetry).
+- [ ] **MAR-24: Security: Gate: per-machine pairing.** Depends on MAR-23. A Marshal `Authenticator`
+  on #129. Done when: a machine pairs with a single-use, expiring code and gets a token kept in a
+  pairing store; the shim presents it through #129's `CredentialProvider`; an unpaired or revoked
+  machine is refused, and revoking closes its open connection; and with pairings and neither `--tls`
+  nor `--plain` the daemon refuses to start, as it does when the store can't be read.
+- [x] **MAR-25: Dropped: Gate: myko's own listener behind the gate.** Superseded by #129 (MAR-76):
+  with `with_auth_provider`, myko checks every connection's token itself, so no vendored
+  `RequestFilter` is needed. Its remnant, binding myko to loopback behind TLS, is part of MAR-23.
+- [ ] **MAR-80: Security: With auth on, a connection acts only as its own sessions.** A
+  `SessionBinding` Authorizer (`crates/daemon/src/auth/`) wraps the provider's own. Done when, with a
+  provider on: a principal owns the sessions it registers (`RegisterSession`, or the raw `Session`
+  SET fallback), and a session owned by another principal can't be re-registered by it; a command
+  naming a session it doesn't own (`asSession`; a `SetSession*` setter's id) and a client event
+  writing another's `Session`, `Message` (as its sender), `MessageRead`, `RoomMember` or
+  `WakeWatcher` are refused with "permission denied", without dropping the connection, and
+  daemon-owned entities (`SessionIdentity`, `SessionNickname`, `Succession`) can't be written by a
+  client at all; sessions registered through the hook listener belong to a configured local
+  principal (the daemon host's own token), so a Codex session works under it and a remote principal
+  can't act for it, and with no local principal they're unowned and refused; a principal's entries go
+  when its session ends or is forgotten; plain mode is unchanged; in-process tests as in #84 for
+  each. The doc says plainly that the hook listener itself isn't covered (MAR-81), and that the local
+  token is a loopback trust boundary: on a shared machine its file must be owner-only (0600).
+- [ ] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
+  listener is outside myko, so #129 doesn't cover it. Done when: with a provider on, every `/hook/*`
+  request must carry the daemon host's local token or a paired machine's token as
+  `Authorization: Bearer`, checked by the same `Authenticator`, and gets 401 otherwise; the local
+  token is made at first start in an owner-only (0600) file that the hooks and local tools read; a
+  refused hook says which token file it wanted; and plain mode is unchanged, with tests.
+- [ ] **MAR-8: Security: TLS restart doesn't miss its takeover.** From MUS-93: an intermittent miss
+  on CI's slower runner. Depends on MAR-23. Done when: the restart-keeps-identity cell passes in TLS
+  mode on CI 10 times in a row.
 
 ## Cutover
 
@@ -422,15 +506,17 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
 
 ## Later: strengthen Marshal
 
-- [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
-  upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
-  write until it's registered (MUS-72, 78, 79; built on the fork as MAR-43), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
-  predecessor's nickname by harness and directory (MAR-9) and hand it the unread mail (MAR-42), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), have `current_task` follow the branch (MAR-20), a `MARSHAL_PERSIST` other than `file` stops startup (MAR-53: so a typo can't silently lose mail; before, the variable meant nothing), and
-  optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
-  (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
-  resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
-  [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), unsent. Done when: the draft is agreed with the
-  commissioner and the operator has filed it.
+- [ ] **MAR-15: Later: Offer the default changes upstream as PRs, one at a time.** The operator chose
+  PRs with working solutions over one issue (2026-11-09). The items are those in
+  [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), each already built and merged
+  on the fork: hold a shim's first write until it's registered (MAR-43, with MAR-18), keep a waiting
+  session through a drop (MAR-6), a restarted session keeps its nickname (MAR-9) and takes over its
+  unread mail (MAR-42), ended sessions leave rooms (MAR-19), `current_task` follows the branch
+  (MAR-20, a possible default), and a Codex session can count as dead from its bridge's signal
+  (MAR-54). The draft's text becomes each PR's description. Done when: each item has gone upstream
+  as its own PR, cut from upstream `main` with its tests; a PR is opened only once the previous
+  one (or upstream #168 and #169, ahead of them) is merged or answered; and each has been merged,
+  declined or answered.
 - [x] **MAR-66: Later: List what the fork could offer upstream as small additive PRs.** Beside
   MAR-15, which is the single issue for default changes. From the watchman (2026-11-09), for Josh's
   upstream decisions; nothing is sent. Done when: [upstream-offers.md](upstream-offers.md) lists
@@ -532,19 +618,3 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   `MykoServer::run_with_socket(TcpSocket)`, so `run()` keeps myko#33's late `listen`.
 - [x] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
-- [ ] **MAR-76: Security: Map the gate stories onto myko#129's hooks.** From the watchman
-  (2026-11-09). Docs only. Done when: [gate-on-myko-129.md](gate-on-myko-129.md) says, for each piece
-  of muster's gate and for MAR-23, 24, 25 and 8, which #129 hook at `f6028125` it would use, what
-  Marshal still writes, and which of MAR-38's questions it waits on, with proposed revisions to the
-  gate stories that aren't applied until MAR-38 is answered.
-- [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
-  myko#129 (its auth provider) and MAR-38 (upstream's answers decide the flag and shape). Done when: `--tls` serves pinned TLS, plain mode is unchanged, and the
-  gate's e2e checks for TLS pass.
-- [ ] **MAR-24: Later: Gate: per-machine pairing.** Depends on MAR-23. Done when: a machine pairs with
-  a one-time code, an unpaired machine is refused, and with pairings and neither `--tls` nor `--plain`
-  the daemon refuses to start.
-- [ ] **MAR-25: Later: Gate: myko's own listener behind the gate.** Depends on MAR-24. Done when:
-  myko's listener admits only requests forwarded by the gate, with no vendored myko-server.
-- [ ] **MAR-8: Later: TLS restart doesn't miss its takeover.** From MUS-93: an intermittent miss on
-  CI's slower runner. Depends on MAR-23. Done when: the restart-keeps-identity cell passes in TLS mode
-  on CI 10 times in a row.
