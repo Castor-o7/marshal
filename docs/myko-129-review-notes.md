@@ -1,9 +1,12 @@
 # Notes on myko#129 for MAR-37
 
 Fork-only. This is a read of ignition-is-go/myko#129 (trevorsargent's auth PR), first at `fcdbc52b`
-and again at `f6028125`, checked against the four attackers in muster's threat model. The comment
-below is for Josh to post on the PR if he wants to, after changing it however he likes. Nothing has
-been posted.
+and again at `f6028125`, checked against the four attackers in muster's threat model.
+
+**Josh's decisions (2026-11-09):** the draft comment below is shelved, not posted. The fork takes
+#129: its myko crates are pinned to the PR by `rev` (at `59db024a`, #129's head that evening), and
+`deny.toml` allows `myko-auth`'s AGPL licence. The four threat-model tests from draft #84 moved to
+`crates/daemon/tests/myko129_threat_model.rs`, so they run on every PR.
 
 ## Where it stands (checked 2026-11-09, evening)
 
