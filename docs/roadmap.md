@@ -289,13 +289,17 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
   `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
   and its exit status unchanged, with tests. Done (#58), merged in 2271713.
-- [x] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
+- [ ] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
   (2026-11-09) for rally's cutover.md step 1, with MAR-59's kit. Done when: a fresh session wired only
   to Marshal through project-local files shows on `marshal-shim roster`, wakes when idle on `tell`, and
   gets mail sent before a `marshal-daemon` restart after it, with nothing user-wide changed and
   muster-daemon untouched; the run, its outputs and what went wrong are recorded in
   [cutover-test-session.md](cutover-test-session.md), and the kit is corrected where the run showed it
-  wrong. Found MAR-71. Done (#80), merged in 9ac68b6.
+  wrong. Found MAR-71. The first run's record was merged in #80 (9ac68b6). Reopened by the watchman
+  (2026-11-09): that run's check 4 didn't test unread mail across a restart, because the held wait
+  hook took the token 0.2 s after the send, before the restart. Done when, as well: mail is shown
+  unread in the `marshal` database at a `marshal-daemon` restart (no `MessageRead` before it, read
+  only), and it reaches the session once afterwards.
 - [x] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
   step 7 retires Muster "only after a full day with no traffic", which nothing defined. Done when:
   [muster-no-traffic-check.md](muster-no-traffic-check.md) defines no traffic (no message and no
@@ -312,6 +316,14 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   empty or `/` path means `/myko`, no port means 5155), names that URL in its finding, and a test
   server that serves `/myko` only passes; doctor built from the branch, run against the live daemon on
   Murph, says `ok daemon`. Done (#79), merged in 98da488.
+- [ ] **MAR-73: Cutover: what "as reliable as Muster" means, measured on Murph.** Josh keeps both
+  daemons running, each as the other's backup, until Marshal is as reliable as Muster (the watchman's
+  assignment, 2026-11-09). Done when: [reliability-vs-muster.md](reliability-vs-muster.md) gives a few
+  checkable measures (restarts and crashes, errors and refusals, mail taken and how fast, unread mail
+  across a restart, sessions lost or duplicated), a read-only way to take each from both daemons on
+  Murph (journal, and the `muster` and `marshal` databases with only `SELECT`s), one run over the last
+  24 h for both with its outputs recorded, and a proposed bar for Josh to accept or change. Nothing on
+  either daemon changes.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
