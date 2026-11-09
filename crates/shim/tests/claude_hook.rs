@@ -941,13 +941,23 @@ fn prompt_listener(
     (base, rx)
 }
 
+/// The Codex tests' own session id, so a Claude test's marker can't be read
+/// as theirs.
+const CODEX_SESSION: &str = "itest-codex";
+
+fn codex_marker(config: &std::path::Path) -> std::path::PathBuf {
+    config
+        .join("marshal")
+        .join(format!("offered-{CODEX_SESSION}"))
+}
+
 fn run_codex_prompt_submit(
     base: &str,
     config: &std::path::Path,
     transcript: Option<&std::path::Path>,
 ) {
     let input = serde_json::json!({
-        "session_id": "itest-claude",
+        "session_id": CODEX_SESSION,
         "turn_id": "turn-1",
         "transcript_path": transcript,
         "cwd": "/tmp/proj",
@@ -1019,7 +1029,7 @@ fn a_codex_hook_with_a_rollout_acks_its_mail_offered() {
         .expect("an ack");
     let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
     assert_eq!(ack["phase"], "offered", "{ack}");
-    assert!(offered_marker(&config).exists());
+    assert!(codex_marker(&config).exists());
 }
 
 #[test]
@@ -1038,7 +1048,7 @@ fn a_codex_hook_with_no_rollout_reads_at_once_and_says_so() {
     let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
     assert!(ack.get("phase").is_none(), "{ack}");
     assert_eq!(ack["rollout"], false, "{ack}");
-    assert!(!offered_marker(&config).exists());
+    assert!(!codex_marker(&config).exists());
 }
 
 #[test]
@@ -1046,7 +1056,7 @@ fn a_codex_hook_confirms_mail_the_model_answered_after() {
     let (base, seen) = prompt_listener(3, "", &[OFFERED_ID]);
     let config = temp_config("codex-confirm");
     std::fs::create_dir_all(config.join("marshal")).unwrap();
-    std::fs::write(offered_marker(&config), "").unwrap();
+    std::fs::write(codex_marker(&config), "").unwrap();
     let rollout = rollout_with(&config, &[assistant_line()]);
 
     run_codex_prompt_submit(&base, &config, Some(&rollout));
@@ -1071,7 +1081,7 @@ fn a_codex_turn_that_stopped_before_the_model_isnt_confirmed() {
     let (base, seen) = prompt_listener(2, "", &[OFFERED_ID]);
     let config = temp_config("codex-stopped");
     std::fs::create_dir_all(config.join("marshal")).unwrap();
-    std::fs::write(offered_marker(&config), "").unwrap();
+    std::fs::write(codex_marker(&config), "").unwrap();
     let rollout = rollout_with(&config, &[]);
 
     run_codex_prompt_submit(&base, &config, Some(&rollout));

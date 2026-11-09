@@ -174,7 +174,11 @@ impl Leases {
 
 static LEASES: LazyLock<Mutex<Leases>> = LazyLock::new(Mutex::default);
 
-/// Sessions already logged as acking without a rollout file (MAR-84).
+/// Sessions already logged as acking without a rollout file (MAR-84). One
+/// entry per such Codex session; emptied once it reaches
+/// `NO_ROLLOUT_NOTED_MAX`, so it stays bounded (a session may then be noted
+/// a second time).
+const NO_ROLLOUT_NOTED_MAX: usize = 10_000;
 static NO_ROLLOUT_NOTED: LazyLock<Mutex<HashSet<SessionId>>> = LazyLock::new(Mutex::default);
 
 fn lease_duration() -> Duration {
@@ -272,7 +276,12 @@ fn handle_ack(body: &[u8], ctx: &Arc<MykoServerContext>) -> HookOutcome {
     if no_rollout
         && let Some(session) = &session
         && let Ok(mut noted) = NO_ROLLOUT_NOTED.lock()
-        && noted.insert(session.clone())
+        && {
+            if noted.len() >= NO_ROLLOUT_NOTED_MAX {
+                noted.clear();
+            }
+            noted.insert(session.clone())
+        }
     {
         log::warn!(
             "[hook] {}: Codex hook names no rollout file, so its mail is marked read when handed on, without two-phase delivery (MAR-84)",
