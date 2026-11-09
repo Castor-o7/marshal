@@ -342,7 +342,7 @@ stays the default and behaves as it does today.
   Marshal still writes, and which of MAR-38's questions it waits on, with proposed revisions to the
   gate stories that aren't applied until MAR-38 is answered. Done (#95), merged in 0380d4a; the
   watchman then had the revisions applied fork-side.
-- [ ] **MAR-23: Security: Gate: opt-in TLS.** From MAR-76's map, with MAR-25's remnant folded in.
+- [x] **MAR-23: Security: Gate: opt-in TLS.** From MAR-76's map, with MAR-25's remnant folded in.
   `marshal-daemon --tls`; plain stays the default. #129 has no TLS, so the daemon terminates it.
   Done when: with `--tls`, a TLS listener on `MARSHAL_BIND` serves a self-signed certificate made at
   first start and kept in the state directory; myko and the hook listener bind loopback only behind
@@ -350,7 +350,9 @@ stays the default and behaves as it does today.
   the certificate's SHA-256 fingerprint pinned, and a wrong pin is refused; without `--tls` nothing
   changes; e2e tests cover a pinned connect and delivery, a wrong pin, and plain mode unchanged; and
   the PR says what it adds to the binaries' size and dependencies (rustls is already in the
-  daemon's tree, through myko's telemetry).
+  daemon's tree, through myko's telemetry). Done in two parts: the daemon (#102, merged in
+  d2925e1) and the shim's pinned link (#104, merged in a49ade4). Each binary grows by 1.9 MB, on
+  ring. Off until the operator starts the daemon with `--tls`.
 - [ ] **MAR-24: Security: Gate: per-machine pairing.** Depends on MAR-23. A Marshal `Authenticator`
   on #129. Done when: a machine pairs with a single-use, expiring code and gets a token kept in a
   pairing store; the shim presents it through #129's `CredentialProvider`; an unpaired or revoked
@@ -359,7 +361,7 @@ stays the default and behaves as it does today.
 - [x] **MAR-25: Dropped: Gate: myko's own listener behind the gate.** Superseded by #129 (MAR-76):
   with `with_auth_provider`, myko checks every connection's token itself, so no vendored
   `RequestFilter` is needed. Its remnant, binding myko to loopback behind TLS, is part of MAR-23.
-- [ ] **MAR-80: Security: With auth on, a connection acts only as its own sessions.** A
+- [x] **MAR-80: Security: With auth on, a connection acts only as its own sessions.** A
   `SessionBinding` Authorizer (`crates/daemon/src/auth/`) wraps the provider's own. Done when, with a
   provider on: a principal owns the sessions it registers (`RegisterSession`, or the raw `Session`
   SET fallback), and a session owned by another principal can't be re-registered by it; a command
@@ -373,7 +375,7 @@ stays the default and behaves as it does today.
   when its session ends or is forgotten; plain mode is unchanged; in-process tests as in #84 for
   each. The doc says plainly that the hook listener itself isn't covered (MAR-81), and that the local
   token is a loopback trust boundary: on a shared machine its file must be owner-only (0600). The
-  doc is [session-binding.md](session-binding.md).
+  doc is [session-binding.md](session-binding.md). Done (#105), merged in defa09c.
 - [ ] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
   listener is outside myko, so #129 doesn't cover it. Done when: with a provider on, every `/hook/*`
   request must carry the daemon host's local token or a paired machine's token as
