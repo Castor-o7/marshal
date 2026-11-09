@@ -16,9 +16,10 @@ jobs:
     # "ram-ge-16g", "disk-ge-100g"]; never send this hunk upstream.
     runs-on: ubuntu-latest
     # Backstop so a stuck step (e.g. a flaky apt mirror, a hung runner) fails
-    # in minutes instead of burning to GitHub's 6-hour default. Longer than
-    # upstream's 30: a hosted runner has fewer cores and a colder cache.
-    timeout-minutes: 60
+    # in minutes instead of burning to GitHub's 6-hour default. MAR-74: each
+    # job's limit is about 4x its slowest green run on the fork's hosted
+    # runners (60 runs to 2026-11-09). check: median 5.7 min, slowest 7.4.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -109,7 +110,10 @@ jobs:
   windows-cross-check:
     # Castor fork only: GitHub-hosted, as for `check` above.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # MAR-74: median 49 s, slowest 4.4 min. It hung twice on 2026-11-09: once
+    # until the old 30-minute limit, once 20 minutes until cancelled. Its
+    # rerun passed in 42 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Report runner resources
@@ -148,6 +152,7 @@ jobs:
   # app-servers, so each bridge must wake only the thread its endpoint owns.
   windows-native-wake:
     runs-on: windows-2025
+    # MAR-74: median 4.9 min, slowest 5.7. Unchanged.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -182,7 +187,8 @@ jobs:
   # Castor fork: GitHub-hosted, as `check` is.
   conformance:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # MAR-74: median 4.6 min, slowest 6.5.
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:16
@@ -230,7 +236,9 @@ jobs:
   # with its lockfile, so no third-party action runs.
   dependency-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # MAR-74: median 15 s, slowest 38 s with a warm cache. A cold one builds
+    # cargo-deny from source, which takes a few minutes, hence 10.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable

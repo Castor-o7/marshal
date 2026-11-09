@@ -411,6 +411,13 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   healthy one accepted, the retry landing on a fresh port, and all three lost. Assumes Codex fails
   its bind within the settle window; one that took longer would still be trusted. The proxy port
   the bridge binds itself fails clearly if lost, and isn't retried. Done (#72), merged in b9f3d26.
+- [ ] **MAR-74: Durability: Every CI job has a timeout, so a hung runner fails fast.** From the
+  watchman (2026-11-09, issues log 4.4). windows-cross-check hung twice that day, once until its
+  30-minute limit and once for 20 minutes until cancelled, and each rerun passed in under a minute.
+  Every job already had a limit, but at 3–8x what was needed. Fork-only: upstream bounds its own jobs
+  (30, 20 and 20 minutes) on self-hosted runners whose times the fork can't measure. Done when: each
+  job's `timeout-minutes` is about 3–5x its slowest green run in the fork's last 60 runs, each with a
+  comment giving those times, and CI passes with the new limits.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
   `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
