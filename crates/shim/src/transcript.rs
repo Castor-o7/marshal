@@ -245,6 +245,9 @@ pub fn codex_seen_in(text: &str, ids: &[String]) -> Vec<String> {
 /// Call items Codex itself runs and records an output for (`*_output` with
 /// the same `call_id`). Server-side calls (`web_search_call`,
 /// `image_generation_call`) have no output and don't hold anything back.
+/// `local_shell_call` and `tool_search_call` may have a null `call_id`; such a
+/// call opens nothing, so a line recorded after it falls back to the plain
+/// rule (the next model output confirms it).
 const CLIENT_CALLS: &[&str] = &[
     "function_call",
     "custom_tool_call",
