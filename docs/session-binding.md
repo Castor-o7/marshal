@@ -69,7 +69,7 @@ without bound. A re-registered id after a release is free to whoever registers i
   principal to claim it wins. A session-end or sweep of a row with no binding is harmless.
 - **Succession isn't principal-aware.** A dead principal A's session can be succeeded by a session of
   principal B with the same identity key, which takes its nickname and unread mail (MAR-9, MAR-42).
-  That's a follow-up story, reserved by the watchman.
+  That's MAR-83.
 
 ## Tests
 
