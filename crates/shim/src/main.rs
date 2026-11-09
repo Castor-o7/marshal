@@ -26,6 +26,7 @@ mod statusline;
 mod terminal_send;
 mod tls_link;
 mod tools;
+mod transcript;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -1092,6 +1093,7 @@ fn forward_push(notifier: &mcp::Notifier, client: &Arc<MykoClient>, cmd: NotifyC
         let _ = client.send_command::<AckMessages, AckMessagesResult>(&AckMessages {
             message_ids: vec![message_id],
             as_session: None,
+            phase: None,
         });
     });
 }

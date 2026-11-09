@@ -314,7 +314,7 @@ impl CommandHandler for SendMessage {
                         // operator, not treat it as ordinary peer chatter.
                         "to_operator": to_operator,
                         "response_required": self.response_required,
-                        "body": context_body,
+                        "body": crate::message::push_body(&context_body),
                         "body_truncated": body_truncated,
                         "sent_at": now,
                     }),

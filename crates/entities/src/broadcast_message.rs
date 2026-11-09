@@ -257,7 +257,7 @@ impl CommandHandler for BroadcastMessage {
                         "to_operator": to_operator,
                         "room": room.id.0.as_ref(),
                         "response_required": self.response_required,
-                        "body": context_body,
+                        "body": crate::message::push_body(&context_body),
                         "body_truncated": body_truncated,
                         "sent_at": now,
                     }),
