@@ -113,7 +113,7 @@ jobs:
     # MAR-74: median 49 s, slowest 4.4 min. It hung twice on 2026-11-09: once
     # until the old 30-minute limit, once 20 minutes until cancelled. Its
     # rerun passed in 42 s.
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Report runner resources
