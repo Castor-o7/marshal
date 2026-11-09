@@ -46,14 +46,27 @@ struct Cell {
 }
 
 impl Cell {
+    /// A cell on a free port. The port is picked by binding port 0 and
+    /// closing it, so another process can take it first: then it's picked
+    /// again (MAR-21).
     fn spawn() -> Self {
         marshal_entities::link();
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .and_then(|listener| listener.local_addr())
-            .expect("reserve port")
-            .port();
-        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut lost = Vec::new();
+        for _ in 0..5 {
+            let bind = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .and_then(|listener| listener.local_addr())
+                .expect("pick a free port");
+            match Self::try_spawn(bind) {
+                Ok(cell) => return cell,
+                Err(why) => lost.push(format!("{bind}: {why}")),
+            }
+        }
+        panic!("no free port held for the test cell: {lost:?}");
+    }
+
+    fn try_spawn(bind: SocketAddr) -> Result<Self, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (failed_tx, failed_rx) = std::sync::mpsc::channel::<String>();
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
         let join = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -70,18 +83,43 @@ impl Cell {
                 );
                 ready_tx.send(server.ctx()).expect("publish cell context");
                 tokio::select! {
-                    result = server.run() => result.expect("run test cell"),
+                    result = server.run() => {
+                        if let Err(e) = result {
+                            let _ = failed_tx.send(e.to_string());
+                        }
+                    }
                     _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()) => {}
                 }
             });
         });
         let ctx = Arc::new(ready_rx.recv_timeout(WAIT).expect("cell context"));
-        Self {
+        // A port another process holds accepts connections too; the cell's
+        // own bind failure comes at once, so it's waited for a moment.
+        let deadline = Instant::now() + WAIT;
+        while std::net::TcpStream::connect(bind).is_err() {
+            if let Ok(why) = failed_rx.try_recv() {
+                // The thread's runtime waits on the shutdown channel as it ends.
+                drop(shutdown_tx);
+                let _ = join.join();
+                return Err(why);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("nothing listening on {bind}"));
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if let Ok(why) = failed_rx.recv_timeout(Duration::from_millis(200)) {
+            // The thread's runtime waits on the shutdown channel as it ends.
+            drop(shutdown_tx);
+            let _ = join.join();
+            return Err(why);
+        }
+        Ok(Self {
             address: format!("ws://{bind}"),
             ctx,
             shutdown: Some(shutdown_tx),
             join: Some(join),
-        }
+        })
     }
 
     fn context(&self) -> CommandContext {
@@ -141,6 +179,8 @@ impl Cell {
                 project: None,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness: None,
+                identity: None,
             })
             .expect("register sender");
     }
@@ -185,6 +225,7 @@ impl Cell {
             to_session_id: SessionId(Arc::from(to)),
             body: body.into(),
             as_session: Some(SessionId(Arc::from(SENDER))),
+            idempotency_key: None,
         }
         .execute(self.context())
         .expect("send message");
@@ -225,6 +266,8 @@ impl ClaudeShim {
                 "plugin:marshal-shim@marshal",
             ])
             .env("SHIM", SHIM)
+            // MAR-56: the shim refuses the default daemon if it ever falls back.
+            .env("MARSHAL_TEST", "1")
             .env("HOME", home.path())
             // The daemon-address file outranks the env var, and
             // `XDG_CONFIG_HOME` is searched first: point it at the temp home
@@ -397,33 +440,50 @@ fn ordinary_shim_preserves_hook_metadata_and_exposes_it_in_resources() {
     let row = shim.wait_registered(&cell, me);
     assert_eq!(row.agent_id, seed.agent_id);
     let stdout = lines_of(shim.wrapper.stdout.take().unwrap());
-    for (id, uri) in [(11, "marshal://whoami"), (12, "marshal://roster")] {
-        writeln!(
-            shim.wrapper.stdin.as_mut().unwrap(),
-            "{}",
-            serde_json::json!({
-                "jsonrpc":"2.0", "id": id, "method":"resources/read", "params":{"uri":uri}
-            })
-        )
-        .unwrap();
-        let line = first_line(&stdout, "resource response", |line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .is_some_and(|value| value["id"] == id)
-        });
-        let value: Value = serde_json::from_str(&line).unwrap();
-        let text = value["result"]["contents"][0]["text"].as_str().unwrap();
-        let content: Value = serde_json::from_str(text).unwrap();
-        let actual = if uri.ends_with("whoami") {
-            &content["agent_id"]
-        } else {
-            &content["sessions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|s| s["session_id"] == me)
-                .unwrap()["agent_id"]
-        };
-        assert_eq!(actual, "agent/\"x\nopaque");
+    // The row above is the daemon's. The resources answer from the shim's own
+    // subscribed view, which can lag it on a slow machine, so read again until
+    // the view has caught up, within WAIT (MAR-33).
+    let mut next_id = 11;
+    for uri in ["marshal://whoami", "marshal://roster"] {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let id = next_id;
+            next_id += 1;
+            writeln!(
+                shim.wrapper.stdin.as_mut().unwrap(),
+                "{}",
+                serde_json::json!({
+                    "jsonrpc":"2.0", "id": id, "method":"resources/read", "params":{"uri":uri}
+                })
+            )
+            .unwrap();
+            let line = first_line(&stdout, "resource response", |line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .is_some_and(|value| value["id"] == id)
+            });
+            let value: Value = serde_json::from_str(&line).unwrap();
+            let text = value["result"]["contents"][0]["text"].as_str().unwrap();
+            let content: Value = serde_json::from_str(text).unwrap();
+            let actual = if uri.ends_with("whoami") {
+                content["agent_id"].clone()
+            } else {
+                content["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["session_id"] == me)
+                    .map(|s| s["agent_id"].clone())
+                    .unwrap_or(Value::Null)
+            };
+            if actual == "agent/\"x\nopaque" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{uri} never showed the agent id: {actual}"
+            );
+            thread::sleep(POLL);
+        }
     }
 }

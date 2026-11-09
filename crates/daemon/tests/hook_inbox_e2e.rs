@@ -30,13 +30,6 @@ use myko::{
 use myko_server::{BlackholePersister, MykoServer};
 use uuid::Uuid;
 
-fn pick_free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("pick free port");
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
 fn session(id: &str, client_id: Option<&str>) -> Session {
     Session {
         id: SessionId(Arc::from(id)),
@@ -59,6 +52,8 @@ fn session(id: &str, client_id: Option<&str>) -> Session {
         project: None,
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -130,8 +125,11 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
     set_session(&ctx, &session("sender", Some("c-sender")));
 
     // bring up the real /hook/* HTTP listener on a free port, sharing ctx.
-    let port = pick_free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    // Bound here and handed to the listener, so no other process can take
+    // the port between picking and binding it (MAR-21).
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hook listener");
+    std_listener.set_nonblocking(true).unwrap();
+    let addr: SocketAddr = std_listener.local_addr().unwrap();
     let listener_ctx = ctx.clone();
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -139,7 +137,11 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
             .build()
             .expect("rt");
         rt.block_on(async move {
-            let _ = daemon::http_listener::run(addr, Arc::new(listener_ctx)).await;
+            let listener = tokio::net::TcpListener::from_std(std_listener).expect("hook listener");
+            // Held while the listener runs, so its waits aren't told to stop.
+            let (_running, stopping) = tokio::sync::watch::channel(false);
+            let _ = daemon::http_listener::serve_until(listener, Arc::new(listener_ctx), stopping)
+                .await;
         });
     });
     wait_listening(addr);
@@ -200,6 +202,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "HOOK-E2E-PROBE-marker".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists to eagerly registered recipient");
@@ -266,6 +269,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "HOOK-E2E-QUEUED-marker".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists unread message before session end");
@@ -327,6 +331,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: "HOOK-E2E-NEW-marker".into(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists new message after resume");
@@ -363,6 +368,7 @@ fn stored_message_surfaces_via_prompt_submit_hook() {
         to_session_id: SessionId(Arc::from("recipient")),
         body: long_body.clone(),
         as_session: None,
+        idempotency_key: None,
     }
     .execute(cmd_ctx(&ctx, Some("c-sender")))
     .expect("send persists long message");

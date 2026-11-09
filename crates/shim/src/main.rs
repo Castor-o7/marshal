@@ -14,10 +14,16 @@ mod channels;
 mod codex_bridge;
 mod codex_hook;
 mod codex_setup;
+mod doctor;
 mod link;
 mod mcp;
+mod roster_read;
 mod session_discovery;
+mod spawn;
+mod spawn_manage;
+mod spawn_team;
 mod statusline;
+mod terminal_send;
 mod tools;
 
 use anyhow::{Context, Result};
@@ -96,6 +102,16 @@ fn main() -> Result<()> {
             println!("ok");
             return Ok(());
         }
+        // Read-only health check: is this binary the one on PATH, does the
+        // daemon accept a connection, and is Claude Code wired to Marshal.
+        // Exits non-zero if any check fails. See `doctor`.
+        Some("doctor") if argv.next().is_none() => {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?
+                .block_on(doctor::run());
+        }
         Some("statusline") if argv.next().is_none() => {
             statusline::render();
             return Ok(());
@@ -141,6 +157,38 @@ fn main() -> Result<()> {
             let base = args.next();
             codex_hook::watch(&sid, base.as_deref(), once);
             return Ok(());
+        }
+        // Message the marshal from a terminal, outside any session. See
+        // `terminal_send`.
+        Some("all") => {
+            let body = argv.collect::<Vec<_>>().join(" ");
+            return run_terminal_send(terminal_send::Target::All, body);
+        }
+        Some("tell") => {
+            let target = argv
+                .next()
+                .context("usage: marshal-shim tell <team, nickname or session id> <message>")?;
+            let body = argv.collect::<Vec<_>>().join(" ");
+            return run_terminal_send(terminal_send::Target::Named(target), body);
+        }
+        // Print the roster as JSON for other programs. See `roster_read`.
+        Some("roster") if argv.next().is_none() => {
+            return tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?
+                .block_on(roster_read::run());
+        }
+        // Start a Claude Code or Codex session in tmux and wait for it to join
+        // the roster. See `spawn`.
+        Some("spawn") => {
+            let rest: Vec<String> = argv.collect();
+            return spawn::run(&rest);
+        }
+        // Start a team of sessions from a TOML file. See `spawn_team`.
+        Some("spawn-team") => {
+            let rest: Vec<String> = argv.collect();
+            return spawn_team::run(&rest);
         }
         // One-shot cross-platform setup: wire marshal into a Codex install
         // (CLI / IDE / desktop app) by writing the config.toml + AGENTS.md
@@ -198,6 +246,7 @@ Usage: marshal-shim [COMMAND]
 With no command, serves MCP on stdio for the agent session that started it.
 
 Commands:
+  doctor        Check this machine's setup and say how to fix what's wrong (read-only)
   statusline    Render the Claude Code status line prefix from stdin
   claude-hook   Forward a Claude hook, or wait for mail:
                 claude-hook <session-start|prompt-submit|post-tool-use|wait> [base-url]
@@ -207,6 +256,16 @@ Commands:
   codex-setup   Wire Marshal into a Codex install (codex-setup --help for options)
   codex-run     Start Codex with Marshal live delivery
   codex-bridge  Run the Codex live-delivery bridge on its own (codex-run starts it)
+  tell          Message a team, nickname or session from a terminal:
+                tell <team, nickname or session id> <message>
+  all           Message every session from a terminal: all <message>
+  roster        Print the roster as JSON
+  spawn         Start a session in tmux and wait for it to join:
+                spawn <claude|codex> [--cwd <dir>] [--name <tmux session>] [--timeout <secs>]
+                      [--task <text>] [--window]
+                spawn list | attach <name> | stop <name>   (sessions spawn started)
+  spawn-team    Start a team from a TOML file and give each member its task:
+                spawn-team <team.toml> [--timeout <secs>]
 
 Options:
   --check        Print \"ok\" and exit (install smoke test)
@@ -219,6 +278,15 @@ then {DEFAULT_DAEMON_ADDRESS}.
 ",
         version = env!("CARGO_PKG_VERSION"),
     )
+}
+
+fn run_terminal_send(target: terminal_send::Target, body: String) -> Result<()> {
+    anyhow::ensure!(!body.trim().is_empty(), "there's no message to send");
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?
+        .block_on(terminal_send::run(target, body))
 }
 
 async fn serve() -> Result<()> {
@@ -378,6 +446,13 @@ async fn serve() -> Result<()> {
         // The drain task below acks each direct push once it is written to
         // Claude, so the daemon can leave it unread until then.
         acks_pushes: (!is_codex).then_some(true),
+        // MUS-3: the same harness and identity the hooks report, since this
+        // SET replaces the row the hooks wrote.
+        harness: Some(if is_codex { "codex" } else { "claude" }.to_string()),
+        identity: std::env::var("MARSHAL_IDENTITY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
     };
     let session = Arc::new(Mutex::new(session));
 
@@ -591,8 +666,17 @@ async fn serve() -> Result<()> {
                 if current == last_branch {
                     return;
                 }
-                last_branch = current.clone();
-                let id = session_for_watch.lock().unwrap().id.clone();
+                let previous_branch = std::mem::replace(&mut last_branch, current.clone());
+                let (id, followed) = {
+                    let s = session_for_watch.lock().unwrap();
+                    let followed = followed_current_task(
+                        &cwd_for_watch,
+                        previous_branch.as_deref(),
+                        current.as_deref(),
+                        s.current_task.as_deref(),
+                    );
+                    (s.id.clone(), followed)
+                };
                 let arc_branch = current.as_deref().map(Arc::<str>::from);
                 let _ = client_for_watch.send_command::<marshal_entities::SetSessionGitBranch, ()>(
                     &marshal_entities::SetSessionGitBranch {
@@ -600,8 +684,20 @@ async fn serve() -> Result<()> {
                         git_branch: arc_branch,
                     },
                 );
+                if let Some(task) = &followed {
+                    let _ = client_for_watch
+                        .send_command::<marshal_entities::SetSessionCurrentTask, ()>(
+                            &marshal_entities::SetSessionCurrentTask {
+                                id: session_for_watch.lock().unwrap().id.clone(),
+                                current_task: task.as_deref().map(Arc::<str>::from),
+                            },
+                        );
+                }
                 if let Ok(mut s) = session_for_watch.lock() {
                     s.git_branch = current;
+                    if let Some(task) = followed {
+                        s.current_task = task;
+                    }
                 }
                 log::info!(
                     "[marshal-shim] git branch changed -> {last_branch:?}; pushed to roster"
@@ -1036,13 +1132,17 @@ fn roster_miss_step(misses: u32, roster_empty: bool, present: bool) -> (u32, boo
 /// `client_id` doesn't count: the daemon finds a caller by that binding, so every
 /// write would fail "no session on the roster" while the row looks fine. A hook
 /// that read the roster just before our SET landed can leave such a row.
-fn registered_on_roster(sessions: &[Arc<Session>], me: &SessionId) -> bool {
+pub(crate) fn registered_on_roster(sessions: &[Arc<Session>], me: &SessionId) -> bool {
     sessions
         .iter()
         .any(|s| &s.id == me && s.client_id.is_some())
 }
 
-fn emit_session_set(client: &MykoClient, session: &Session, current: &Arc<Mutex<Session>>) {
+pub(crate) fn emit_session_set(
+    client: &MykoClient,
+    session: &Session,
+    current: &Arc<Mutex<Session>>,
+) {
     let current = Arc::clone(current);
     let result = client.send_command::<marshal_entities::RegisterSession, ()>(
         &marshal_entities::RegisterSession {
@@ -1096,9 +1196,18 @@ fn emit_session_del(client: &MykoClient, session: &Session) {
 pub(crate) fn daemon_address() -> String {
     first_daemon_address(
         read_address_from_config_file(),
-        std::env::var(ADDRESS_ENV).ok(),
-        std::env::var(ADDRESS_ENV_LEGACY).ok(),
+        address_env(ADDRESS_ENV),
+        address_env(ADDRESS_ENV_LEGACY),
     )
+}
+
+/// An address variable, unless it's unset or blank: a blank one would win
+/// over the fallback and then reach `localhost` anyway.
+pub(crate) fn address_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn first_daemon_address(
@@ -1108,7 +1217,71 @@ fn first_daemon_address(
 ) -> String {
     file.or(env)
         .or(legacy_env)
-        .unwrap_or_else(|| DEFAULT_DAEMON_ADDRESS.to_string())
+        .unwrap_or_else(fallback_daemon_address)
+}
+
+/// Set by the shim's own tests on every shim they start (MAR-56). Under it the
+/// shim never falls back to `localhost:6155`/`:6156`, which on a developer's
+/// machine is often a live daemon, and only reads or writes config files in
+/// the system temp dir.
+const TEST_ENV: &str = "MARSHAL_TEST";
+
+/// Whether this is a test: the shim's unit tests, or a shim started with
+/// `MARSHAL_TEST` set.
+pub(crate) fn test_mode() -> bool {
+    cfg!(test) || std::env::var_os(TEST_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// The daemon a shim with nothing configured talks to. Under test, refuses.
+pub(crate) fn fallback_daemon_address() -> String {
+    if test_mode() {
+        refuse_default_address();
+    }
+    DEFAULT_DAEMON_ADDRESS.to_string()
+}
+
+/// Stop a test before it reaches the default daemon. A unit test panics, so
+/// only that test fails; a shim process says why and exits 2.
+pub(crate) fn refuse_default_address() -> ! {
+    let msg = format!(
+        "marshal-shim: {TEST_ENV} is set but no daemon address was given; refusing \
+         {DEFAULT_DAEMON_ADDRESS} and its hook port, which may be a live daemon. Set \
+         MARSHAL_DAEMON_ADDRESS (or MARSHAL_BASE_URL for hooks) to the test's own daemon."
+    );
+    if cfg!(test) {
+        panic!("{msg}");
+    }
+    eprintln!("{msg}");
+    std::process::exit(2)
+}
+
+/// Under test, keep only config paths inside the system temp dir, so a test
+/// that forgot to set `HOME` neither reads the operator's `daemon-address` nor
+/// writes `nickname-*` files into the real config dir.
+pub(crate) fn keep_test_paths(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    if !test_mode() {
+        return paths;
+    }
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.canonicalize().unwrap_or(tmp);
+    paths.into_iter().filter(|p| under(p, &tmp)).collect()
+}
+
+/// Whether `path` is inside `dir`, comparing the nearest existing ancestor's
+/// real path so that a symlinked temp dir (macOS `/var` → `/private/var`)
+/// still matches.
+fn under(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    let mut probe = path;
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            let rest = path.strip_prefix(probe).unwrap_or(std::path::Path::new(""));
+            return real.join(rest).starts_with(dir);
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return path.starts_with(dir),
+        }
+    }
 }
 
 pub(crate) fn read_address_from_config_file() -> Option<String> {
@@ -1266,7 +1439,7 @@ pub(crate) fn config_file_candidates(filename: &str) -> Vec<std::path::PathBuf> 
                 .join(filename),
         );
     }
-    out
+    keep_test_paths(out)
 }
 
 #[cfg(windows)]
@@ -1282,7 +1455,7 @@ pub(crate) fn config_file_candidates(filename: &str) -> Vec<std::path::PathBuf> 
     if let Some(pd) = std::env::var_os("PROGRAMDATA") {
         out.push(std::path::PathBuf::from(pd).join("marshal").join(filename));
     }
-    out
+    keep_test_paths(out)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1378,8 +1551,8 @@ fn log_if_refused(
 /// `pulse work` workspace (`.workspaces/<name>/…`, named for its task) and then
 /// a non-trunk git branch. Trunk names carry no routing signal and stay `None`.
 /// An explicit `set_status` always overwrites this. The workspace source is
-/// fixed for the session's life; the branch source is read once and the HEAD
-/// watcher does not re-derive it on checkout.
+/// fixed for the session's life; the branch source follows checkouts through
+/// [`followed_current_task`] (MUS-26).
 fn default_current_task(cwd: &str, git_branch: Option<&str>) -> Option<String> {
     let mut components = std::path::Path::new(cwd).components();
     while let Some(component) = components.next() {
@@ -1392,6 +1565,25 @@ fn default_current_task(cwd: &str, git_branch: Option<&str>) -> Option<String> {
     git_branch
         .filter(|branch| !matches!(*branch, "main" | "master" | "dev" | "develop" | "trunk"))
         .map(str::to_string)
+}
+
+/// The `current_task` a checkout should leave behind (MUS-26), or `None` to
+/// leave it alone. The task follows the branch only while it still holds the
+/// default derived from the branch being left, so text a session set with
+/// `set_status` is never overwritten. The one blind spot: text that happens to
+/// equal that default is indistinguishable from it.
+fn followed_current_task(
+    cwd: &str,
+    previous_branch: Option<&str>,
+    new_branch: Option<&str>,
+    current_task: Option<&str>,
+) -> Option<Option<String>> {
+    let was_default = default_current_task(cwd, previous_branch);
+    if current_task != was_default.as_deref() {
+        return None;
+    }
+    let next = default_current_task(cwd, new_branch);
+    (next != was_default).then_some(next)
 }
 
 /// Resolve which HUMAN drives this session, as an email — the canonical id
@@ -1501,14 +1693,44 @@ mod tests {
             first_daemon_address(None, None, some("ws://old:6155")),
             "ws://old:6155"
         );
+        // Nothing configured would mean localhost, which a test must never
+        // reach (MAR-56): under test it refuses instead.
+        let refused = std::panic::catch_unwind(|| first_daemon_address(None, None, None));
+        let msg = refused.expect_err("a test must not fall back to localhost");
+        let msg = msg
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(msg.contains(DEFAULT_DAEMON_ADDRESS), "{msg}");
+    }
+
+    #[test]
+    fn under_test_only_temp_dir_config_paths_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inside = tmp.path().join("config/marshal/daemon-address");
+        let outside =
+            std::path::PathBuf::from("/definitely-not-tmp/.config/marshal/daemon-address");
         assert_eq!(
-            first_daemon_address(None, None, None),
-            DEFAULT_DAEMON_ADDRESS
+            super::keep_test_paths(vec![outside, inside.clone()]),
+            vec![inside]
+        );
+    }
+
+    #[test]
+    fn a_blank_address_variable_counts_as_unset() {
+        // SAFETY: the variable name is unique to this test.
+        unsafe { std::env::set_var("MARSHAL_TEST_BLANK_ADDRESS", "  ") };
+        assert_eq!(super::address_env("MARSHAL_TEST_BLANK_ADDRESS"), None);
+        unsafe { std::env::set_var("MARSHAL_TEST_BLANK_ADDRESS", " ws://x:1 ") };
+        assert_eq!(
+            super::address_env("MARSHAL_TEST_BLANK_ADDRESS").as_deref(),
+            Some("ws://x:1")
         );
     }
     use super::{
         DEFAULT_DAEMON_ADDRESS, ROSTER_MISS_TICKS, default_current_task, detect_git_branch,
-        first_daemon_address, registered_on_roster, resolve_git_head_dir, roster_miss_step,
+        first_daemon_address, followed_current_task, registered_on_roster, resolve_git_head_dir,
+        roster_miss_step,
     };
     use marshal_entities::{Session, SessionId};
     use std::process::Command;
@@ -1541,6 +1763,54 @@ mod tests {
         assert_eq!(
             default_current_task("/root/pulse/.workspaces", Some("lv-a57b")),
             Some("lv-a57b".into())
+        );
+    }
+
+    #[test]
+    fn current_task_follows_a_checkout_while_it_is_the_default() {
+        // The roadmap's case: the roster said feature/comments on feature/search.
+        assert_eq!(
+            followed_current_task(
+                "/repo",
+                Some("feature/comments"),
+                Some("feature/search"),
+                Some("feature/comments"),
+            ),
+            Some(Some("feature/search".into()))
+        );
+        // Onto trunk the default is no task, so the stale branch name clears.
+        assert_eq!(
+            followed_current_task("/repo", Some("feature/x"), Some("main"), Some("feature/x")),
+            Some(None)
+        );
+        // Off trunk with no task set, the new branch becomes the task.
+        assert_eq!(
+            followed_current_task("/repo", Some("main"), Some("fix/y"), None),
+            Some(Some("fix/y".into()))
+        );
+    }
+
+    #[test]
+    fn current_task_keeps_text_the_session_set() {
+        assert_eq!(
+            followed_current_task(
+                "/repo",
+                Some("feature/x"),
+                Some("feature/y"),
+                Some("reviewing #140"),
+            ),
+            None
+        );
+        // Cleared with set_status on a branch: stays cleared.
+        assert_eq!(
+            followed_current_task("/repo", Some("feature/x"), Some("feature/y"), None),
+            None
+        );
+        // A pulse workspace name is fixed for the session's life.
+        let cwd = "/root/pulse/.workspaces/lv-1141/muster";
+        assert_eq!(
+            followed_current_task(cwd, Some("a"), Some("b"), Some("lv-1141")),
+            None
         );
     }
 
@@ -1603,6 +1873,8 @@ mod tests {
                 project: None,
                 channels_enabled: None,
                 acks_pushes: None,
+                harness: None,
+                identity: None,
             })
         };
         assert!(registered_on_roster(&[row("me", Some("c"))], &me));

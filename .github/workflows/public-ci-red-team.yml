@@ -12,6 +12,8 @@ permissions:
 jobs:
   boundary-probes:
     name: Sandbox boundary probes
+    # Castor fork: self-hosted runners exist only upstream, so this runs only there (MAR-34).
+    if: github.repository == 'ignition-is-go/marshal'
     runs-on: ["self-hosted", "Linux", "X64", "ram-ge-16g", "disk-ge-100g"]
     timeout-minutes: 10
     steps:

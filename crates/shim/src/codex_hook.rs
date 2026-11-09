@@ -69,6 +69,16 @@ pub fn run(ep: &str, base_override: Option<&str>) {
     run_for(Harness::Codex, ep, base_override);
 }
 
+/// `&identity=<MARSHAL_IDENTITY>` when it's set, for the daemon to match a
+/// restarted session on (MUS-3): a role such as `watchman`, or `none` to opt
+/// out. Empty when unset, and then the daemon infers it from the cwd.
+pub(crate) fn identity_q() -> String {
+    match std::env::var("MARSHAL_IDENTITY") {
+        Ok(v) if !v.trim().is_empty() => format!("&identity={}", url_q(v.trim())),
+        _ => String::new(),
+    }
+}
+
 /// Shared hook body for both harnesses.
 pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     let mut input = String::new();
@@ -101,10 +111,11 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     // has printed it, so a reply lost on the way (a hook killed at its timeout,
     // a dropped proxy hop) leaves the mail unread.
     let path = format!(
-        "/hook/{endpoint}?host={}&operator={}&harness={}&ack=client",
+        "/hook/{endpoint}?host={}&operator={}&harness={}&ack=client{}",
         url_q(&host),
         url_q(&op),
-        harness.name()
+        harness.name(),
+        identity_q()
     );
 
     let deadline = Instant::now() + harness.timeout();
@@ -245,10 +256,11 @@ fn wait_for_mail(
     let wait = if once { ONCE_WAIT } else { WATCH_WAIT };
     let body = registration_body(session_id, cwd, agent_id_from_env().as_deref());
     let path = format!(
-        "/hook/wait?host={}&operator={}&harness=claude&ack=client&timeout={}",
+        "/hook/wait?host={}&operator={}&harness=claude&ack=client&timeout={}{}",
         url_q(&short_host()),
         url_q(&operator()),
-        wait.as_secs()
+        wait.as_secs(),
+        identity_q()
     );
     let base = resolve_base(base_override);
     // The daemon answers within `WATCH_WAIT`; the read timeout only has to
@@ -262,6 +274,12 @@ fn wait_for_mail(
     let mut restart_quiet_until: Option<std::time::Instant> = None;
     loop {
         if parent_pid() != parent {
+            return false;
+        }
+        if superseded(session_id, parent) {
+            log::info!(
+                "[marshal-shim] waiter for {session_id}: the session's id has changed; exiting so the next one waits under the new id"
+            );
             return false;
         }
         let post = |path: &str, body: &str, timeout| {
@@ -365,6 +383,31 @@ fn clear_refusal(session_id: &str) {
     if let Some(path) = refusal_marker(session_id) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Whether Claude has moved this waiter's session to a new id (MAR-44, from
+/// muster's MUS-104). A `/clear` or compaction re-mints the id in the same
+/// process, so the parent stays alive and a waiter started before it would
+/// poll under the old id forever: a row that is never reaped, and that still
+/// takes mail for the old id. Claude's live per-PID manifest names the current
+/// id; with no manifest (Codex, or an older Claude), nothing changes.
+fn superseded(session_id: &str, parent: Option<u32>) -> bool {
+    let current = parent.and_then(crate::session_discovery::canonical_session_id);
+    id_moved(session_id, current.as_ref().map(|s| s.0.as_ref()))
+}
+
+/// [`superseded`], reading the manifest under `home`.
+#[cfg(test)]
+fn superseded_under(home: &std::path::Path, session_id: &str, parent: u32) -> bool {
+    // An unprobed process: MAR-45's liveness check trusts what it can't read,
+    // so this exercises only the id comparison.
+    let unprobed = |_| crate::session_discovery::Liveness::default();
+    let current = crate::session_discovery::sid_from_claude_sessions_file(&unprobed, home, parent);
+    id_moved(session_id, current.as_ref().map(|s| s.0.as_ref()))
+}
+
+fn id_moved(session_id: &str, current: Option<&str>) -> bool {
+    current.is_some_and(|current| current != session_id)
 }
 
 /// This process's parent, which changes when the parent exits. `None` where
@@ -471,9 +514,10 @@ fn wrap_long_lines(text: &str, max: usize) -> String {
 pub(crate) fn register_session(base: &str, session_id: &str, cwd: &str) -> Option<String> {
     let body = registration_body(session_id, cwd, agent_id_from_env().as_deref());
     let path = format!(
-        "/hook/session-register?host={}&operator={}&harness=codex",
+        "/hook/session-register?host={}&operator={}&harness=codex{}",
         url_q(&short_host()),
-        url_q(&operator())
+        url_q(&operator()),
+        identity_q()
     );
     let response = http_post(base, &path, &body, TIMEOUT)?;
     if let Ok(identity) = serde_json::from_str::<serde_json::Value>(&response)
@@ -487,6 +531,60 @@ pub(crate) fn register_session(base: &str, session_id: &str, cwd: &str) -> Optio
         return Some(nickname.to_string());
     }
     None
+}
+
+/// End `session_id` at the daemon, as a harness's SessionEnd hook does: its
+/// roster row goes, its room memberships with it, and its waits end. Used by
+/// `spawn stop` (MAR-30), since Claude's plugin has no SessionEnd hook. Returns
+/// whether the daemon answered.
+pub(crate) fn end_session(base: &str, session_id: &str) -> bool {
+    let body = serde_json::json!({ "session_id": session_id }).to_string();
+    http_post(base, "/hook/session-end", &body, TIMEOUT).is_some()
+}
+
+/// Tell the daemon whether the Codex bridge can wake `session_id`, so the
+/// roster shows its wake path (MAR-12). Goes to the hook listener at `base`,
+/// as the bridge's registrations do. Returns whether the daemon now records it
+/// as watched.
+pub(crate) fn bridge_watch(base: &str, session_id: &str, watching: bool) -> bool {
+    // The daemon keeps one record per bridge process, named by
+    // `bridge_instance`, so ending this bridge's watch leaves another's (MAR-4).
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "watching": watching,
+        "bridge": bridge_instance(),
+    })
+    .to_string();
+    let path = format!(
+        "/hook/bridge-watch?host={}&operator={}&harness=codex",
+        url_q(&short_host()),
+        url_q(&operator())
+    );
+    http_post(base, &path, &body, TIMEOUT).is_some_and(|reply| reply == "watching")
+}
+
+/// This bridge process's name for its wake-path records (MAR-4): its host,
+/// pid and start time, so a later bridge with a reused pid gets a name of its
+/// own. Always one the daemon accepts: 1 to 64 of `[A-Za-z0-9:._-]`.
+pub(crate) fn bridge_instance() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let host: String = short_host()
+            .chars()
+            .take(32)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{host}-{}-{started}", std::process::id())
+    })
 }
 
 /// Resolve the hook listener used by a bridge that already resolved its daemon
@@ -667,7 +765,45 @@ fn registration_body(session_id: &str, cwd: &str, agent_id: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_waiter_whose_session_id_moved_stands_down() {
+        assert!(
+            super::id_moved("old", Some("new")),
+            "a /clear re-minted the id"
+        );
+        assert!(!super::id_moved("same", Some("same")));
+        assert!(!super::id_moved("old", None), "no manifest: keep waiting");
+    }
+
+    #[test]
+    fn the_waiter_reads_the_id_from_claudes_live_manifest() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let pid = 4242;
+        // No manifest yet: nothing to compare against, so the waiter stays.
+        assert!(!super::superseded_under(home.path(), "old-id", pid));
+        let manifest = sessions.join(format!("{pid}.json"));
+        std::fs::write(&manifest, r#"{"pid":4242,"sessionId":"old-id","cwd":"/x"}"#).unwrap();
+        assert!(!super::superseded_under(home.path(), "old-id", pid));
+        // A /clear re-mints the id: Claude rewrites the manifest.
+        std::fs::write(&manifest, r#"{"pid":4242,"sessionId":"new-id","cwd":"/x"}"#).unwrap();
+        assert!(super::superseded_under(home.path(), "old-id", pid));
+        assert!(!super::superseded_under(home.path(), "new-id", pid));
+    }
+
     use super::*;
+
+    #[test]
+    fn the_bridge_name_is_one_the_daemon_accepts() {
+        let name = bridge_instance();
+        assert!((1..=64).contains(&name.len()), "{name}");
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-')),
+            "{name}"
+        );
+    }
 
     #[test]
     fn takeover_budget_outlasts_the_full_old_poll_and_error_backoff() {

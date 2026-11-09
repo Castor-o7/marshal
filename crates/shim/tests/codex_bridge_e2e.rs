@@ -10,11 +10,13 @@
 //! - Windows: two isolated app-server endpoints each wake only the thread they
 //!   own, matching native `codex-run`'s per-TUI topology.
 
+mod support;
+
 use std::{
     collections::HashSet,
     io,
     net::SocketAddr,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -22,7 +24,8 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use marshal_entities::{
-    GetAllSessions, HostInfo, Message, MessageId, MessageRead, MessageReadId, Session, SessionId,
+    GetAllSessions, GetAllWakeWatchers, HostInfo, Message, MessageId, MessageRead, MessageReadId,
+    Session, SessionId, WakeWatcher, WakeWatcherId,
 };
 use myko::prelude::EventPublishing as _;
 use myko::{
@@ -43,7 +46,6 @@ use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
 const TEST_HOST: &str = "marshal-wake-canary";
 const POLL: Duration = Duration::from_millis(25);
 const WAIT: Duration = Duration::from_secs(8);
-const SHIM: &str = env!("CARGO_BIN_EXE_marshal-shim");
 
 struct CellHarness {
     address: String,
@@ -53,10 +55,25 @@ struct CellHarness {
 }
 
 impl CellHarness {
+    /// A cell on a free port. The port is picked by binding port 0 and
+    /// closing it, so another process can take it first: then it's picked
+    /// again (MAR-21).
     fn spawn() -> Self {
         marshal_entities::link();
-        let bind: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let mut lost = Vec::new();
+        for _ in 0..5 {
+            let bind: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            match Self::try_spawn(bind) {
+                Ok(cell) => return cell,
+                Err(why) => lost.push(format!("{bind}: {why}")),
+            }
+        }
+        panic!("no free port held for the test cell: {lost:?}");
+    }
+
+    fn try_spawn(bind: SocketAddr) -> Result<Self, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (failed_tx, failed_rx) = std::sync::mpsc::channel::<String>();
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
 
         let join = thread::spawn(move || {
@@ -75,7 +92,9 @@ impl CellHarness {
                 ready_tx.send(server.ctx()).expect("publish cell context");
                 tokio::select! {
                     result = server.run() => {
-                        result.expect("run test cell");
+                        if let Err(e) = result {
+                            let _ = failed_tx.send(e.to_string());
+                        }
                     }
                     _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()) => {}
                 }
@@ -86,13 +105,34 @@ impl CellHarness {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("cell context"),
         );
+        // A port another process holds accepts connections too; the cell's
+        // own bind failure comes at once, so it's waited for a moment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(bind).is_err() {
+            if let Ok(why) = failed_rx.try_recv() {
+                // The thread's runtime waits on the shutdown channel as it ends.
+                drop(shutdown_tx);
+                let _ = join.join();
+                return Err(why);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("nothing listening on {bind}"));
+            }
+            thread::sleep(POLL);
+        }
+        if let Ok(why) = failed_rx.recv_timeout(Duration::from_millis(200)) {
+            // The thread's runtime waits on the shutdown channel as it ends.
+            drop(shutdown_tx);
+            let _ = join.join();
+            return Err(why);
+        }
 
-        Self {
+        Ok(Self {
             address: format!("ws://{bind}"),
             ctx,
             shutdown: Some(shutdown_tx),
             join: Some(join),
-        }
+        })
     }
 }
 
@@ -144,6 +184,7 @@ impl Drop for HookHarness {
 
 async fn handle_hook_request(mut stream: TcpStream, ctx: Arc<MykoServerContext>) -> io::Result<()> {
     let (target, body) = read_http_request(&mut stream).await?;
+    let mut reply = String::new();
     if target.starts_with("/hook/session-register")
         && let Ok(body) = serde_json::from_slice::<Value>(&body)
         && let Some(session_id) = body.get("session_id").and_then(Value::as_str)
@@ -157,10 +198,43 @@ async fn handle_hook_request(mut stream: TcpStream, ctx: Arc<MykoServerContext>)
         internal_context(&ctx)
             .emit_set(&hook_session(session_id, cwd))
             .expect("register hook-owned session");
+        // Answer as the daemon does, with the session's identity. Without it
+        // the bridge counts every registration as failed and retries forever,
+        // which re-registers a dropped row by accident and hides MAR-7's gap.
+        reply = json!({"session_id": session_id, "nickname": format!("canary-{session_id}")})
+            .to_string();
     }
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .await?;
+    if target.starts_with("/hook/bridge-watch")
+        && let Ok(body) = serde_json::from_slice::<Value>(&body)
+        && let Some(session_id) = body.get("session_id").and_then(Value::as_str)
+    {
+        // As the daemon does: a watched session gets a WakeWatcher, which is
+        // what the roster's `wake` and a send's `expected` read (MAR-12).
+        // One record per bridge, naming its session (MAR-4).
+        let bridge = body["bridge"].as_str().unwrap_or("bridge");
+        let watcher = WakeWatcher {
+            id: WakeWatcherId(Arc::from(WakeWatcher::bridge_id(session_id, bridge))),
+            until: chrono::Utc::now().timestamp_millis() + 120_000,
+            session_id: Some(SessionId(Arc::from(session_id))),
+        };
+        if body["watching"] == true {
+            internal_context(&ctx)
+                .emit_set(&watcher)
+                .expect("record the wake path");
+            reply = "watching".to_string();
+        } else {
+            internal_context(&ctx)
+                .emit_del(&watcher)
+                .expect("end the wake path");
+            reply = "not watching".to_string();
+        }
+    }
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reply.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(reply.as_bytes()).await?;
     stream.flush().await
 }
 
@@ -215,6 +289,7 @@ struct FakeAppServer {
     endpoint: String,
     accepted: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl FakeAppServer {
@@ -231,23 +306,44 @@ impl FakeAppServer {
         );
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let accepted_for_task = Arc::clone(&accepted);
+        let connections: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
+        let connections_for_task = Arc::clone(&connections);
         let task = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept app-server client");
                 let owned = Arc::clone(&owned);
                 let accepted = Arc::clone(&accepted_for_task);
-                tokio::spawn(async move {
+                let connection = tokio::spawn(async move {
                     // Tests terminate bridge processes abruptly; a reset
                     // without a WebSocket close handshake is expected cleanup,
                     // not a failed canary assertion.
                     let _ = serve_app_server_connection(stream, owned, accepted).await;
                 });
+                connections_for_task
+                    .lock()
+                    .expect("app-server connections mutex")
+                    .push(connection);
             }
         });
         Self {
             endpoint: format!("ws://{address}"),
             accepted,
             task,
+            connections,
+        }
+    }
+
+    /// The app-server goes away, as when Codex exits or crashes: it stops
+    /// listening and drops every open connection, with no `thread/closed`.
+    fn stop(&self) {
+        self.task.abort();
+        for connection in self
+            .connections
+            .lock()
+            .expect("app-server connections mutex")
+            .drain(..)
+        {
+            connection.abort();
         }
     }
 
@@ -378,7 +474,7 @@ impl BridgeProcess {
         name: &str,
     ) -> Self {
         let ready_file = temp.path().join(format!("{name}.ready"));
-        let mut command = Command::new(SHIM);
+        let mut command = support::shim(support::shared_home());
         command
             .args([
                 "codex-bridge",
@@ -486,6 +582,8 @@ fn hook_session(id: &str, cwd: &str) -> Session {
         project: Some("wake-canary".into()),
         channels_enabled: None,
         acks_pushes: None,
+        harness: None,
+        identity: None,
     }
 }
 
@@ -580,6 +678,122 @@ async fn unix_multi_process_bridge_elects_one_wake_leader_and_fails_over() {
     );
     mark_read(&cell.ctx, "unix-message-2", "unix-thread");
     follower.stop();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_thread_dropped_from_the_roster_is_registered_again_and_still_wakes() {
+    // A daemon restart without Postgres comes back with an empty roster. The
+    // bridge only learned of the thread from `thread/started`, which won't
+    // come again for an idle session, so it has to put the row back itself,
+    // or mail to the session can't be addressed and never wakes it.
+    let temp = tempfile::tempdir().expect("test tempdir");
+    let cell = CellHarness::spawn();
+    let hooks = HookHarness::spawn(Arc::clone(&cell.ctx)).await;
+    let app_server = FakeAppServer::spawn(&["idle-thread"]).await;
+
+    let mut bridge = BridgeProcess::spawn(&app_server, &cell, &hooks, &temp, "reregister");
+    bridge.wait_ready().await;
+    wait_for_sessions(&cell.ctx, &["idle-thread"]).await;
+
+    internal_context(&cell.ctx)
+        .emit_del(&hook_session("idle-thread", "/"))
+        .expect("drop the session from the roster");
+    wait_until("the session to leave the roster", WAIT, || {
+        !internal_context(&cell.ctx)
+            .exec_query(GetAllSessions {})
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.id.0.as_ref() == "idle-thread")
+    })
+    .await;
+
+    // Registered again after the bridge's per-thread cooldown (5 s).
+    wait_until("the bridge to register the thread again", WAIT * 2, || {
+        internal_context(&cell.ctx)
+            .exec_query(GetAllSessions {})
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.id.0.as_ref() == "idle-thread" && s.client_id.is_none())
+    })
+    .await;
+
+    emit_message(&cell.ctx, "reregister-message", "idle-thread");
+    app_server.wait_for_count(1).await;
+    assert_eq!(app_server.accepted(), vec!["idle-thread"]);
+    mark_read(&cell.ctx, "reregister-message", "idle-thread");
+    bridge.stop();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thread_whose_app_server_went_away_is_not_registered_again() {
+    // A thread only says it closed while its app-server is up. When the
+    // app-server dies, its threads must be forgotten, not re-registered every
+    // cooldown for the bridge's whole life as ghost rows.
+    let temp = tempfile::tempdir().expect("test tempdir");
+    let cell = CellHarness::spawn();
+    let hooks = HookHarness::spawn(Arc::clone(&cell.ctx)).await;
+    let app_server = FakeAppServer::spawn(&["gone-thread"]).await;
+
+    let mut bridge = BridgeProcess::spawn(&app_server, &cell, &hooks, &temp, "gone");
+    bridge.wait_ready().await;
+    wait_for_sessions(&cell.ctx, &["gone-thread"]).await;
+
+    app_server.stop();
+    // Let the bridge see its lifecycle connection end.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    internal_context(&cell.ctx)
+        .emit_del(&hook_session("gone-thread", "/"))
+        .expect("drop the session from the roster");
+
+    // Well past the re-registration cooldown (5 s): the row stays gone.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let back = internal_context(&cell.ctx)
+        .exec_query(GetAllSessions {})
+        .unwrap_or_default()
+        .iter()
+        .any(|s| s.id.0.as_ref() == "gone-thread");
+    assert!(
+        !back,
+        "a thread whose app-server went away came back as a ghost row"
+    );
+    bridge.stop();
+}
+
+fn wake_watched(ctx: &Arc<MykoServerContext>, session_id: &str) -> bool {
+    internal_context(ctx)
+        .exec_query(GetAllWakeWatchers {})
+        .unwrap_or_default()
+        .iter()
+        .any(|w| w.session() == session_id)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leading_bridge_reports_its_wake_path_until_its_app_server_goes() {
+    // MAR-12: Codex holds no /hook/wait, so the bridge tells the daemon which
+    // threads it can wake. The roster then says `waiting` and a send says
+    // `expected`, until the bridge can't wake the thread any more.
+    let temp = tempfile::tempdir().expect("test tempdir");
+    let cell = CellHarness::spawn();
+    let hooks = HookHarness::spawn(Arc::clone(&cell.ctx)).await;
+    let app_server = FakeAppServer::spawn(&["watched-thread"]).await;
+
+    let mut bridge = BridgeProcess::spawn(&app_server, &cell, &hooks, &temp, "watcher");
+    bridge.wait_ready().await;
+    wait_for_sessions(&cell.ctx, &["watched-thread"]).await;
+    wait_until("the bridge to report its wake path", WAIT, || {
+        wake_watched(&cell.ctx, "watched-thread")
+    })
+    .await;
+
+    app_server.stop();
+    wait_until("the bridge to withdraw its wake path", WAIT, || {
+        !wake_watched(&cell.ctx, "watched-thread")
+    })
+    .await;
+    bridge.stop();
 }
 
 #[cfg(windows)]
