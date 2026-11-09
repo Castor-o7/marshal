@@ -97,7 +97,7 @@ pub async fn run() -> Result<()> {
         client.watch_query_map_state::<GetAllSessionNicknames>(GetAllSessionNicknames {});
     let watchers = client.watch_query_map_state::<GetAllWakeWatchers>(GetAllWakeWatchers {});
     let address = crate::daemon_address();
-    client.set_address(Some(address.clone()));
+    client.set_address(Some(crate::tls_link::myko_address(address.clone())));
 
     let started = Instant::now();
     while !(sessions.ready().get() && nicknames.ready().get() && watchers.ready().get()) {

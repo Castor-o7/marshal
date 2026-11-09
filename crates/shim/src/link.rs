@@ -2,7 +2,7 @@
 //! whichever resolved address accepts, and read its reply, including why it
 //! failed and which delivered messages to ack.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,55 @@ pub fn connect_any(target: impl ToSocketAddrs, deadline: Instant) -> Option<TcpS
 }
 
 const CONNECT_ATTEMPT: Duration = Duration::from_secs(1);
+
+/// A connection to the hook listener: plain, or pinned TLS to a `--tls`
+/// daemon (MAR-23). Timeouts are set on the TCP stream underneath.
+pub enum Stream {
+    Plain(TcpStream),
+    Tls(Box<crate::tls_link::HttpsStream>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Plain(tcp) => tcp,
+            Self::Tls(tls) => &tls.sock,
+        }
+    }
+
+    pub fn set_read_timeout(&self, limit: Option<Duration>) -> std::io::Result<()> {
+        self.tcp().set_read_timeout(limit)
+    }
+
+    pub fn set_write_timeout(&self, limit: Option<Duration>) -> std::io::Result<()> {
+        self.tcp().set_write_timeout(limit)
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(tcp) => tcp.read(buf),
+            Self::Tls(tls) => tls.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(tcp) => tcp.write(buf),
+            Self::Tls(tls) => tls.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(tcp) => tcp.flush(),
+            Self::Tls(tls) => tls.flush(),
+        }
+    }
+}
 
 /// Why a POST to the daemon got no usable answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +146,7 @@ fn response_length(buf: &[u8]) -> Result<Option<usize>, PostFailure> {
     Ok(Some(total))
 }
 
-pub fn read_reply(stream: &mut TcpStream, deadline: Instant) -> Result<Reply, PostFailure> {
+pub fn read_reply(stream: &mut Stream, deadline: Instant) -> Result<Reply, PostFailure> {
     let mut buf = Vec::new();
     let mut chunk = [0; 8192];
     loop {
@@ -292,7 +341,7 @@ mod tests {
             socket.write_all(&frame("", b"body")).unwrap();
             let _ = release_rx.recv_timeout(Duration::from_secs(3));
         });
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = Stream::Plain(TcpStream::connect(addr).unwrap());
         let reply = read_reply(&mut stream, Instant::now() + Duration::from_secs(1)).unwrap();
         assert_eq!(reply.body, "body");
         release_tx.send(()).unwrap();

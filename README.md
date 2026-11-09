@@ -36,6 +36,8 @@ marshal-daemon &
 
 The daemon binds `127.0.0.1:6155` by default, so only this machine can reach it. To let sessions on other hosts reach it, set `MARSHAL_BIND` to an address they can reach, such as `MARSHAL_BIND=0.0.0.0:6155`. Marshal has no authentication, so expose it only on a network you trust.
 
+To put TLS on those ports, start it with `marshal-daemon --tls`. On first start it makes a self-signed certificate in the state directory (`tls/`, key readable by your user only) and logs its SHA-256 fingerprint, also written to `tls/fingerprint`. Behind the TLS listeners, myko and the hook listener move to loopback (`MARSHAL_MYKO_BIND`, default `127.0.0.1:6157`). Clients then use a `wss://` address and pin the fingerprint: set `MARSHAL_TLS_PIN`, or put it in `tls-pin` beside `daemon-address` in the shim's config directory. A client with no pin is refused by the handshake, so a wrong or missing pin fails loudly rather than connecting insecurely. Without `--tls` nothing changes. TLS alone only keeps the bytes private on the wire; who may connect is still decided behind it.
+
 By default the daemon keeps its store in memory, so a restart loses messages, read state and rooms. To keep them, give it Postgres with `MYKO_POSTGRES_URL`, or, with no Postgres, set `MARSHAL_PERSIST=file`: the store goes to `store.jsonl` in the state directory (`MARSHAL_STATE_DIR`, else `$XDG_STATE_HOME/marshal`, else `~/.local/state/marshal`), private to your user. The daemon refuses a second daemon on the same directory, and any `MARSHAL_PERSIST` value other than `file`.
 
 ### 3. Add the plugin in Claude Code
@@ -415,6 +417,8 @@ Code, you can instead pin it in a per-project `.mcp.json`:
 ```
 
 The daemon's bind address is set with `MARSHAL_BIND` (default `127.0.0.1:6155`, localhost only; set `MARSHAL_BIND=0.0.0.0:6155` to accept other hosts).
+
+For a daemon started with `--tls`, give the clients `wss://host:6155` and the daemon's fingerprint (`tls/fingerprint` in its state directory) in `MARSHAL_TLS_PIN`, or in a `tls-pin` file beside `daemon-address`. The hook bridge derives `https://host:6156` from a `wss://` address when a pin is set.
 
 With `MARSHAL_TEST` set, a shim never falls back to `localhost:6155` or its hook port: with no address given, it exits with an error instead. It also ignores config files outside the system temp dir. The shim's own tests set it on every shim they start (`crates/shim/tests/support`), so a test can't reach the daemon you're running. Set it yourself for a hand-run check against a throwaway daemon.
 

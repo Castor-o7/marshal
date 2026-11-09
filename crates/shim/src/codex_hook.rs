@@ -615,6 +615,14 @@ fn resolve_base(base_override: Option<&str>) -> String {
 }
 
 fn base_from_daemon(daemon: &str) -> String {
+    // A `--tls` daemon serves its hooks over TLS too (MAR-23). A pin says
+    // the daemon is one: a `wss://` address without one is a TLS proxy in front
+    // of the daemon, whose hooks have always been plain HTTP.
+    let scheme = if daemon.starts_with("wss://") && crate::tls_link::pin().is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let authority = daemon
         .strip_prefix("ws://")
         .or_else(|| daemon.strip_prefix("wss://"))
@@ -634,7 +642,7 @@ fn base_from_daemon(daemon: &str) -> String {
             .unwrap_or(authority)
     };
     let host = if host.is_empty() { "localhost" } else { host };
-    format!("http://{host}:{HOOK_PORT}")
+    format!("{scheme}://{host}:{HOOK_PORT}")
 }
 
 /// Blocking HTTP/1.1 POST with a complete Content-Length response.
@@ -658,18 +666,33 @@ fn http_post_why(
             .filter(|left| !left.is_zero())
             .ok_or(PostFailure::Unreachable)
     };
-    let hostport = base
-        .strip_prefix("http://")
-        .ok_or(PostFailure::Unreachable)?
-        .trim_end_matches('/');
+    let (tls, hostport) = match base.strip_prefix("https://") {
+        Some(rest) => (true, rest),
+        None => (
+            false,
+            base.strip_prefix("http://")
+                .ok_or(PostFailure::Unreachable)?,
+        ),
+    };
+    let hostport = hostport.trim_end_matches('/');
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (h, p.parse::<u16>().map_err(|_| PostFailure::Unreachable)?),
-        None => (hostport, 80),
+        None => (hostport, if tls { 443 } else { 80 }),
     };
     let addrs =
         resolve_within(format!("{host}:{port}"), left()?).ok_or(PostFailure::Unreachable)?;
-    let mut stream =
+    let tcp =
         crate::link::connect_any(addrs.as_slice(), deadline).ok_or(PostFailure::Unreachable)?;
+    let mut stream = if tls {
+        crate::link::Stream::Tls(Box::new(crate::tls_link::connect_https(tcp).map_err(
+            |e| {
+                log::warn!("[marshal-shim] TLS to the hook listener at {hostport}: {e}");
+                PostFailure::Unreachable
+            },
+        )?))
+    } else {
+        crate::link::Stream::Plain(tcp)
+    };
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",

@@ -24,6 +24,7 @@ mod spawn_manage;
 mod spawn_team;
 mod statusline;
 mod terminal_send;
+mod tls_link;
 mod tools;
 
 use anyhow::{Context, Result};
@@ -79,6 +80,8 @@ const ROSTER_MISS_TICKS: u32 = 2;
 const ADDRESS_FILE: &str = "daemon-address";
 
 fn main() -> Result<()> {
+    // Before anything builds a rustls config (see `tls_link::install_provider`).
+    tls_link::install_provider();
     // Subcommands are dispatched BEFORE the async runtime is built so the
     // statusline (invoked on every Claude render) and the deploy smoke
     // test never pay for tokio / WS / MCP init. This is why both live as
@@ -548,7 +551,7 @@ async fn serve() -> Result<()> {
 
     // All queries / handlers / connection subscribers are registered.
     // Now it's safe to start the WS handshake.
-    client.set_address(Some(daemon_address));
+    client.set_address(Some(tls_link::myko_address(daemon_address)));
 
     // Parent-death watchdog — defense in depth beside the exit-on-EOF path.
     // Stdin EOF is the primary death signal, but it never arrives when a
