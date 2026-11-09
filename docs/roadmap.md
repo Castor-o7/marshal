@@ -369,7 +369,9 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   its own, when the manifest's `statusUpdatedAt` moves under an unchanged `activity`, tracking the
   last pushed value beside `pushed_activity`; without a `statusUpdatedAt`, or with no `activity`,
   nothing is re-pushed; and unit tests cover a changed activity, a flip and back, and each case that
-  pushes nothing.
+  pushes nothing. Assumes Claude writes `statusUpdatedAt` only when it sets a status: a build that
+  rewrote the same status with a fresh time, as a heartbeat, would make `activity_at` mean "last
+  status write" rather than "in this activity since".
 - [x] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: every in-process
   hook listener in the tests takes a socket the test bound to port 0; every port a test's myko
   server or daemon still picks is retried on a lost bind instead of failing; and the e2e and
