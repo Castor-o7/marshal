@@ -61,13 +61,13 @@ fork's `main`.
   self-hosted runners, which the fork has none of, so every fork run sat queued. Done when: `check` and
   `windows-cross-check` run on `ubuntu-latest` on the fork, Release stays untouched, and it's merged
   (Castor #3).
-- [ ] **MAR-61: Foundation: The wake-leader failover test polls with a delay.** Main's `check` job
+- [x] **MAR-61: Foundation: The wake-leader failover test polls with a delay.** Main's `check` job
   failed twice in a row (runs 42544039558 and 42544694495) at
   `bridges_elect_one_wake_leader_and_fail_over`'s "second acquires released wake-leader lock". The
   test polled 100 times back to back, so a released lock still held for a moment (likely a child
   another test forked holding a copy of the fd until its exec) outlasted every poll on a hosted
   runner. Done when: the test sleeps between polls, bounded at about 5 s, and main's `check` job is
-  green on the merge.
+  green on the merge. Done (#65), merged in 6b7e11d.
 
 ## Goal 1: Codex live delivery
 
@@ -183,7 +183,7 @@ launcher.
   call marks the sibling lapsed. A forced interleaving fails the same way. Done when: the tests in
   that file that feed the observations hold one test-only mutex, daemon code is unchanged, and the
   file passes repeatedly with `--test-threads` up to 32. Done (#66), merged in 1ae9717.
-- [ ] **MAR-67: Supporting: Tests that need a free or dead port keep it for as long as they use it.**
+- [x] **MAR-67: Supporting: Tests that need a free or dead port keep it for as long as they use it.**
   robust-warbler's run 42661142039 failed `spawn_e2e`'s `nothing_is_started_when_the_daemon_cant_be_reached`:
   it bound port 0 and dropped the listener to get a dead port, and a parallel test's daemon took the
   port before spawn connected. A survey at 914f06f found the same bind-then-drop pattern in four more
@@ -193,15 +193,15 @@ launcher.
   that needs a free port binds the listener itself and hands it over (`hook_inbox_framing` through
   `serve_until`, and the two `tui_proxy` tests straight to `run_tcp_tui_proxy`). The change is
   test-only, and each test passes a local stress run. Conformance's `restart()` on the same ports is
-  left out: it needs a design call.
-- [ ] **MAR-69: Supporting: Conformance reruns a cell on fresh ports when a restart loses its bind.**
+  left out: it needs a design call. Done (#73), merged in 1c732ee.
+- [x] **MAR-69: Supporting: Conformance reruns a cell on fresh ports when a restart loses its bind.**
   Left out of MAR-67: a cell's `restart()` starts the daemon again on the same ports, since the
   same-address reconnect is what the restart cells test, and a lost bind there panicked the cell. The
   first start already retried on new ports (MAR-21). Decided by the watchman (2026-11-09): rerun the
   whole cell. Done when: a restart that finds a port taken unwinds with `RestartLostPorts`, `run_cell`
   runs the whole cell again on fresh ports (both starts) up to 3 attempts, logging each retry, and
   fails only when every attempt loses its port. A test forces the loss once (the cell passes on its
-  second run) and every time (it fails after 3). Test-only.
+  second run) and every time (it fails after 3). Test-only. Done (#74), merged in 3f36815.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
@@ -285,21 +285,21 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
   `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
   and its exit status unchanged, with tests. Done (#58), merged in 2271713.
-- [ ] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
+- [x] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
   (2026-11-09) for rally's cutover.md step 1, with MAR-59's kit. Done when: a fresh session wired only
   to Marshal through project-local files shows on `marshal-shim roster`, wakes when idle on `tell`, and
   gets mail sent before a `marshal-daemon` restart after it, with nothing user-wide changed and
   muster-daemon untouched; the run, its outputs and what went wrong are recorded in
   [cutover-test-session.md](cutover-test-session.md), and the kit is corrected where the run showed it
-  wrong. Found MAR-71.
-- [ ] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
+  wrong. Found MAR-71. Done (#80), merged in 9ac68b6.
+- [x] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
   step 7 retires Muster "only after a full day with no traffic", which nothing defined. Done when:
   [muster-no-traffic-check.md](muster-no-traffic-check.md) defines no traffic (no message and no
   session event for 24 h, and no session registered) and gives a read-only query on the `muster`
   database, with SELECTs only, for the latest message, the latest session event and the registered
   sessions; the query has been run once on Murph with its output recorded; and cutover.md links it
-  (RAL-127).
-- [ ] **MAR-71: Cutover: doctor probes the daemon where the shim connects.** Found running MAR-70 on
+  (RAL-127). Done (#70), merged in 15295bb.
+- [x] **MAR-71: Cutover: doctor probes the daemon where the shim connects.** Found running MAR-70 on
   Murph: `marshal-shim doctor` said "FAIL daemon ws://127.0.0.1:6155 answered HTTP 404 … isn't a Marshal
   daemon" against the live daemon. The daemon serves its WebSocket at `/myko` only, and myko's client
   turns an address with no path into `/myko` (`normalize_myko_address`), but doctor handshook at the
@@ -307,7 +307,7 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   missed it. Done when: doctor resolves the address as myko's client does (no scheme means `ws://`, an
   empty or `/` path means `/myko`, no port means 5155), names that URL in its finding, and a test
   server that serves `/myko` only passes; doctor built from the branch, run against the live daemon on
-  Murph, says `ok daemon`.
+  Murph, says `ok daemon`. Done (#79), merged in 98da488.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
@@ -357,10 +357,16 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   only in its current `op:` room, with a test. Done (#42): each auto-rooms dispatch removes the
   session from other operators' `op:` rooms; a SET naming no operator leaves them.
   `crates/daemon/tests/auto_rooms_operator.rs` shows it.
-- [ ] **MAR-51: Parity: A future lastActivityAt doesn't win operator mail.** The plain-mode part of
+- [x] **MAR-51: Parity: A future lastActivityAt doesn't win operator mail.** The plain-mode part of
   MUS-33 (muster `9a0b61c`). Mail to an operator goes to their most active session, and a session can
   claim a far-future `lastActivityAt`. Done when: a `lastActivityAt` later than now doesn't outrank a
-  real one when routing operator mail, with a test.
+  real one when routing operator mail, with a test. Done (#45), merged in 172e6d7.
+- [x] **MAR-55: Parity: Operator mail tolerates a client clock slightly ahead of the daemon's.**
+  The watchman's follow-up to MAR-51, which ranks a future `lastActivityAt` as no activity, so a
+  machine whose clock runs a little fast (as a1's may) would miss its operator's mail. Done when: a
+  `lastActivityAt` up to 60 s ahead (`CLOCK_TOLERANCE_MS`) counts as current activity, and one further
+  ahead still doesn't outrank a real one, with a test. The entry was missing here when it merged
+  (#52's proposed done-when). Done (#52), merged in 54c87a3.
 - [ ] **MAR-52: Parity: Run CI on macOS.** From MUS-13 (muster #163). Held until the official swap to
   Marshal, by the operator (2026-11-08: "we'll get macos tests ready when we perform the official swap");
   as for MAR-35, Rally hold 1418. Done when: a `macos-15` job runs the workspace tests on the fork's CI
@@ -382,14 +388,14 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
   [upstream-defaults-issue-draft.md](upstream-defaults-issue-draft.md), unsent. Done when: the draft is agreed with the
   commissioner and the operator has filed it.
-- [ ] **MAR-66: Later: List what the fork could offer upstream as small additive PRs.** Beside
+- [x] **MAR-66: Later: List what the fork could offer upstream as small additive PRs.** Beside
   MAR-15, which is the single issue for default changes. From the watchman (2026-11-09), for Josh's
   upstream decisions; nothing is sent. Done when: [upstream-offers.md](upstream-offers.md) lists
   each merged fork story that could go upstream with its upstream-shaped commits, whether they
   cherry-pick cleanly onto upstream `main` (checked with `git cherry-pick --no-commit` in a
   throwaway worktree), what it's stacked on, and its size; marks default changes as MAR-15's; and
-  names what's fork-only.
-- [ ] **MAR-68: Later: The Codex bridge makes sure it's talking to the app-server it started.**
+  names what's fork-only. Done (#71), merged in 914f06f.
+- [x] **MAR-68: Later: The Codex bridge makes sure it's talking to the app-server it started.**
   From the watchman's bind-then-drop survey (2026-11-09). `ephemeral_loopback_endpoint()` picks the
   app-server's port by binding port 0 and closing it, and `wait_for_app_server` took the first TCP
   connect as ready, so the bridge could talk to another process that took the port while Codex,
@@ -400,7 +406,7 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   with a fake app-server and a foreign listener on the port, show the foreign answer refused, a
   healthy one accepted, the retry landing on a fresh port, and all three lost. Assumes Codex fails
   its bind within the settle window; one that took longer would still be trusted. The proxy port
-  the bridge binds itself fails clearly if lost, and isn't retried.
+  the bridge binds itself fails clearly if lost, and isn't retried. Done (#72), merged in b9f3d26.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
   `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
