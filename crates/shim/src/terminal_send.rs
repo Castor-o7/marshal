@@ -25,7 +25,7 @@ use marshal_entities::{
 use myko::client::MykoClient;
 use uuid::Uuid;
 
-const TERMINAL_KIND: &str = "terminal";
+use marshal_entities::TERMINAL_KIND;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_POLL: Duration = Duration::from_millis(200);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);

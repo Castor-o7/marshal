@@ -3000,6 +3000,8 @@ mod tests {
             to_operator: None,
             body: "hello".into(),
             sent_at: 2,
+            from_kind: None,
+            from_machine: None,
         })
     }
 

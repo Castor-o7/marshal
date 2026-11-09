@@ -941,6 +941,8 @@ mod tests {
             to_operator: None,
             body: "hi".into(),
             sent_at,
+            from_kind: None,
+            from_machine: None,
         };
         let ev = MEvent::from_item(&msg, MEventType::SET, &Uuid::new_v4().to_string());
         ctx.apply_event_batch(vec![ev]).expect("apply Message SET");

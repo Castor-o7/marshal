@@ -150,6 +150,8 @@ impl CommandHandler for BroadcastMessage {
             to_operator: None,
             body: self.body.clone(),
             sent_at: now,
+            from_kind: sender.kind.clone(),
+            from_machine: sender.host.as_ref().map(|h| h.name.clone()),
         };
         ctx.emit_set(&msg)?;
 
@@ -226,6 +228,8 @@ impl CommandHandler for BroadcastMessage {
                 to_operator: to_operator.clone(),
                 body: format!("[@mention in {}] {}", room.name, self.body),
                 sent_at: now,
+                from_kind: sender.kind.clone(),
+                from_machine: sender.host.as_ref().map(|h| h.name.clone()),
             };
             ctx.emit_set(&ping)?;
             let (context_body, body_truncated) =
