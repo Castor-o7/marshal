@@ -31,6 +31,16 @@ marshal-entities = { workspace = true }
 notify-debouncer-mini = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
+# Opt-in TLS (MAR-23), on the ring provider. rustls and tokio-rustls are already
+# in the tree through myko's telemetry; ring adds about 1.9 MB to a release
+# daemon (32.0 -> 33.9 MB on Linux x86-64), where the aws-lc-rs provider that
+# telemetry names but doesn't link would add 4.2 MB. reqwest picks its own
+# provider explicitly, so enabling ring changes nothing there. rcgen makes the
+# self-signed certificate and sha2 its fingerprint.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 # controls.rs checks a control file is owned by the daemon's own user.
