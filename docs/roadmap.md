@@ -437,7 +437,9 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   another test's myko server holds the port, a connect succeeds, and detection rests on the bind
   error arriving within 200 ms, a timing assumption. Waits on the operator and upstream: an additive
   ask that myko-server accept a pre-bound listener, which Josh sends. Done when: myko-server accepts
-  a pre-bound listener, and the remaining port-0 picks in the tests use it.
+  a pre-bound listener, and the remaining port-0 picks in the tests use it. The ask is drafted in
+  [myko-prebound-listener-ask.md](myko-prebound-listener-ask.md): an additive
+  `MykoServer::run_with_socket(TcpSocket)`, so `run()` keeps myko#33's late `listen`.
 - [x] **MAR-22: Later: Keep windows-cross-check within its time limit.** From MUS-91. Done when: the
   job finishes under its limit on 10 consecutive fork runs.
 - [ ] **MAR-23: Later: Gate: opt-in TLS.** `marshal-daemon --tls`; plain stays the default. Waits on
