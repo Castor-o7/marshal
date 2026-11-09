@@ -285,6 +285,13 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
   `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
   and its exit status unchanged, with tests. Done (#58), merged in 2271713.
+- [ ] **MAR-70: Cutover: run step 1, prove one session on Marshal.** The watchman's assignment
+  (2026-11-09) for rally's cutover.md step 1, with MAR-59's kit. Done when: a fresh session wired only
+  to Marshal through project-local files shows on `marshal-shim roster`, wakes when idle on `tell`, and
+  gets mail sent before a `marshal-daemon` restart after it, with nothing user-wide changed and
+  muster-daemon untouched; the run, its outputs and what went wrong are recorded in
+  [cutover-test-session.md](cutover-test-session.md), and the kit is corrected where the run showed it
+  wrong. Found MAR-71.
 - [ ] **MAR-65: Cutover: Define and run the step-7 no-traffic check on Muster.** Rally's cutover.md
   step 7 retires Muster "only after a full day with no traffic", which nothing defined. Done when:
   [muster-no-traffic-check.md](muster-no-traffic-check.md) defines no traffic (no message and no
