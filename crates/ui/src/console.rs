@@ -81,6 +81,8 @@ impl Console {
             project: Some("marshal".to_string()),
             channels_enabled: Some(false),
             acks_pushes: None,
+            harness: None,
+            identity: None,
         }
     }
 
@@ -353,6 +355,7 @@ fn Compose(
                 to_session_id: SessionId(Arc::from(to.as_str())),
                 body,
                 as_session: Some(as_dm.clone()),
+                idempotency_key: None,
             },
             move |res| match res {
                 Ok(r) => {
@@ -527,6 +530,7 @@ pub fn ReplyBox(target: String) -> impl IntoView {
                 to_session_id: SessionId(Arc::from(target.as_str())),
                 body: b,
                 as_session: Some(as_session.clone()),
+                idempotency_key: None,
             },
             move |res| match res {
                 Ok(r) => {
