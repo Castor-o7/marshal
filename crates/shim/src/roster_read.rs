@@ -64,6 +64,7 @@ fn view(
                     "machine": s.host.as_ref().map(|h| h.name.as_str()),
                     "operator": s.operator,
                     "activity": s.activity,
+                    "activity_at": s.activity_at,
                     "last_activity_at": s.last_activity_at,
                     "last_tool": s.last_tool,
                     "last_tool_at": s.last_tool_at,
@@ -145,7 +146,7 @@ mod tests {
             current_task: Some("anything at all".into()),
             session_name: None,
             activity: Some("idle".into()),
-            activity_at: None,
+            activity_at: Some(3),
             kind: None,
             connected_at: 1,
             last_activity_at: Some(2),
@@ -176,6 +177,10 @@ mod tests {
         assert!(row["recorded"].get("operator").is_none());
         assert_eq!(row["declared"]["current_task"], "anything at all");
         assert_eq!(row["declared"]["last_activity_at"], 2);
+        // MAR-58: when the activity last changed sits beside it, as a claim.
+        assert_eq!(row["declared"]["activity"], "idle");
+        assert_eq!(row["declared"]["activity_at"], 3);
+        assert!(row["recorded"].get("activity_at").is_none());
         assert!(row["recorded"].get("current_task").is_none());
         assert!(row["recorded"].get("last_activity_at").is_none());
     }
