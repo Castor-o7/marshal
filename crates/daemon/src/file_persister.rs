@@ -40,6 +40,7 @@ pub const ENV: &str = "MARSHAL_PERSIST";
 /// stops startup.
 pub const DURABLE_KINDS: &[&str] = &[
     "Message",
+    "MessageOffer",
     "MessageRead",
     "Room",
     "RoomMember",

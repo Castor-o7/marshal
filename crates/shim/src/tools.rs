@@ -658,6 +658,7 @@ async fn ack_messages(host: &ToolHost, args: &Value) -> Result<ToolOutcome, Tool
     let cmd = AckMessages {
         message_ids,
         as_session,
+        phase: None,
     };
     let cell = host
         .client
