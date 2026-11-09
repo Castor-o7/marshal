@@ -340,6 +340,18 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   cherry-pick cleanly onto upstream `main` (checked with `git cherry-pick --no-commit` in a
   throwaway worktree), what it's stacked on, and its size; marks default changes as MAR-15's; and
   names what's fork-only.
+- [ ] **MAR-68: Later: The Codex bridge makes sure it's talking to the app-server it started.**
+  From the watchman's bind-then-drop survey (2026-11-09). `ephemeral_loopback_endpoint()` picks the
+  app-server's port by binding port 0 and closing it, and `wait_for_app_server` took the first TCP
+  connect as ready, so the bridge could talk to another process that took the port while Codex,
+  failing its own bind, exited. Upstream has the same code, so the fix is branched from upstream
+  `main`. Done when: an answer on the port counts only once the app-server has stayed up for a
+  settle window after it (500 ms); an app-server that exits before or just after an answer is
+  started again on a fresh port, up to 3 times, with an error naming every port lost; and tests,
+  with a fake app-server and a foreign listener on the port, show the foreign answer refused, a
+  healthy one accepted, the retry landing on a fresh port, and all three lost. Assumes Codex fails
+  its bind within the settle window; one that took longer would still be trusted. The proxy port
+  the bridge binds itself fails clearly if lost, and isn't retried.
 - [x] **MAR-16: Later: cargo-deny dependency audit in CI.** Additive. Done when: `cargo deny check`
   runs in the fork's CI and passes, with each licence exception explained. Done (#32): CI's
   `dependency-audit` job runs cargo-deny 0.20.2 against `deny.toml`, ported from muster's MUS-11.
