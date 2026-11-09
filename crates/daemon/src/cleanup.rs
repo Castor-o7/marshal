@@ -516,6 +516,38 @@ fn sweep_once(ctx: &MykoServerContext, disconnected_since: &mut HashMap<Arc<str>
         // membership sweep already knows it may be taken over (MAR-19).
         crate::succession::record_removed(&id, now_ms);
         disconnected_since.remove(&id);
+        // Its offers go with it, as at SessionEnd (MAR-82): the mail was never
+        // marked read, so it's unread for the session if it comes back, or,
+        // by MAR-42, for its successor.
+        drop_offers_of(ctx, &id);
+    }
+}
+
+/// DEL every `MessageOffer` made to `session` (MAR-82).
+fn drop_offers_of(ctx: &MykoServerContext, session: &str) {
+    let Some(store) = ctx.registry.get(MessageOffer::ENTITY_NAME_STATIC) else {
+        return;
+    };
+    let ids: Vec<Arc<str>> = store
+        .entries()
+        .materialize()
+        .get()
+        .into_iter()
+        .filter_map(|(id, item)| {
+            downcast_item::<MessageOffer>(&item)
+                .filter(|o| o.session_id.0.as_ref() == session)
+                .map(|_| id)
+        })
+        .collect();
+    for id in ids {
+        if let Err(e) = ctx.del_by_id(MessageOffer::ENTITY_NAME_STATIC, &id) {
+            log::warn!(
+                "[cleanup] drop offer {} of reaped {} failed: {}",
+                id,
+                session,
+                e
+            );
+        }
     }
 }
 
@@ -744,6 +776,26 @@ mod tests {
         assert!(
             !survives_a_drop_past_the_grace(&ctx, "lapsed"),
             "a wait that has stopped counting keeps nothing"
+        );
+    }
+
+    /// MAR-82: a reaped session's offers are dropped with it, as at
+    /// SessionEnd, and another session's are left.
+    #[test]
+    fn a_reaped_session_takes_its_offers_with_it() {
+        let ctx = setup();
+        set_client(&ctx, "other-client");
+        set_ws_session(&ctx, "crashed", "gone-client");
+        let now = Utc::now().timestamp_millis();
+        set_message(&ctx, "m", now - 1_000);
+        set_offer(&ctx, "m", "crashed", now - 1_000);
+        set_offer(&ctx, "m", "someone-else", now - 1_000);
+
+        assert!(!survives_a_drop_past_the_grace(&ctx, "crashed"));
+
+        assert_eq!(
+            offer_ids(&ctx),
+            HashSet::from(["m::someone-else".to_string()])
         );
     }
 
