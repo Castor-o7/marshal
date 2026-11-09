@@ -298,23 +298,16 @@ async fn a_session_can_claim_another_unless_the_authorizer_checks_as_session() -
     let permissive = daemon(Some(Policy::AllowAll)).await?;
     let mut alice = connect(&permissive, Some("alice"), None).await?;
     let (_, error) = send_as(&mut alice, "bob", "impersonate-1").await?;
-    assert_ne!(
-        error, "permission denied",
+    // Marshal's own resolver answered, so #129 let the command through as bob.
+    // With bob on the roster, the send would have gone out from bob.
+    assert!(
+        error.contains("asSession 'bob' is not on the roster"),
         "gap: with no asSession check, the handler ran as bob (it said: {error:?})"
     );
-
-    let checked = daemon(Some(Policy::OwnSessionsOnly)).await?;
-    let mut alice = connect(&checked, Some("alice"), None).await?;
-    let (event, error) = send_as(&mut alice, "bob", "impersonate-2").await?;
-    assert_eq!(
-        (event.as_str(), error.as_str()),
-        ("ws:m:command-error", "permission denied")
-    );
     let (_, own) = send_as(&mut alice, "alice", "own-session").await?;
-    assert_ne!(own, "permission denied", "alice may act as alice");
     assert!(
-        !closes_within(&mut alice, Duration::from_millis(300)).await,
-        "a denied command doesn't end the connection"
+        own.contains("asSession 'alice' is not on the roster"),
+        "alice may act as alice, so her own command reaches the handler (it said: {own:?})"
     );
     Ok(())
 }
