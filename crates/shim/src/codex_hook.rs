@@ -92,8 +92,20 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     let cwd = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
 
     let base = resolve_base(base_override);
-    if matches!(harness, Harness::Claude) {
-        let _ = confirm_seen(&base, sid, transcript_path(&v).as_deref());
+    let transcript = transcript_path(&v);
+    match harness {
+        Harness::Claude => {
+            let _ = confirm_seen(&base, sid, transcript.as_deref());
+        }
+        // Codex's `transcript_path` is its rollout file (MAR-84).
+        Harness::Codex => {
+            let _ = confirm_seen_with(
+                &base,
+                sid,
+                transcript.as_deref(),
+                crate::transcript::seen_codex,
+            );
+        }
     }
     let host = short_host();
     let op = operator();
@@ -144,9 +156,22 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     // Only now has the mail been handed on. A lost ack means it comes again
     // once the lease lapses, which beats losing it.
     if !reply.ack_ids.is_empty() {
-        let ack =
-            serde_json::json!({ "session_id": sid, "message_ids": reply.ack_ids }).to_string();
-        let _ = http_post_why(&base, "/hook/ack", &ack, deadline);
+        // Codex records this context before it samples, and even when the turn
+        // then stops, so it's only offered until the rollout shows model output
+        // after it (MAR-84). With no rollout to read, it's read now, as before.
+        let offered = matches!(harness, Harness::Codex) && transcript.is_some();
+        let mut ack = serde_json::json!({ "session_id": sid, "message_ids": reply.ack_ids });
+        if offered {
+            ack["phase"] = "offered".into();
+        } else if matches!(harness, Harness::Codex) {
+            // No rollout to confirm from: read now, as before, and say so, so
+            // the daemon's log shows the weaker path is in use (MAR-84).
+            ack["rollout"] = false.into();
+        }
+        let _ = http_post_why(&base, "/hook/ack", &ack.to_string(), deadline);
+        if offered {
+            mark_offered(sid);
+        }
     }
 }
 
@@ -438,6 +463,16 @@ fn ack_seen(base: &str, session_id: &str, ids: &[String]) {
 /// fail-safe: anything that goes wrong leaves the mail offered, and the daemon
 /// offers it again after its timeout.
 fn confirm_seen(base: &str, session_id: &str, transcript: Option<&std::path::Path>) -> Vec<String> {
+    confirm_seen_with(base, session_id, transcript, crate::transcript::seen)
+}
+
+/// `confirm_seen` with the matcher for the harness's transcript format.
+fn confirm_seen_with(
+    base: &str,
+    session_id: &str,
+    transcript: Option<&std::path::Path>,
+    seen_in: fn(&std::path::Path, &[String]) -> Vec<String>,
+) -> Vec<String> {
     let (Some(marker), Some(transcript)) = (offered_marker(session_id), transcript) else {
         return Vec::new();
     };
@@ -457,7 +492,7 @@ fn confirm_seen(base: &str, session_id: &str, transcript: Option<&std::path::Pat
         return Vec::new();
     };
     let offered: Vec<String> = serde_json::from_str(reply.body.trim()).unwrap_or_default();
-    let seen = crate::transcript::seen(transcript, &offered);
+    let seen = seen_in(transcript, &offered);
     if !seen.is_empty() {
         ack_seen(base, session_id, &seen);
     }
