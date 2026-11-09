@@ -316,6 +316,14 @@ MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md]
   empty or `/` path means `/myko`, no port means 5155), names that URL in its finding, and a test
   server that serves `/myko` only passes; doctor built from the branch, run against the live daemon on
   Murph, says `ok daemon`. Done (#79), merged in 98da488.
+- [ ] **MAR-73: Cutover: what "as reliable as Muster" means, measured on Murph.** Josh keeps both
+  daemons running, each as the other's backup, until Marshal is as reliable as Muster (the watchman's
+  assignment, 2026-11-09). Done when: [reliability-vs-muster.md](reliability-vs-muster.md) gives a few
+  checkable measures (restarts and crashes, errors and refusals, mail taken and how fast, unread mail
+  across a restart, sessions lost or duplicated), a read-only way to take each from both daemons on
+  Murph (journal, and the `muster` and `marshal` databases with only `SELECT`s), one run over the last
+  24 h for both with its outputs recorded, and a proposed bar for Josh to accept or change. Nothing on
+  either daemon changes.
 
 ## Parity with muster (gap survey, 2026-11-08)
 
