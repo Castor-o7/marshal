@@ -77,14 +77,17 @@ jobs:
             plugins/marshal-opencode/test/channel.test.ts \
             plugins/marshal-opencode/test/push-ack.test.ts \
             plugins/marshal-opencode/test/push.test.ts \
+            plugins/marshal-opencode/test/reconnect.test.ts \
             plugins/marshal-pi/test/embedding-agent.test.ts \
             plugins/marshal-pi/test/push-ack.test.ts \
             plugins/marshal-pi/test/live-push.test.ts \
             plugins/marshal-pi/test/inbox-pull.test.ts \
+            plugins/marshal-pi/test/reconnect.test.ts \
             plugins/marshal-prime-agent/test/embedding-agent.test.ts \
             plugins/marshal-prime-agent/test/push-ack.test.ts \
             plugins/marshal-prime-agent/test/live-push.test.ts \
-            plugins/marshal-prime-agent/test/inbox-pull.test.ts
+            plugins/marshal-prime-agent/test/inbox-pull.test.ts \
+            plugins/marshal-prime-agent/test/reconnect.test.ts
       - name: Test simulation fixture and scoring contracts
         run: python3 -m unittest discover -s scripts/sandbox -v
       - name: Test release dispatch contract

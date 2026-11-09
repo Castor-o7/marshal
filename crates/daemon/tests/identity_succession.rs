@@ -286,6 +286,7 @@ fn a_live_alias_isnt_given_to_a_new_session() {
         alias: Some(held.clone()),
         alias_until: Some(now + 600_000),
         told: false,
+        handed_over: Vec::new(),
     })
     .expect("succession SET");
     assert_ne!(
@@ -307,7 +308,176 @@ fn a_live_alias_isnt_given_to_a_new_session() {
         alias: Some(free.clone()),
         alias_until: Some(now - 1),
         told: false,
+        handed_over: Vec::new(),
     })
     .expect("succession SET");
     assert_eq!(start(&ctx, &later), free);
+}
+
+/// MUS-47: the predecessor's unread direct mail is the successor's after the
+/// takeover, and the record lists it. Mail it had read stays with it.
+#[test]
+fn unread_mail_is_handed_to_the_successor() {
+    use marshal_entities::{Message, MessageId, MessageRead, MessageReadId};
+    let ctx = setup();
+    let cwd = unique_cwd();
+    let old = session(&cwd, None, None);
+    start(&ctx, &old);
+    let mail = |body: &str| Message {
+        id: MessageId(Arc::from(Uuid::new_v4().to_string().as_str())),
+        from_session_id: SessionId(Arc::from("sender")),
+        to_session_id: Some(old.id.clone()),
+        to_room_id: None,
+        to_operator: None,
+        response_required: false,
+        body: body.into(),
+        sent_at: 1,
+    };
+    let unread = mail("unread");
+    let read = mail("read");
+    ctx.set(&unread).expect("message SET");
+    ctx.set(&read).expect("message SET");
+    ctx.set(&MessageRead {
+        id: MessageReadId(Arc::from(
+            MessageRead::make_id(read.id.0.as_ref(), old.id.0.as_ref()).as_str(),
+        )),
+        message_id: read.id.clone(),
+        session_id: old.id.clone(),
+        read_at: 2,
+    })
+    .expect("read SET");
+    end(&ctx, &old);
+    let new = session(&cwd, None, None);
+    start(&ctx, &new);
+
+    let messages = cmd(&ctx)
+        .exec_query(marshal_entities::GetAllMessages {})
+        .unwrap();
+    let to = |m: &Message| {
+        messages
+            .iter()
+            .find(|x| x.id == m.id)
+            .and_then(|x| x.to_session_id.clone())
+    };
+    assert_eq!(to(&unread), Some(new.id.clone()), "unread mail moves");
+    assert_eq!(to(&read), Some(old.id.clone()), "read mail stays");
+    let rec = cmd(&ctx)
+        .exec_query(GetAllSuccessions {})
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id.0.as_ref() == old.id.0.as_ref())
+        .expect("succession record");
+    assert_eq!(rec.handed_over, vec![unread.id.0.to_string()]);
+}
+
+/// MAR-54: a Codex bridge's wake record is keyed `<session>#bridge:<bridge>`
+/// (MAR-4), not by the session id, and it still counts as a waiter: a
+/// predecessor a bridge can wake isn't taken over, however quiet its row.
+#[test]
+fn a_bridge_wake_record_counts_as_a_waiter() {
+    use marshal_entities::{WakeWatcher, WakeWatcherId};
+    let ctx = setup();
+    let cwd = unique_cwd();
+    let hour_ago = chrono::Utc::now().timestamp_millis() - 3_600_000;
+    let mut old = session(&cwd, None, None);
+    old.connected_at = hour_ago;
+    old.last_activity_at = Some(hour_ago);
+    let nick = start(&ctx, &old);
+    let sid = old.id.0.as_ref();
+    ctx.set(&WakeWatcher {
+        id: WakeWatcherId(Arc::from(WakeWatcher::bridge_id(sid, "bridge-1").as_str())),
+        until: chrono::Utc::now().timestamp_millis() + 120_000,
+        session_id: Some(old.id.clone()),
+    })
+    .expect("bridge record SET");
+    let new = session(&cwd, None, None);
+    assert_ne!(
+        start(&ctx, &new),
+        nick,
+        "a session a bridge can wake keeps its nickname"
+    );
+}
+
+/// A Codex row an hour quiet, as a bridge-watched idle thread looks.
+fn quiet_codex(cwd: &str) -> Session {
+    let hour_ago = chrono::Utc::now().timestamp_millis() - 3_600_000;
+    let mut s = session(cwd, None, None);
+    s.harness = Some("codex".into());
+    s.connected_at = hour_ago;
+    s.last_activity_at = Some(hour_ago);
+    s
+}
+
+/// MAR-54: a Codex thread its bridge can still wake keeps its nickname when
+/// a new session starts in the same directory, however quiet its row.
+#[test]
+fn a_bridge_watched_codex_sibling_keeps_its_name() {
+    use marshal_entities::{WakeWatcher, WakeWatcherId};
+    let ctx = setup();
+    let cwd = unique_cwd();
+    let old = quiet_codex(&cwd);
+    let nick = start(&ctx, &old);
+    let now = chrono::Utc::now().timestamp_millis();
+    ctx.set(&WakeWatcher {
+        id: WakeWatcherId(Arc::from(
+            WakeWatcher::bridge_id(old.id.0.as_ref(), "bridge-1").as_str(),
+        )),
+        until: now + 120_000,
+        session_id: Some(old.id.clone()),
+    })
+    .expect("bridge record SET");
+    succession::observe_bridges(&[old.id.0.clone()].into_iter().collect(), now);
+    let mut new = session(&cwd, None, None);
+    new.harness = Some("codex".into());
+    assert_ne!(
+        start(&ctx, &new),
+        nick,
+        "the live Codex thread keeps its name"
+    );
+}
+
+/// MAR-54: once a Codex row's bridge record has been gone the bridge grace,
+/// with no hook since, a new session in its directory takes it over, unread
+/// mail included (MAR-42).
+#[test]
+fn a_codex_row_whose_bridge_record_ended_is_taken_over() {
+    use marshal_entities::{GetAllMessages, Message, MessageId};
+    let ctx = setup();
+    let cwd = unique_cwd();
+    let old = quiet_codex(&cwd);
+    let nick = start(&ctx, &old);
+    let now = chrono::Utc::now().timestamp_millis();
+    let id: Arc<str> = old.id.0.clone();
+    // Seen with a bridge record, which ended ten minutes ago.
+    succession::observe_bridges(&[id.clone()].into_iter().collect(), now - 3_000_000);
+    succession::observe_bridges(&Default::default(), now - 600_000);
+    let unread = Message {
+        id: MessageId(Arc::from(Uuid::new_v4().to_string().as_str())),
+        from_session_id: SessionId(Arc::from("sender")),
+        to_session_id: Some(old.id.clone()),
+        to_room_id: None,
+        to_operator: None,
+        response_required: false,
+        body: "while it was gone".into(),
+        sent_at: now - 300_000,
+    };
+    ctx.set(&unread).expect("message SET");
+
+    let mut new = session(&cwd, None, None);
+    new.harness = Some("codex".into());
+    assert_eq!(start(&ctx, &new), nick, "the new session takes the name");
+    let to = cmd(&ctx)
+        .exec_query(GetAllMessages {})
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == unread.id)
+        .and_then(|m| m.to_session_id.clone());
+    assert_eq!(to, Some(new.id.clone()), "and the unread mail");
+    let rec = cmd(&ctx)
+        .exec_query(GetAllSuccessions {})
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id.0.as_ref() == old.id.0.as_ref())
+        .expect("a succession record");
+    assert!(rec.reason.contains("bridge record ended"), "{}", rec.reason);
 }

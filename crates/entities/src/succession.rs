@@ -40,6 +40,10 @@ pub struct Succession {
     /// takeover needs telling: one at registration shows in its session block.
     #[serde(default)]
     pub told: bool,
+    /// The predecessor's unread direct messages handed to the successor at the
+    /// takeover (MUS-47): their recipient is now the successor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handed_over: Vec<String>,
 }
 
 /// Follow a session id through successions to the session that holds its

@@ -147,6 +147,23 @@ launcher.
 - [x] **MAR-9: Supporting: Stable nickname across a restart.** From MUS-3. Done when: a session
   restarted in the same harness and directory keeps its nickname, a role declared by environment can be
   reached after a restart, and a test shows both.
+- [x] **MAR-42: Supporting: A restarted session's unread mail follows it.** From MUS-47, built on MAR-9.
+  A takeover readdresses the predecessor's unread direct mail to the successor; mail it had read stays
+  with it. Done when: the conformance cell `unread-mail-follows-a-restart` passes on claude and codex, a
+  daemon test shows unread mail moving and read mail staying, and the change is listed in MAR-15.
+  Done (#43): `unread-mail-follows-a-restart` is off `MARSHAL_NOT_APPLICABLE` and passes on claude
+  and codex in CI; `crates/daemon/tests/identity_succession.rs` shows the mail moving.
+- [x] **MAR-54: Supporting: Codex rows on the roster can count as dead, from the bridge's signal.**
+  Follow-up to MAR-9. Succession never treated a Codex row still on the roster as dead
+  (`CODEX_PRESENT_ROWS_CAN_BE_DEAD`, "until MUS-77"), but MAR-12 has since given the roster the bridge's
+  wake path. Scope agreed with the watchman (2026-11-08). Done when: a present Codex row counts as dead
+  only once this daemon saw its bridge record end at least `MARSHAL_SUCCESSION_BRIDGE_GRACE_SECS` (120 s)
+  ago, with no other waiter and no hook since, and a row never seen with one never does, with verdict
+  tests including a 45 s bridge handover gap; succession finds waiters by `WakeWatcher::session()`, with
+  a test; a daemon test shows a bridge-watched Codex sibling keeping its name and one whose record ended
+  taken over with its unread mail; the codex conformance cells still pass; and `stable-identity.md`
+  says so. Done (#48): verdict tests in `crates/daemon/src/succession.rs`, daemon tests in
+  `crates/daemon/tests/identity_succession.rs`.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
@@ -200,6 +217,20 @@ that PR, not on a patched myko-server, and its shape is agreed upstream before a
 
 MAR-37's read and a draft comment for myko#129 are in [myko-129-review-notes.md](myko-129-review-notes.md).
 
+## Cutover
+
+- [ ] **MAR-59: Cutover: a kit to prove one session on Marshal.** Step 1 of the cutover runbook
+  (rally's docs/cutover.md, RAL-119). Done when: [cutover-test-session.md](cutover-test-session.md)
+  gives the project-local wiring, the checks with their expected output, and teardown, checked
+  against the plugin's hooks.json and Claude Code's flags. Running it is the operator's call; the
+  doc is marked not yet run.
+- [ ] **MAR-60: Cutover: doctor checks a project's own Claude Code wiring.** Found writing MAR-59:
+  `marshal-shim doctor` reads only `~/.claude/settings.json` and `~/.claude.json`, so it can't check a
+  session wired by a project-local `.claude/settings.json` and `.mcp.json`, which is how the cutover
+  moves sessions one at a time. Done when: run in a directory with its own `.claude/settings.json` or
+  `.mcp.json`, doctor checks those too and says which file each finding came from; it stays read-only
+  and its exit status unchanged, with tests.
+
 ## Parity with muster (gap survey, 2026-11-08)
 
 Toward the operator's goal of bringing Marshal up to muster's capabilities. A survey of the 62 finished
@@ -240,10 +271,12 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   `2d997b3`). Write tools fail one missing field at a time. Done when: one error names every missing or
   mistyped field (Codex's `asSession` too) and the keys given, the common aliases muster accepts stand
   in, the canonical name wins over an alias, the advertised schemas are unchanged, with tests.
-- [ ] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
-  (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the old
-  one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is only in
-  its current `op:` room, with a test.
+- [x] **MAR-50: Parity: A session leaves its old op: room when its operator changes.** From MUS-40
+  (muster `1a4b670`). `auto_rooms` adds a session to `op:<operator>` but never removes it from the
+  old one, so a broadcast to the old room reaches it. Done when: a session whose operator changes is
+  only in its current `op:` room, with a test. Done (#42): each auto-rooms dispatch removes the
+  session from other operators' `op:` rooms; a SET naming no operator leaves them.
+  `crates/daemon/tests/auto_rooms_operator.rs` shows it.
 - [ ] **MAR-51: Parity: A future lastActivityAt doesn't win operator mail.** The plain-mode part of
   MUS-33 (muster `9a0b61c`). Mail to an operator goes to their most active session, and a session can
   claim a far-future `lastActivityAt`. Done when: a `lastActivityAt` later than now doesn't outrank a
@@ -263,7 +296,7 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
 - [ ] **MAR-15: Later: File the defaults issue upstream.** One issue listing the default changes
   upstream may choose: refuse an empty `to` (MUS-73, fix ready on a local branch), hold a shim's first
   write until it's registered (MUS-72, 78, 79; built on the fork as MAR-43), keep a waiting session through a drop (MAR-6: the sweep spares a dropped WS session while its `/hook/wait` is held), take over a dead
-  predecessor's nickname by harness and directory (MAR-9), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), a `MARSHAL_PERSIST` other than `file` stops startup (MAR-53: so a typo can't silently lose mail; before, the variable meant nothing), and
+  predecessor's nickname by harness and directory (MAR-9) and hand it the unread mail (MAR-42), a reaped session that comes back loses its adhoc rooms unless it takes the old one over (MAR-19: it rejoins its auto-rooms; a takeover within a day moves the adhoc ones, otherwise it rejoins them itself), have `current_task` follow the branch (MAR-20), a `MARSHAL_PERSIST` other than `file` stops startup (MAR-53: so a typo can't silently lose mail; before, the variable meant nothing), and
   optional inbox quoting. From the gap survey (2026-11-08), also: a per-session send rate limit
   (MUS-9), keeping a session while its hooks are firing (MUS-54), a larger hook body (MUS-102), and a
   resource read right after connecting waiting for registration (MUS-114). Needs the operator: Josh files it. The draft is
@@ -295,8 +328,19 @@ MAR-9, and MUS-47 is MAR-9's follow-up, so neither is repeated here.
   covers both.
 - [x] **MAR-19: Later: Drop ended sessions from rooms.** From MUS-58. Done when: a session that ends
   leaves every room it was in, and `everyone` lists only live sessions, with a test.
-- [ ] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
-  branch unless the session set its own, with a test.
+- [x] **MAR-20: Later: Keep current_task fresh.** From MUS-26. Done when: `current_task` follows the
+  branch unless the session set its own, with a test. Done (#34), in `crates/shim/src/main.rs`.
+- [ ] **MAR-58: Later: The roster says when a session's activity last changed.** The roster's
+  `activity` (`busy`, `idle` or `shell`, from Claude's per-PID manifest) says what a session is doing
+  but not since when, so "idle for a minute" and "idle for an hour" look the same, and
+  `last_activity_at` moves only on Marshal traffic. Claude's manifest already records the change as
+  `statusUpdatedAt`. Additive: a new optional `activity_at` field on `Session`, epoch milliseconds.
+  Done when: the shim sets `activity_at` at registration and with every `activity` push, taking
+  the manifest's `statusUpdatedAt` when it's there and its own clock when the change was seen
+  but has no timestamp; a shim restart or a canonical-id re-register keeps the manifest's time
+  rather than resetting it; a session with no `activity` (Codex, older Claude builds) has none;
+  everywhere the shim shows `activity` shows `activity_at` beside it (`marshal://roster`, the
+  `roster` tool and `marshal://whoami`); and tests cover each of those cases.
 - [x] **MAR-21: Later: Tests pick ports without races.** From MUS-88. Done when: every in-process
   hook listener in the tests takes a socket the test bound to port 0; every port a test's myko
   server or daemon still picks is retried on a lost bind instead of failing; and the e2e and

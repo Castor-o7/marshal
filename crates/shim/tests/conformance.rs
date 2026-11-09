@@ -1907,10 +1907,6 @@ const MARSHAL_NOT_APPLICABLE: &[(&str, &str)] = &[
         "resume-wakes-held-mail",
         "Marshal has no operator pause to resume (MUS-10)",
     ),
-    (
-        "unread-mail-follows-a-restart",
-        "Marshal doesn't hand a successor its predecessor's mail yet (muster's MUS-47)",
-    ),
 ];
 
 const TLS_EXCLUDED: &str = "Marshal has no TLS gate yet (MAR-23); runs as plain mode would";
@@ -2106,8 +2102,8 @@ fn unread_mail_follows_a_restart(c: &mut Cell) -> Result<(), String> {
 /// Scenario 12 (MUS-3): A second session in the same working directory,
 /// while the first is live, gets a nickname of its own, and the first keeps
 /// its nickname past the quiet time. For Codex the first is an idle thread
-/// with no client, which the daemon can't tell from a dead one until MUS-77,
-/// so it must never be taken over.
+/// with no client: only a bridge record that has since ended (MAR-54) lets
+/// the daemon take it over, so it must keep its name here.
 fn live_sibling_keeps_its_name(c: &mut Cell) -> Result<(), String> {
     c.harness.arm_idle();
     let first = c.recipient();

@@ -146,6 +146,40 @@ impl CommandHandler for DispatchAutoRooms {
             }
         }
 
+        // A session's operator can change, and its old `op:` room shouldn't keep reaching it
+        // (MAR-50, from muster's MUS-40). A room left empty falls to the room sweep.
+        for member in stale_operator_memberships(&session, &rooms, &memberships) {
+            ctx.emit_del(&*member)?;
+        }
+
         Ok(())
     }
+}
+
+/// This session's memberships of operator rooms other than its current operator's. With no
+/// operator known, there's nothing to compare against, so none are stale.
+pub fn stale_operator_memberships(
+    session: &Session,
+    rooms: &[Arc<Room>],
+    memberships: &[Arc<RoomMember>],
+) -> Vec<Arc<RoomMember>> {
+    let Some(operator) = session.operator.as_deref().filter(|op| !op.is_empty()) else {
+        return Vec::new();
+    };
+    let is_stale_room = |room_id: &RoomId| {
+        rooms.iter().any(|room| {
+            room.id == *room_id
+                && matches!(
+                    &room.kind,
+                    RoomKind::Auto {
+                        source: AutoSource::Operator { name }
+                    } if name != operator
+                )
+        })
+    };
+    memberships
+        .iter()
+        .filter(|m| m.session_id == session.id && is_stale_room(&m.room_id))
+        .cloned()
+        .collect()
 }
