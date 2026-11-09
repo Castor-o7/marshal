@@ -234,6 +234,15 @@ launcher.
   `crates/shim/tests/claude_hook.rs`, for a later upstream PR if the operator wants one.
   Done (#67), merged in ea4299f.
 
+- [ ] **MAR-79: Supporting: Design two-phase delivery, so mail taken mid-turn isn't lost.** Found in
+  MAR-70 and MAR-73: a Claude session's background `claude-hook wait` takes a message as soon as it's
+  sent, and the daemon records it read then, but Claude Code holds it until the turn ends. If the
+  session crashes or exits first, the message is marked read and never seen. Muster has the same
+  design. Done when: [two-phase-delivery.md](two-phase-delivery.md) proposes offering mail first and confirming it only at the
+  session's next hook (or another way to know the model saw it), covering Claude and Codex, MAR-3's
+  "never offered twice", restarts and succession (MAR-42), with what changes in the daemon and the
+  shim, for the watchman to take to Josh. Design only: no code.
+
 ## Later: other harnesses
 
 - [x] **MAR-10: Later: Plugins ack a push only after the harness takes it.** From MUS-81. Pi, opencode
