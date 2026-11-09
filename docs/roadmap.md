@@ -176,6 +176,17 @@ launcher.
   call marks the sibling lapsed. A forced interleaving fails the same way. Done when: the tests in
   that file that feed the observations hold one test-only mutex, daemon code is unchanged, and the
   file passes repeatedly with `--test-threads` up to 32. Done (#66), merged in 1ae9717.
+- [ ] **MAR-67: Supporting: Tests that need a free or dead port keep it for as long as they use it.**
+  robust-warbler's run 42661142039 failed `spawn_e2e`'s `nothing_is_started_when_the_daemon_cant_be_reached`:
+  it bound port 0 and dropped the listener to get a dead port, and a parallel test's daemon took the
+  port before spawn connected. A survey at 914f06f found the same bind-then-drop pattern in four more
+  places. Done when: a test that needs a dead port holds a socket bound to it without listening, for
+  the whole test, so connecting is still refused and nothing else can bind it (`spawn_e2e`, and
+  doctor's `the_daemon_check_fails_when_nothing_listens`, as `link.rs`'s `refusing_address`). A test
+  that needs a free port binds the listener itself and hands it over (`hook_inbox_framing` through
+  `serve_until`, and the two `tui_proxy` tests straight to `run_tcp_tui_proxy`). The change is
+  test-only, and each test passes a local stress run. Conformance's `restart()` on the same ports is
+  left out: it needs a design call.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding

@@ -101,11 +101,11 @@ fn start() -> (MykoServerContext, SocketAddr) {
     let event = MEvent::from_item(&sender(), MEventType::SET, &Uuid::new_v4().to_string());
     ctx.apply_event_batch(vec![event]).expect("seed sender");
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    // Bound here and handed to the listener, so no parallel test can take the
+    // port between finding it and binding it (MAR-67, as MAR-21 did elsewhere).
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let addr: SocketAddr = std_listener.local_addr().unwrap();
     let listener_ctx = ctx.clone();
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -113,7 +113,11 @@ fn start() -> (MykoServerContext, SocketAddr) {
             .build()
             .expect("rt");
         rt.block_on(async move {
-            let _ = daemon::http_listener::run(addr, Arc::new(listener_ctx)).await;
+            let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener");
+            // Held for as long as the listener runs, as `run` does.
+            let (_never_stopping, stopping) = tokio::sync::watch::channel(false);
+            let _ = daemon::http_listener::serve_until(listener, Arc::new(listener_ctx), stopping)
+                .await;
         });
     });
     let deadline = Instant::now() + Duration::from_secs(5);

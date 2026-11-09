@@ -3594,9 +3594,12 @@ mod tests {
             .await
             .unwrap();
         let app_address = app_listener.local_addr().unwrap();
-        let reserved = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let proxy_address = reserved.local_addr().unwrap();
-        drop(reserved);
+        // Bound here and handed to the proxy, so no parallel test can take the
+        // port between finding it and binding it (MAR-67).
+        let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("launcher.json");
         let launcher = Arc::new(tokio::sync::Mutex::new(LauncherStateWriter::new(
@@ -3605,15 +3608,11 @@ mod tests {
             None,
         )));
 
-        let proxy = spawn_tui_proxy(
-            Some(AppServerEndpoint::WebSocket(format!(
-                "ws://{proxy_address}"
-            ))),
-            AppServerEndpoint::WebSocket(format!("ws://{app_address}")),
+        let proxy = tokio::spawn(run_tcp_tui_proxy(
+            proxy_listener,
+            format!("ws://{app_address}"),
             Some(launcher),
-        )
-        .await
-        .unwrap();
+        ));
         let app_server = tokio::spawn(async move {
             let (stream, _) = app_listener.accept().await.unwrap();
             let mut websocket = accept_async(stream).await.unwrap();
@@ -3678,9 +3677,12 @@ mod tests {
             .await
             .unwrap();
         let app_address = app_listener.local_addr().unwrap();
-        let reserved = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let proxy_address = reserved.local_addr().unwrap();
-        drop(reserved);
+        // Bound here and handed to the proxy, so no parallel test can take the
+        // port between finding it and binding it (MAR-67).
+        let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("launcher.json");
         let launcher = Arc::new(tokio::sync::Mutex::new(LauncherStateWriter::new(
@@ -3689,15 +3691,11 @@ mod tests {
             None,
         )));
 
-        let proxy = spawn_tui_proxy(
-            Some(AppServerEndpoint::WebSocket(format!(
-                "ws://{proxy_address}"
-            ))),
-            AppServerEndpoint::WebSocket(format!("ws://{app_address}")),
+        let proxy = tokio::spawn(run_tcp_tui_proxy(
+            proxy_listener,
+            format!("ws://{app_address}"),
             Some(launcher),
-        )
-        .await
-        .unwrap();
+        ));
         let app_server = tokio::spawn(async move {
             let (stream, _) = app_listener.accept().await.unwrap();
             let mut websocket = accept_async(stream).await.unwrap();
