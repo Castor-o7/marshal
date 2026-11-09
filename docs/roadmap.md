@@ -182,6 +182,15 @@ launcher.
   Done when: Release's self-hosted jobs and the public CI jobs carry `if: github.repository ==
   'ignition-is-go/marshal'`, and the next merge's Release run on fork main ends skipped, not cancelled.
   Fork-only: never send this hunk upstream as-is.
+- [ ] **MAR-63: Supporting: claude_hook's Windows tests read an accepted stream left non-blocking.**
+  Found in rally 0x7 (issues log, 2.1): `windows-native-wake` flakes in
+  `a_replacement_waiter_takes_over_after_the_old_process_releases_its_lock` with WouldBlock (10035)
+  on `stream.read`, because on Windows a stream accepted from a non-blocking listener is
+  non-blocking too. `boundary_listener`'s second accept has the same pattern. Test-only: every other
+  non-blocking listener is handed to tokio, which wants that. Done when: both accepted streams are
+  set back to blocking before they're read, and `windows-native-wake` passes 10 runs in a row on
+  the PR's head. Upstream has the same test, so the fix is its own commit, touching only
+  `crates/shim/tests/claude_hook.rs`, for a later upstream PR if the operator wants one.
 
 ## Later: other harnesses
 
