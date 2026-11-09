@@ -187,6 +187,14 @@ launcher.
   `serve_until`, and the two `tui_proxy` tests straight to `run_tcp_tui_proxy`). The change is
   test-only, and each test passes a local stress run. Conformance's `restart()` on the same ports is
   left out: it needs a design call.
+- [ ] **MAR-69: Supporting: Conformance reruns a cell on fresh ports when a restart loses its bind.**
+  Left out of MAR-67: a cell's `restart()` starts the daemon again on the same ports, since the
+  same-address reconnect is what the restart cells test, and a lost bind there panicked the cell. The
+  first start already retried on new ports (MAR-21). Decided by the watchman (2026-11-09): rerun the
+  whole cell. Done when: a restart that finds a port taken unwinds with `RestartLostPorts`, `run_cell`
+  runs the whole cell again on fresh ports (both starts) up to 3 attempts, logging each retry, and
+  fails only when every attempt loses its port. A test forces the loss once (the cell passes on its
+  second run) and every time (it fails after 3). Test-only.
 - [x] **MAR-6: Supporting: Keep a session through a dropped connection while its waiter is held.** The
   WS reap on `STALE_AFTER` doesn't check `WakeWatcher`, so a session still waiting is reaped. A default
   change: it goes in the defaults issue (MAR-15) and is built on the fork. Done when: a session holding
