@@ -2,7 +2,9 @@
 
 **A checklist. Nothing in it has been done.** It prepares step 3 of the cutover runbook (rally's
 `docs/cutover.md`, RAL-119): "move the watchman and lamplighter first". The watchman (mellow-weevil)
-asked for it on 2026-11-09 (MAR-72). Every step is Josh's to approve and the lamplighter's to run. Fork-only.
+asked for it on 2026-11-09 (MAR-72). Josh made the switch the rally's goal, to happen when there'll be no interruption, and asked not to be
+asked when. So the watchman confirms readiness, the lamplighter runs the steps, and Josh restarts the
+watchman's session, since only he can. Fork-only.
 
 Read on Murph on 2026-11-09, read-only: Claude Code 2.1.319, `~/.claude/settings.json`,
 `~/.claude.json`, the two working directories, and Muster's roster. Builds on Marshal's
@@ -84,14 +86,15 @@ below).
 
 ## Before the dry run
 
-- [ ] Step 1 is done and passed: the MAR-59 kit's checks 1 to 4 on a test session. cobalt-bream's test on
-      2026-11-09, with the daemon restarted at 13:59:08, may be that run. Get its result from the watchman.
+- [x] Step 1 is done and passed: MAR-70, cobalt-bream's run of the MAR-59 kit on 2026-11-09, verified at
+      Rally record 1856 with all four checks passed.
 - [ ] Step 2 is in place: `rally wake`, `rally digest` and `rally brief` read both rosters (RAL-126) and
       send through `marshal-shim` first (RAL-120). rally's `cutover.md` rows 5 and 6 say this is done.
-- [ ] A cutover hold is recorded in Rally (`rally hold`, step 0), naming this step.
+- [x] A cutover hold is recorded in Rally (`rally hold`, step 0): record 1859.
 - [ ] Marshal's daemon is the one built from fork main (MAR-46 `forget`, MAR-9 nickname, MAR-42 succession
       mail, MAR-61), and it's listening on `127.0.0.1:6155` and `:6156` only (the loopback drop-in).
-- [ ] Josh approves the move and the time. The lamplighter runs it.
+- [ ] The watchman confirms readiness. The lamplighter runs the steps, and Josh restarts the watchman's
+      session (only he can).
 
 ## The dry run: a stand-in for each role, nothing real moves
 
@@ -183,7 +186,7 @@ second, when the lamplighter has confirmed it can reach both rosters from its ne
 3. **Announce on Muster first.** The session broadcasts on Muster: its role, that it's moving to Marshal,
    when it'll be back, and how to reach it meanwhile (the lamplighter, or the other role, relays). Say how
    cross-daemon mail works (problem 3).
-4. **Restart with Marshal's wiring.** `/exit`, then the launch command above, from the role's directory.
+4. **Restart with Marshal's wiring.** For the watchman, Josh does this step. `/exit`, then the launch command above, from the role's directory.
    Give it the role in its first prompt (or `--resume <old session id>` with the same flags, if its context
    matters more than a clean start; test `--resume` in the dry run first if you plan to use it).
 5. **Announce on Marshal after.** The new session broadcasts on Marshal: its new nickname and the old one.
@@ -206,5 +209,5 @@ it by hand.
 - **For the lamplighter:** the watchman prefers a directory of its own (`~/src/lamplighter`). Is anything
   the lamplighter runs tied to `~/src` as its working directory?
 - **For the watchman:** a clean start, or `--resume` to keep context?
-- **For Josh:** the time of the move, and whether the `--settings` copy of the user settings is acceptable
-  until step 5.
+- **For Josh, only if he wants to weigh in:** whether the `--settings` copy of the user settings is
+  acceptable until step 5. The time of the move is the watchman's call, not a question for Josh.
