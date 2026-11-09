@@ -275,6 +275,19 @@ launcher.
   marks it read); and a test kills a session mid-turn and its mail is still unread (MAR-79's check
   5).
 
+- [ ] **MAR-84: Durability: Two-phase delivery for Codex sessions.** MAR-82's Codex half. Codex's
+  `UserPromptSubmit` hook injects mail as `additionalContext` in the turn it runs in and acks after
+  its stdout write, so the gap is narrower than Claude's: a Codex killed, interrupted, or whose model
+  request fails between the hook's ack and the model receiving the turn. Researched from Codex's
+  source at `rust-v0.163.0` in [codex-two-phase-delivery.md](codex-two-phase-delivery.md): its hook
+  input does carry `transcript_path` (the rollout file), where hook context lands as a developer
+  `response_item`, recorded before sampling even when the turn stops. Done when: Codex's hook acks
+  mail as offered, not read; it's marked read only on evidence the model received that turn (named in
+  the doc, with records recorded from Codex, saying which Codex version, as for Claude); a turn that
+  fails or is interrupted first leaves the mail for the next turn; an unconfirmed offer is dropped at
+  session end and re-offered after 6 h, as for Claude; a plain `codex` with no bridge keeps today's
+  behaviour unless such evidence exists for it too; and a live check kills Codex between its hook and
+  the model, and the mail arrives once.
 - [ ] **MAR-79: Supporting: Design two-phase delivery, so mail taken mid-turn isn't lost.** Found in
   MAR-70 and MAR-73: a Claude session's background `claude-hook wait` takes a message as soon as it's
   sent, and the daemon records it read then, but Claude Code holds it until the turn ends. If the
