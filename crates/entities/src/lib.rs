@@ -32,6 +32,8 @@ mod room_tools;
 mod sandbox;
 mod send_message;
 mod session;
+/// Fork only (MAR-85): the host a session is recorded with, under a paired principal.
+pub use session::{attested_host, paired_machine};
 mod session_identity;
 mod session_nickname;
 mod succession;
