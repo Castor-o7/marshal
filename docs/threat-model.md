@@ -60,7 +60,7 @@ is refused the same way. (`Origin` is not checked: with auth on, a page can't pr
 which is the defence; in plain mode nothing stops it, as upstream.)
 
 **A prompt-injected session.** `SessionBinding` (MAR-80) ties every session to the principal that
-registered it: a connection may register, SET and act (`asSession`, `SetSession*`, `Message` as
+registered it for writes and actions (reads aren't scoped; see the gaps): a connection may register, SET and act (`asSession`, `SetSession*`, `Message` as
 sender, `MessageRead`, `RoomMember`, `WakeWatcher`) only for its own sessions, and may not write the
 daemon's own entities (`SessionIdentity`, `SessionNickname`, `Succession`). The hook listener binds
 a hook-registered session to the token's owner and refuses other principals' hooks for it, before
@@ -82,6 +82,12 @@ the daemon's files can't be used to connect.
 ## Known gaps
 
 Honest, and each with where it closes.
+
+- **Reads aren't scoped.**  governs what a connection may write and act as, not
+  what it may read: the  and  queries and subscriptions give every
+  valid principal every inbox and the whole roster (MAR-80's stated limit). On a one-operator
+  network that's the operator's own traffic; on anything else it isn't acceptable. MAR-90:
+  per-principal read scoping, off unless configured.
 
 - **After a daemon restart, who holds which session is forgotten** while the sessions persist (the
   binding table is in memory). Until each owner's next hook, any paired token could claim a

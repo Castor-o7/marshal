@@ -27,12 +27,14 @@ below is opt-in, and turning it on changes nothing for a daemon that doesn't.
   operator's config directory, readable by that user only. That host should be one only you use.
 - **Session binding.** A connection, and a machine's hooks, may act only as the sessions that
   machine registered; the daemon's own records (nicknames, identities, succession) can't be
-  written by any client. One paired machine can't read, end or send as another's session.
+  written by any client. One paired machine can't end or send as another's session. It can still
+  read: every valid principal sees the whole roster and every inbox (see the gaps below).
 - **Attested host.** A paired machine's sessions carry the pairing's name as their host, whatever
   the client says. Pasted pairing codes and tokens are redacted from messages.
 
 What this doesn't cover, and where each gap closes, is in
-[docs/threat-model.md](docs/threat-model.md). In short: after a daemon restart the ownership
-table is empty until each session's next hook; there are no connection limits, send allowance or
-sender allow-list yet; the daemon host's own sessions are one principal; and none of it has run
-outside loopback tests yet.
+[docs/threat-model.md](docs/threat-model.md). In short: reads aren't scoped, so any paired machine can
+read every session's mail and the roster; after a daemon restart the ownership table is empty
+until each session's next hook; there are no connection limits, send allowance or sender
+allow-list yet; the daemon host's own sessions are one principal; and none of it has run outside
+loopback tests yet.
