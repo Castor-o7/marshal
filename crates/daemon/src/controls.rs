@@ -23,6 +23,9 @@ use myko::{core::item::Eventable as _, server::MykoServerContext, utils::downcas
 
 pub const FORGET_FILE: &str = "forget-sessions";
 pub const RESULTS_FILE: &str = "forget-results";
+/// `allowed-senders` (MAR-89): machines that may send, one name per line;
+/// `#` starts a comment. Absent or empty, everyone may send.
+pub const ALLOWED_SENDERS_FILE: &str = "allowed-senders";
 /// How soon the running daemon sees a change.
 pub const REFRESH: Duration = Duration::from_secs(2);
 /// How long a forgotten session's hooks are refused by default, so a waiter
@@ -422,10 +425,79 @@ pub fn apply(dir: &Path, ctx: &MykoServerContext) {
 /// Keep applying the control files, every [`REFRESH`]. Spawn on a tokio task.
 pub async fn run(dir: PathBuf, ctx: MykoServerContext) {
     let mut interval = tokio::time::interval(REFRESH);
+    let mut last_list: Option<Option<Vec<String>>> = None;
     loop {
         interval.tick().await;
         apply(&dir, &ctx);
+        // A file that can't be trusted or read keeps the last good list in
+        // force (a truncate-then-write, a chmod, a symlink swap must not open
+        // the daemon to everyone); only an absent file means everyone.
+        let list = match read_allowed_senders(&dir) {
+            AllowedSenders::Absent => None,
+            AllowedSenders::List(machines) => Some(machines),
+            AllowedSenders::Unusable(why) => {
+                if last_list.is_some() {
+                    log::warn!(
+                        "[controls] {ALLOWED_SENDERS_FILE}: {why}; keeping the last good list"
+                    );
+                    continue;
+                }
+                log::warn!("[controls] {ALLOWED_SENDERS_FILE}: {why}; no list is in force");
+                None
+            }
+        };
+        if last_list.as_ref() != Some(&list) {
+            match &list {
+                Some(machines) => log::info!(
+                    "[controls] messages are allowed only from: {}",
+                    machines.join(", ")
+                ),
+                None if last_list.is_some() => {
+                    log::info!("[controls] the sender allow-list is gone; everyone may send");
+                }
+                None => {}
+            }
+            marshal_entities::controls::set_allowed_senders(list.clone());
+            last_list = Some(list);
+        }
     }
+}
+
+/// What `allowed-senders` says right now.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AllowedSenders {
+    /// No file: everyone may send.
+    Absent,
+    /// The machines named. An empty file is an empty list, which
+    /// `set_allowed_senders` treats as no list.
+    List(Vec<String>),
+    /// The file is there but can't be trusted (mode or owner) or read; the
+    /// reason. The caller keeps whatever list it had.
+    Unusable(String),
+}
+
+/// The allow-list in `dir`, with the same trust check as the other control files.
+pub fn read_allowed_senders(dir: &Path) -> AllowedSenders {
+    let path = dir.join(ALLOWED_SENDERS_FILE);
+    if !path.exists() {
+        return AllowedSenders::Absent;
+    }
+    if let Some(why) = untrusted(&path) {
+        return AllowedSenders::Unusable(why);
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => AllowedSenders::List(parse_allowed_senders(&text)),
+        Err(e) => AllowedSenders::Unusable(format!("can't read it: {e}")),
+    }
+}
+
+/// One machine name per line; blank lines and `#` comments are skipped.
+pub fn parse_allowed_senders(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -550,5 +622,37 @@ mod tests {
         )
         .unwrap();
         assert!(requests(&dir).is_empty());
+    }
+
+    #[test]
+    fn the_allow_list_parses_names_and_skips_comments_and_blanks() {
+        assert_eq!(
+            parse_allowed_senders("# who may send\nlaptop\n\nmurph # the host\n"),
+            vec!["laptop".to_string(), "murph".to_string()]
+        );
+        assert!(parse_allowed_senders("# nobody yet\n\n").is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_allowed_senders(dir.path()), AllowedSenders::Absent);
+        std::fs::write(dir.path().join(ALLOWED_SENDERS_FILE), "desk\n").unwrap();
+        assert_eq!(
+            read_allowed_senders(dir.path()),
+            AllowedSenders::List(vec!["desk".to_string()])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                dir.path().join(ALLOWED_SENDERS_FILE),
+                std::fs::Permissions::from_mode(0o666),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    read_allowed_senders(dir.path()),
+                    AllowedSenders::Unusable(_)
+                ),
+                "a world-writable list is unusable, not empty"
+            );
+        }
     }
 }

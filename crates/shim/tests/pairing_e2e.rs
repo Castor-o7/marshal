@@ -166,6 +166,8 @@ struct Rig {
     hook: u16,
     child: Option<Child>,
     fingerprint: String,
+    /// Extra environment for the daemon (MAR-88's allowances).
+    env: Vec<(String, String)>,
 }
 
 impl Rig {
@@ -188,12 +190,17 @@ impl Rig {
             .env("XDG_CONFIG_HOME", self.home().join("config"))
             .env("MARSHAL_STATE_DIR", self.state())
             .env("RUST_LOG", "info");
+        c.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         c
     }
 
     /// Start `marshal-daemon <flags>` on free ports. `--tls` daemons are
     /// waited for until myko answers; others until the WebSocket port does.
     fn start(flags: &[&str]) -> Self {
+        Self::start_with(flags, &[])
+    }
+
+    fn start_with(flags: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut rig = Self {
             dir,
@@ -201,6 +208,10 @@ impl Rig {
             hook: 0,
             child: None,
             fingerprint: String::new(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         };
         assert!(
             rig.restart(flags),
@@ -532,6 +543,42 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
         "the terminal's sender label didn't carry the pairing's name: {shown}"
     );
 
+    // A pasted pairing code or token never reaches a reader (MAR-86). The
+    // spent code and the machine's live token both go in; neither comes out.
+    let pairing_code =
+        std::fs::read_to_string(rig.dir.path().join("remote-home/config/marshal/pairing")).unwrap();
+    let token = marshal_entities::pairing::Pairing::from_code(&pairing_code)
+        .unwrap()
+        .token;
+    let leak = format!("my code was {code} and my token is {token}, keep them safe");
+    let told = rig
+        .remote_shim(None, &["tell", "paired-session", &leak])
+        .output()
+        .unwrap();
+    assert!(told.status.success(), "the leaking tell: {}", text(&told));
+    let mut shown = String::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let out = rig.hook(
+                rig.remote_shim(None, &[]),
+                "prompt-submit",
+                "paired-session",
+            );
+            shown = text(&out);
+            shown.contains("keep them safe")
+        }),
+        "the leaking tell never showed: {shown}"
+    );
+    assert!(
+        !shown.contains(&token) && !shown.contains(&code[20..60]),
+        "a secret reached the inbox: {shown}"
+    );
+    assert!(
+        shown.contains("[marshal pairing code redacted]")
+            && shown.contains("[marshal token redacted]"),
+        "the secrets weren't marked as redacted: {shown}"
+    );
+
     // Unpaired, it's out within the token cache's second, and stays out.
     let out = rig.daemon_cmd(&["unpair", "laptop"]).output().unwrap();
     assert!(out.status.success(), "unpair: {}", text(&out));
@@ -586,4 +633,116 @@ fn with_machines_paired_the_daemon_refuses_to_start_untold_and_runs_open_with_pl
     assert!(rig.restart(&["--plain"]), "--plain didn't start");
     assert!(rig.log().contains("running open"), "{}", rig.log());
     assert!(TcpStream::connect(("127.0.0.1", rig.ws)).is_ok());
+}
+
+/// MAR-88: with a machine allowance of `2/60`, a paired machine's third
+/// message in a minute is refused with a clear reason. Each `tell` is its own
+/// terminal session, so the machine's allowance is the one that bites across
+/// them; the session allowance is covered by the unit tests. Nothing is
+/// limited otherwise: the other tests here send freely with no allowance set.
+#[test]
+fn a_send_allowance_refuses_a_flood_with_a_reason() {
+    let Some(_) = daemon_bin() else {
+        return;
+    };
+    let rig = Rig::start_with(
+        &["--tls"],
+        &[
+            ("MARSHAL_SEND_ALLOWANCE", "2/60"),
+            ("MARSHAL_MACHINE_SEND_ALLOWANCE", "2/60"),
+        ],
+    );
+    std::fs::create_dir_all(rig.dir.path().join("work")).unwrap();
+    let code = rig.pair_code("laptop");
+    let out = rig.remote_shim(None, &["pair", &code]).output().unwrap();
+    assert!(out.status.success(), "pair: {}", text(&out));
+    let joined = rig.hook(rig.remote_shim(None, &[]), "session-start", "flood-target");
+    assert!(joined.status.success(), "session-start: {}", text(&joined));
+    assert!(wait_until(Duration::from_secs(10), || {
+        text(&roster_of(&rig)).contains("flood-target")
+    }));
+    for n in 1..=2 {
+        let out = rig
+            .remote_shim(None, &["tell", "flood-target", &format!("message {n}")])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "tell {n}: {}", text(&out));
+    }
+    let third = rig
+        .remote_shim(None, &["tell", "flood-target", "message 3"])
+        .output()
+        .unwrap();
+    let said = text(&third);
+    assert!(
+        said.contains("--- 0 sent, 1 not sent"),
+        "the third message in a minute went through: {said}"
+    );
+    assert!(
+        said.contains("too many messages from this machine"),
+        "the refusal didn't say why: {said}"
+    );
+}
+
+/// MAR-89: with `allowed-senders` naming only another machine, a paired
+/// machine's tell is refused with the reason; naming it, the next tell goes;
+/// removing the file, everyone may send again. The daemon reads the file every
+/// two seconds.
+#[test]
+fn the_operators_allow_list_decides_who_may_send() {
+    let Some(_) = daemon_bin() else {
+        return;
+    };
+    let rig = Rig::start(&["--tls"]);
+    std::fs::create_dir_all(rig.dir.path().join("work")).unwrap();
+    let code = rig.pair_code("laptop");
+    let out = rig.remote_shim(None, &["pair", &code]).output().unwrap();
+    assert!(out.status.success(), "pair: {}", text(&out));
+    let joined = rig.hook(rig.remote_shim(None, &[]), "session-start", "list-target");
+    assert!(joined.status.success(), "session-start: {}", text(&joined));
+    assert!(wait_until(Duration::from_secs(10), || {
+        text(&roster_of(&rig)).contains("list-target")
+    }));
+    let tell = |body: &str| {
+        rig.remote_shim(None, &["tell", "list-target", body])
+            .output()
+            .unwrap()
+    };
+    let out = tell("before any list");
+    assert!(
+        text(&out).contains("--- 1 sent"),
+        "no list set: {}",
+        text(&out)
+    );
+
+    let list = rig.state().join("allowed-senders");
+    std::fs::write(&list, "# only the desk\ndesk\n").unwrap();
+    let mut said = String::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let out = tell("from the laptop, not allowed");
+            said = text(&out);
+            said.contains("doesn't allow messages from this machine (laptop)")
+        }),
+        "the list never took effect: {said}"
+    );
+    assert!(
+        !said.contains("desk"),
+        "the refusal handed over the list: {said}"
+    );
+
+    std::fs::write(&list, "desk\nlaptop\n").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            text(&tell("from the laptop, allowed now")).contains("--- 1 sent")
+        }),
+        "adding the laptop never took effect"
+    );
+
+    std::fs::remove_file(&list).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            text(&tell("list gone")).contains("--- 1 sent")
+        }),
+        "removing the list never took effect"
+    );
 }

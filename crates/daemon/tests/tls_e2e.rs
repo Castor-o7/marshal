@@ -47,19 +47,25 @@ fn free_port() -> u16 {
 /// back where they bound from its log. myko's loopback port has to be named,
 /// since myko binds it itself, so a lost race for it is retried.
 fn start() -> Daemon {
+    start_with(&[])
+}
+
+/// `start`, with extra environment for the daemon (MAR-88's caps).
+fn start_with(env: &[(&str, &str)]) -> Daemon {
     for _ in 0..3 {
-        if let Some(daemon) = try_start() {
+        if let Some(daemon) = try_start(env) {
             return daemon;
         }
     }
     panic!("marshal-daemon --tls didn't start in 3 tries");
 }
 
-fn try_start() -> Option<Daemon> {
+fn try_start(env: &[(&str, &str)]) -> Option<Daemon> {
     let state = tempfile::tempdir().unwrap();
     let log = state.path().join("daemon.log");
     let child = Command::new(env!("CARGO_BIN_EXE_marshal-daemon"))
         .arg("--tls")
+        .envs(env.iter().copied())
         .env("MARSHAL_BIND", "127.0.0.1:0")
         .env("MARSHAL_HOOK_BIND", "127.0.0.1:0")
         .env("MARSHAL_MYKO_BIND", format!("127.0.0.1:{}", free_port()))
@@ -412,4 +418,44 @@ async fn unpairing_or_repairing_a_machine_cuts_its_open_connection() {
         ws_with_token(&daemon, &second).await.is_err(),
         "an unpaired token still connects"
     );
+}
+
+/// MAR-88: with `MARSHAL_MAX_CONNECTIONS_PER_PEER=1`, a second connection from
+/// the same peer is closed before the handshake while the first stays up;
+/// freeing the first lets another in. Nothing is capped unless configured.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_peer_connection_cap_closes_the_second_connection() {
+    let daemon = start_with(&[("MARSHAL_MAX_CONNECTIONS_PER_PEER", "1")]);
+    let token_path = daemon
+        ._state
+        .path()
+        .join("home/.config/marshal/local-token");
+    let local_token = std::fs::read_to_string(token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+    let first = ws_with_token(&daemon, &local_token)
+        .await
+        .expect("the first connection from this peer");
+    // The second gets no handshake: the front closes it.
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        tls_connect(daemon.public, &daemon.fingerprint),
+    )
+    .await;
+    assert!(
+        !matches!(second, Ok(Ok(_))),
+        "a second connection from the capped peer completed its handshake"
+    );
+    drop(first);
+    // The place frees when the first ends; myko's side may take a moment.
+    let mut again = Err(());
+    for _ in 0..20 {
+        if let Ok(ws) = ws_with_token(&daemon, &local_token).await {
+            again = Ok(ws);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(again.is_ok(), "the freed place wasn't a place again");
 }
