@@ -148,17 +148,32 @@ async fn handle_conn(
         return write_response(&mut stream, 405, "method not allowed").await;
     }
 
-    if path == "/hook/wait" {
-        return handle_wait(stream, query, &body, &ctx, stopping).await;
-    }
-
     // Pairing (MAR-24): exchange a one-time invite for a token. Only with a
-    // store, which the daemon has with --tls.
+    // store, which the daemon has with --tls. Needs no token: it's how a
+    // machine gets one.
     if path == "/pair" {
         return handle_pair(&mut stream, &body).await;
     }
 
-    match hooks::dispatch(path, query, &body, &ctx) {
+    // With a pairing store (MAR-81), every hook request carries a token the
+    // daemon knows: the host's own local token, or a paired machine's. Its
+    // owner is the caller the handlers bind sessions to.
+    let caller = match verify_caller(&head) {
+        Ok(caller) => caller,
+        Err(why) => {
+            return write_response_with(&mut stream, 401, "WWW-Authenticate: Bearer\r\n", why)
+                .await;
+        }
+    };
+
+    if path == "/hook/wait" {
+        return handle_wait(stream, query, &body, &ctx, stopping, caller).await;
+    }
+
+    match hooks::with_caller(caller, || hooks::dispatch(path, query, &body, &ctx)) {
+        Some(outcome) if outcome.status != 200 => {
+            write_response(&mut stream, outcome.status, &outcome.body).await
+        }
         Some(outcome) => {
             // A caller that says it will ack (`ack=client`) gets the ids in
             // `X-Marshal-Ack-V1` and acks once it has printed the mail; until then a
@@ -184,6 +199,40 @@ async fn handle_conn(
         }
         None => write_response(&mut stream, 404, "not found").await,
     }
+}
+
+/// The request's verified principal (MAR-81): `Ok(None)` with no pairing
+/// store (plain mode, nothing to check against), `Ok(Some(..))` for a token
+/// the store knows, and the reason otherwise.
+fn verify_caller(head: &str) -> Result<Option<myko_auth::Principal>, &'static str> {
+    let Some(store) = crate::pairing::store() else {
+        return Ok(None);
+    };
+    let token = head
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, v)| v.trim().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let Some(token) = token else {
+        return Err(
+            "the hook listener needs a token: the daemon host's local token (local-token in the \
+             config directory) or this machine's pairing (marshal-shim pair)",
+        );
+    };
+    let Some(name) = store.verify(token) else {
+        return Err(
+            "the hook listener doesn't know this token: pair again, or read the daemon \
+                    host's current local-token",
+        );
+    };
+    Ok(Some(myko_auth::Principal {
+        issuer: crate::pairing::ISSUER.into(),
+        subject: name,
+        kind: myko_auth::PrincipalKind::Agent,
+    }))
 }
 
 /// `POST /pair` with `{"invite": "<secret>"}`: a fresh token for the invite's
@@ -227,9 +276,13 @@ async fn handle_wait(
     body: &[u8],
     ctx: &Arc<MykoServerContext>,
     mut stopping: watch::Receiver<bool>,
+    caller: Option<myko_auth::Principal>,
 ) -> std::io::Result<()> {
-    let Some((sid, cmd_ctx)) = hooks::begin_wait(query, body, ctx) else {
-        return write_response(&mut stream, 200, "").await;
+    let begun = hooks::with_caller(caller, || hooks::begin_wait(query, body, ctx));
+    let (sid, cmd_ctx) = match begun {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return write_response(&mut stream, 200, "").await,
+        Err(refused) => return write_response(&mut stream, refused.status, &refused.body).await,
     };
     let secs = query
         .split('&')
@@ -297,6 +350,8 @@ async fn write_response_with(
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
