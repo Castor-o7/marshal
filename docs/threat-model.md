@@ -83,8 +83,8 @@ the daemon's files can't be used to connect.
 
 Honest, and each with where it closes.
 
-- **Reads aren't scoped.**  governs what a connection may write and act as, not
-  what it may read: the  and  queries and subscriptions give every
+- **Reads aren't scoped.** `SessionBinding` governs what a connection may write and act as, not
+  what it may read: the `GetAllMessages` and `GetAllSessions` queries and subscriptions give every
   valid principal every inbox and the whole roster (MAR-80's stated limit). On a one-operator
   network that's the operator's own traffic; on anything else it isn't acceptable. MAR-90:
   per-principal read scoping, off unless configured.
