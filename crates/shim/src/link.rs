@@ -95,9 +95,18 @@ impl std::fmt::Display for PostFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable => write!(f, "can't reach the daemon (down, or no network)"),
-            Self::Status(code @ (401 | 403)) => {
-                write!(f, "the daemon refused this request ({code})")
-            }
+            // A daemon that checks tokens (MAR-81) says why in these two.
+            Self::Status(401) => write!(
+                f,
+                "the daemon refused this request (401): its hook listener wants a token it knows, \
+                 the daemon host's local-token (config directory) or this machine's pairing \
+                 (marshal-shim pair)"
+            ),
+            Self::Status(403) => write!(
+                f,
+                "the daemon refused this request (403): it says this session belongs to another \
+                 machine"
+            ),
             Self::Status(code) => write!(f, "the daemon answered with an error ({code})"),
         }
     }

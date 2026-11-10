@@ -50,6 +50,106 @@ fn wait_until(within: Duration, mut ok: impl FnMut() -> bool) -> bool {
     ok()
 }
 
+/// Drive the MCP shim over stdio as a Codex harness would, and call
+/// `set_status` for `session` with `text`. The tool answers ok whatever myko
+/// then decides, so the effect is read back from the roster.
+fn mcp_set_status(mut shim: Command, session: &str, text: &str) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let mut child = shim
+        .env("MARSHAL_HARNESS", "codex")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let messages = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "pairing-e2e", "version": "0"}}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "set_status",
+                       "arguments": {"text": text, "asSession": session}}}),
+    ];
+    for m in &messages {
+        writeln!(stdin, "{m}").unwrap();
+    }
+    let answered = std::sync::mpsc::channel::<bool>();
+    std::thread::spawn(move || {
+        for line in stdout.lines() {
+            let Ok(line) = line else { break };
+            if line.contains("\"id\":2") {
+                let _ = answered.0.send(true);
+                return;
+            }
+        }
+        let _ = answered.0.send(false);
+    });
+    let got = answered
+        .1
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or(false);
+    // The command is queued on the shim's connection; give it a moment to go.
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(got, "the MCP shim never answered set_status");
+}
+
+fn roster_of(rig: &Rig) -> Output {
+    rig.local_shim(&["roster"]).output().unwrap()
+}
+
+/// `declared.current_task` of `session` on the roster, through the host's shim.
+fn current_task_of(rig: &Rig, session: &str) -> Option<String> {
+    let out = roster_of(rig);
+    let roster: serde_json::Value =
+        serde_json::from_str(text(&out).trim_start_matches(|c| c != '{')).ok()?;
+    fn find(v: &serde_json::Value, id: &str) -> Option<String> {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.get("session_id").and_then(|v| v.as_str()) == Some(id) {
+                    return map
+                        .get("declared")?
+                        .get("current_task")?
+                        .as_str()
+                        .map(str::to_string);
+                }
+                map.values().find_map(|v| find(v, id))
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(|v| find(v, id)),
+            _ => None,
+        }
+    }
+    find(&roster, session)
+}
+
+/// `declared.machine` of `session` on the roster, through the host's shim.
+fn machine_of(rig: &Rig, session: &str) -> Option<String> {
+    let out = rig.local_shim(&["roster"]).output().unwrap();
+    let roster: serde_json::Value =
+        serde_json::from_str(text(&out).trim_start_matches(|c| c != '{')).ok()?;
+    fn find(v: &serde_json::Value, id: &str) -> Option<String> {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.get("session_id").and_then(|v| v.as_str()) == Some(id) {
+                    return map
+                        .get("declared")?
+                        .get("machine")?
+                        .as_str()
+                        .map(str::to_string);
+                }
+                map.values().find_map(|v| find(v, id))
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(|v| find(v, id)),
+            _ => None,
+        }
+    }
+    find(&roster, session)
+}
+
 fn text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -266,11 +366,23 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
     let rig = Rig::start(&["--tls"]);
     std::fs::create_dir_all(rig.dir.path().join("work")).unwrap();
 
-    // The pin alone isn't enough: myko refuses a connection with no token.
+    // The pin alone isn't enough: myko refuses a connection with no token,
+    // and so does the hook listener (MAR-81), saying what it wants.
     let out = rig.remote_shim(None, &["roster"]).output().unwrap();
     assert!(
         !out.status.success(),
         "no token read the roster: {}",
+        text(&out)
+    );
+    let mut no_token = rig.remote_shim(None, &[]);
+    no_token.env(
+        "MARSHAL_BASE_URL",
+        format!("https://127.0.0.1:{}", rig.hook),
+    );
+    let out = rig.hook(no_token, "session-start", "unpaired-session");
+    assert!(
+        text(&out).contains("wants a token it knows"),
+        "a tokenless hook wasn't told why: {}",
         text(&out)
     );
     let out = rig
@@ -286,7 +398,12 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
     // Pair: a code from the daemon's host, redeemed by the machine, once.
     let code = rig.pair_code("laptop");
     let out = rig.remote_shim(None, &["pair", &code]).output().unwrap();
-    assert!(out.status.success(), "pair: {}", text(&out));
+    assert!(
+        out.status.success(),
+        "pair: {}\ndaemon log:\n{}",
+        text(&out),
+        rig.log()
+    );
     assert!(text(&out).contains("paired as laptop"), "{}", text(&out));
     let again = rig.remote_shim(None, &["pair", &code]).output().unwrap();
     assert!(
@@ -320,11 +437,65 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
         "the paired machine's session never showed: {seen}"
     );
 
+    // The session belongs to the machine whose token registered it (MAR-81):
+    // the daemon host's own shim, with the local token, can't run its hooks,
+    // and the tokenless hook above registered nothing.
+    let poser = rig.hook(rig.local_shim(&[]), "prompt-submit", "paired-session");
+    assert!(
+        text(&poser).contains("belongs to another machine"),
+        "the local shim ran a hook for the paired machine's session: {}",
+        text(&poser)
+    );
+    assert!(
+        !text(&rig.local_shim(&["roster"]).output().unwrap()).contains("unpaired-session"),
+        "the tokenless hook's session joined"
+    );
+    // Nor can the host end it, or re-register it over the owner's row: the
+    // row keeps the owner's declared host after both refusals.
+    let ended = rig.hook(rig.local_shim(&[]), "session-end", "paired-session");
+    assert!(
+        text(&ended).contains("belongs to another machine"),
+        "the host ended the paired machine's session: {}",
+        text(&ended)
+    );
+    let overwrite = rig.hook(rig.local_shim(&[]), "session-start", "paired-session");
+    assert!(
+        text(&overwrite).contains("belongs to another machine"),
+        "the host re-registered the paired machine's session: {}",
+        text(&overwrite)
+    );
+    assert_eq!(
+        machine_of(&rig, "paired-session").as_deref(),
+        Some("remote"),
+        "the owner's row didn't survive the refused hooks"
+    );
+
+    // Acting *as* the hook-registered session (MAR-80 through MAR-81): the
+    // paired machine's own MCP shim may set its status; the daemon host's,
+    // with the local token, may not, since the session is the machine's.
+    mcp_set_status(
+        rig.remote_shim(None, &[]),
+        "paired-session",
+        "set by the laptop",
+    );
+    let mut task = None;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            task = current_task_of(&rig, "paired-session");
+            task.as_deref() == Some("set by the laptop")
+        }),
+        "the paired machine couldn't act as its own session (current_task {task:?})"
+    );
+    mcp_set_status(rig.local_shim(&[]), "paired-session", "set by the host");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        current_task_of(&rig, "paired-session").as_deref(),
+        Some("set by the laptop"),
+        "the daemon host acted as the paired machine's session"
+    );
+
     // The paired machine writes as itself: its terminal's tell reaches its
-    // session, and the session's next hook shows it. (Acting *as* the
-    // hook-registered session from that machine's MCP shim is what MAR-80
-    // refuses until MAR-81 binds hook sessions to the machine that sent them;
-    // no CLI command does that, so it isn't driven here.)
+    // session, and the session's next hook shows it.
     let told = rig
         .remote_shim(None, &["tell", "paired-session", "hello from the laptop"])
         .output()

@@ -336,12 +336,18 @@ fn bind_to_local(table: &Table, local: Option<&str>, session: &str) -> bool {
         );
         return false;
     };
-    match table.claim(Some(local), session) {
+    bind_to(table, local, session)
+}
+
+/// Claim `session` for the principal `key`. False, and a line that names
+/// neither the holder nor its other sessions, when another principal holds it.
+fn bind_to(table: &Table, key: &str, session: &str) -> bool {
+    match table.claim(Some(key), session) {
         Ok(()) => true,
         Err(_) => {
             log::warn!(
                 "[auth] session {session} registered through the hook listener is held by another \
-                 principal, so it isn't bound to the local one"
+                 principal, so it isn't bound to this one"
             );
             false
         }
@@ -368,6 +374,28 @@ pub fn bind_local(session: &str) -> bool {
         return false;
     };
     bind_to_local(table, local.as_deref(), session)
+}
+
+/// Bind a session the hook listener registered to `principal`, the verified
+/// owner of the token the request carried (MAR-81). With no binding installed
+/// (plain mode) it's a no-op, and false.
+pub fn bind(session: &str, principal: &Principal) -> bool {
+    let guard = installed();
+    let Some(Installed { table, .. }) = guard.as_ref() else {
+        return false;
+    };
+    bind_to(table, &principal_key(principal), session)
+}
+
+/// Whether `session` is held by a principal other than `principal` (MAR-81):
+/// the check a hook makes before acting for a session it didn't register.
+/// Unbound, or no binding installed, is false.
+pub fn held_by_another(session: &str, principal: &Principal) -> bool {
+    installed().as_ref().is_some_and(|Installed { table, .. }| {
+        table
+            .owner_of(session)
+            .is_some_and(|owner| owner != principal_key(principal))
+    })
 }
 
 /// Forget who held a session that has gone: ended, swept or forgotten. With
@@ -831,5 +859,37 @@ mod tests {
         assert_eq!(same_principal("codex-3", "nobody"), Some(false));
         *installed() = None;
         assert_eq!(same_principal("codex-3", "codex-3"), None, "plain mode");
+    }
+
+    #[test]
+    fn hook_registered_sessions_can_belong_to_a_paired_principal() {
+        let laptop = Principal {
+            issuer: "marshal-pairing".into(),
+            subject: "laptop".into(),
+            kind: PrincipalKind::Agent,
+        };
+        let desk = Principal {
+            issuer: "marshal-pairing".into(),
+            subject: "desk".into(),
+            kind: PrincipalKind::Agent,
+        };
+        let binding = SessionBinding::new(AllowAll, None);
+        binding.install();
+        assert!(
+            bind("s-laptop", &laptop),
+            "a free session binds to the paired principal"
+        );
+        assert!(bind("s-laptop", &laptop), "binding it again is fine");
+        assert!(!bind("s-laptop", &desk), "another principal can't take it");
+        assert!(!bind_local("s-laptop"), "nor the local one");
+        assert_eq!(
+            binding.table().owner_of("s-laptop").as_deref(),
+            Some(principal_key(&laptop).as_str())
+        );
+        assert!(held_by_another("s-laptop", &desk));
+        assert!(!held_by_another("s-laptop", &laptop));
+        assert!(!held_by_another("s-free", &desk), "unbound is nobody's");
+        assert!(release("s-laptop"));
+        assert!(bind("s-laptop", &desk), "released, it's free again");
     }
 }

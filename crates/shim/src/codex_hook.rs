@@ -122,8 +122,17 @@ pub fn run_for(harness: Harness, ep: &str, base_override: Option<&str>) {
     );
 
     let deadline = Instant::now() + harness.timeout();
-    let Ok(reply) = http_post_why(&base, &path, &body, deadline) else {
-        return;
+    let reply = match http_post_why(&base, &path, &body, deadline) {
+        Ok(reply) => reply,
+        // A refusal by a daemon that checks tokens (MAR-81) is the operator's
+        // to fix, so it's said here, once per hook; these hooks run before
+        // logging starts and don't loop. (The waiter has its own
+        // once-per-cause rule for this.)
+        Err(failure @ PostFailure::Status(401 | 403)) => {
+            eprintln!("marshal-shim: {failure}");
+            return;
+        }
+        Err(_) => return,
     };
     let resp = reply.body.trim_end_matches(['\n', '\r', ' ']);
     if resp.is_empty() {
