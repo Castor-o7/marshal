@@ -859,8 +859,21 @@ mod tests {
     }
 
     // The one test of the process-wide install, so it can't race another.
+    /// The installed binding is one per process, so the tests that install,
+    /// read or clear it take turns (MAR-91): under parallel test threads, one
+    /// test's "plain mode" teardown could clear it between another's install
+    /// and release.
+    static GLOBAL_BINDING: Mutex<()> = Mutex::new(());
+
+    fn my_turn() -> MutexGuard<'static, ()> {
+        GLOBAL_BINDING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     #[test]
     fn the_installed_binding_serves_the_hook_listener_and_cleanup() {
+        let _turn = my_turn();
         assert!(
             !bind_local("before-install"),
             "plain mode: nothing installed"
@@ -888,6 +901,7 @@ mod tests {
 
     #[test]
     fn hook_registered_sessions_can_belong_to_a_paired_principal() {
+        let _turn = my_turn();
         let laptop = Principal {
             issuer: "marshal-pairing".into(),
             subject: "laptop".into(),
@@ -916,6 +930,7 @@ mod tests {
         assert!(!held_by_another("s-free", &desk), "unbound is nobody's");
         assert!(release("s-laptop"));
         assert!(bind("s-laptop", &desk), "released, it's free again");
+        *installed() = None;
     }
 
     #[test]
