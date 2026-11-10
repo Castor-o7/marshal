@@ -99,6 +99,8 @@ async fn main() -> Result<()> {
     // Before anything builds a rustls config (see `tls::install_provider`).
     daemon::tls::install_provider();
 
+    init_logging();
+
     // Send allowances (MAR-88): per session and per machine, each off unless
     // its variable is set. Applied in every mode, since they're the operator's
     // own setting; nothing is configured by default.
@@ -126,7 +128,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    init_logging();
+    // Connection caps (MAR-88), read here in every mode so a malformed value
+    // stops startup whichever way the daemon runs; applied by the TLS fronts.
+    let myko_limits = daemon::limits::ConnLimits::from_env()
+        .map_err(|e| anyhow::anyhow!("marshal-daemon: {e}"))?;
+    let hook_limits = daemon::limits::ConnLimits::from_env()
+        .map_err(|e| anyhow::anyhow!("marshal-daemon: {e}"))?;
+    if let Some(limits) = &myko_limits {
+        log::info!(
+            "connection caps per TLS listener: {} (applied only with --tls)",
+            limits.describe()
+        );
+    }
 
     // Resolve via the system resolver (not bare `parse`) so a mesh DNS
     // name like `marshal-01.lucid.host:6155` works and survives the peer's
@@ -138,7 +151,7 @@ async fn main() -> Result<()> {
     // so a taken port stops startup, and myko and the hook listener move to
     // loopback behind them. Without it, nothing here runs.
     let tls_front = if tls {
-        Some(TlsFront::start(bind_addr, hook_bind).await?)
+        Some(TlsFront::start(bind_addr, hook_bind, myko_limits, hook_limits).await?)
     } else {
         None
     };
@@ -426,7 +439,12 @@ struct TlsFront {
 }
 
 impl TlsFront {
-    async fn start(bind: SocketAddr, hook_bind: SocketAddr) -> Result<Self> {
+    async fn start(
+        bind: SocketAddr,
+        hook_bind: SocketAddr,
+        myko_limits: Option<Arc<daemon::limits::ConnLimits>>,
+        hook_limits: Option<Arc<daemon::limits::ConnLimits>>,
+    ) -> Result<Self> {
         let myko = resolve_bind("MARSHAL_MYKO_BIND", DEFAULT_MYKO_BIND)?;
         daemon::tls::require_loopback("MARSHAL_MYKO_BIND", myko)?;
         let dir = daemon::controls::state_dir().ok_or_else(|| {
@@ -463,14 +481,6 @@ impl TlsFront {
         // The public listener is bound now, so a taken port stops startup, but
         // it forwards only once myko answers on its loopback port.
         let myko_acceptor = acceptor.clone();
-        // Connection caps (MAR-88), one set per front, off unless configured.
-        let myko_limits = daemon::limits::ConnLimits::from_env()
-            .map_err(|e| anyhow::anyhow!("marshal-daemon --tls: {e}"))?;
-        let hook_limits = daemon::limits::ConnLimits::from_env()
-            .map_err(|e| anyhow::anyhow!("marshal-daemon --tls: {e}"))?;
-        if let Some(limits) = &myko_limits {
-            log::info!("[tls] connection caps per listener: {}", limits.describe());
-        }
         tokio::spawn(async move {
             daemon::tls::wait_for_upstream(myko).await;
             daemon::tls::serve(public_listener, myko_acceptor, myko, myko_limits).await;
