@@ -674,7 +674,7 @@ fn a_send_allowance_refuses_a_flood_with_a_reason() {
         .unwrap();
     let said = text(&third);
     assert!(
-        !third.status.success() || said.contains("not sent"),
+        said.contains("--- 0 sent, 1 not sent"),
         "the third message in a minute went through: {said}"
     );
     assert!(
