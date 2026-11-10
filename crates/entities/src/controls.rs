@@ -23,16 +23,16 @@ pub fn sender_allowed(machine: Option<&str>) -> Result<(), String> {
     let Some(list) = allowed.as_ref() else {
         return Ok(());
     };
+    // The refusal says only what the sender already knows about itself; the
+    // list is the operator's, and shows in the daemon's log.
     match machine {
         Some(m) if list.iter().any(|a| a.eq_ignore_ascii_case(m)) => Ok(()),
         Some(m) => Err(format!(
-            "the operator allows messages only from {}; this session is on {m}",
-            list.join(", ")
+            "the operator doesn't allow messages from this machine ({m})"
         )),
-        None => Err(format!(
-            "the operator allows messages only from {}; this session names no machine",
-            list.join(", ")
-        )),
+        None => Err(
+            "the operator doesn't allow messages from a session that names no machine".to_string(),
+        ),
     }
 }
 
@@ -61,8 +61,9 @@ mod tests {
         assert!(sender_allowed(Some("MURPH")).is_ok());
         let refused = sender_allowed(Some("desk")).unwrap_err();
         assert!(
-            refused.contains("only from Laptop, murph") && refused.contains("on desk"),
-            "{refused}"
+            refused.contains("doesn't allow messages from this machine (desk)")
+                && !refused.contains("Laptop"),
+            "the refusal named the list: {refused}"
         );
         assert!(
             sender_allowed(None)

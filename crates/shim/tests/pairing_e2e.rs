@@ -721,11 +721,14 @@ fn the_operators_allow_list_decides_who_may_send() {
         wait_until(Duration::from_secs(10), || {
             let out = tell("from the laptop, not allowed");
             said = text(&out);
-            said.contains("allows messages only from desk")
+            said.contains("doesn't allow messages from this machine (laptop)")
         }),
         "the list never took effect: {said}"
     );
-    assert!(said.contains("this session is on laptop"), "{said}");
+    assert!(
+        !said.contains("desk"),
+        "the refusal handed over the list: {said}"
+    );
 
     std::fs::write(&list, "desk\nlaptop\n").unwrap();
     assert!(
