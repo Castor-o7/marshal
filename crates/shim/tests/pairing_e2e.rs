@@ -532,6 +532,42 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
         "the terminal's sender label didn't carry the pairing's name: {shown}"
     );
 
+    // A pasted pairing code or token never reaches a reader (MAR-86). The
+    // spent code and the machine's live token both go in; neither comes out.
+    let pairing_code =
+        std::fs::read_to_string(rig.dir.path().join("remote-home/config/marshal/pairing")).unwrap();
+    let token = marshal_entities::pairing::Pairing::from_code(&pairing_code)
+        .unwrap()
+        .token;
+    let leak = format!("my code was {code} and my token is {token}, keep them safe");
+    let told = rig
+        .remote_shim(None, &["tell", "paired-session", &leak])
+        .output()
+        .unwrap();
+    assert!(told.status.success(), "the leaking tell: {}", text(&told));
+    let mut shown = String::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let out = rig.hook(
+                rig.remote_shim(None, &[]),
+                "prompt-submit",
+                "paired-session",
+            );
+            shown = text(&out);
+            shown.contains("keep them safe")
+        }),
+        "the leaking tell never showed: {shown}"
+    );
+    assert!(
+        !shown.contains(&token) && !shown.contains(&code[20..60]),
+        "a secret reached the inbox: {shown}"
+    );
+    assert!(
+        shown.contains("[marshal pairing code redacted]")
+            && shown.contains("[marshal token redacted]"),
+        "the secrets weren't marked as redacted: {shown}"
+    );
+
     // Unpaired, it's out within the token cache's second, and stays out.
     let out = rig.daemon_cmd(&["unpair", "laptop"]).output().unwrap();
     assert!(out.status.success(), "unpair: {}", text(&out));
