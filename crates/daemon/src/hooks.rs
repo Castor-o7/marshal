@@ -555,6 +555,13 @@ fn register_hook_session_unchecked(
         os: q.get("os").cloned().unwrap_or_default(),
         arch: q.get("arch").cloned().unwrap_or_default(),
     });
+    // A paired machine's host is its pairing's name, whatever its hooks
+    // declare (MAR-85). The caller is the verified owner of the request's
+    // token (MAR-81); the local token and plain mode leave the host alone.
+    let paired = caller()
+        .filter(|p| p.subject != crate::pairing::LOCAL_NAME)
+        .map(|p| p.subject);
+    let host = marshal_entities::attested_host(host, paired.as_deref());
     // MUS-3: what the session is matched on after a restart. Both declared.
     let harness = q.get("harness").filter(|s| !s.is_empty()).cloned();
     let identity = q.get("identity").filter(|s| !s.is_empty()).cloned();

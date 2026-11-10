@@ -98,6 +98,30 @@ fn mcp_set_status(mut shim: Command, session: &str, text: &str) {
     assert!(got, "the MCP shim never answered set_status");
 }
 
+/// `declared.machine` of `session` on the roster.
+fn machine_of(rig: &Rig, session: &str) -> Option<String> {
+    let out = roster_of(rig);
+    let roster: serde_json::Value =
+        serde_json::from_str(text(&out).trim_start_matches(|c| c != '{')).ok()?;
+    fn find(v: &serde_json::Value, id: &str) -> Option<String> {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.get("session_id").and_then(|v| v.as_str()) == Some(id) {
+                    return map
+                        .get("declared")?
+                        .get("machine")?
+                        .as_str()
+                        .map(str::to_string);
+                }
+                map.values().find_map(|v| find(v, id))
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(|v| find(v, id)),
+            _ => None,
+        }
+    }
+    find(&roster, session)
+}
+
 fn roster_of(rig: &Rig) -> Output {
     rig.local_shim(&["roster"]).output().unwrap()
 }
@@ -114,30 +138,6 @@ fn current_task_of(rig: &Rig, session: &str) -> Option<String> {
                     return map
                         .get("declared")?
                         .get("current_task")?
-                        .as_str()
-                        .map(str::to_string);
-                }
-                map.values().find_map(|v| find(v, id))
-            }
-            serde_json::Value::Array(items) => items.iter().find_map(|v| find(v, id)),
-            _ => None,
-        }
-    }
-    find(&roster, session)
-}
-
-/// `declared.machine` of `session` on the roster, through the host's shim.
-fn machine_of(rig: &Rig, session: &str) -> Option<String> {
-    let out = rig.local_shim(&["roster"]).output().unwrap();
-    let roster: serde_json::Value =
-        serde_json::from_str(text(&out).trim_start_matches(|c| c != '{')).ok()?;
-    fn find(v: &serde_json::Value, id: &str) -> Option<String> {
-        match v {
-            serde_json::Value::Object(map) => {
-                if map.get("session_id").and_then(|v| v.as_str()) == Some(id) {
-                    return map
-                        .get("declared")?
-                        .get("machine")?
                         .as_str()
                         .map(str::to_string);
                 }
@@ -466,8 +466,17 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
     );
     assert_eq!(
         machine_of(&rig, "paired-session").as_deref(),
-        Some("remote"),
+        Some("laptop"),
         "the owner's row didn't survive the refused hooks"
+    );
+
+    // The machine declared MARSHAL_HOST=remote, but its sessions are recorded
+    // under its pairing's name (MAR-85), on the hook path here and on the
+    // RegisterSession path below (the terminal's "a terminal on laptop").
+    assert_eq!(
+        machine_of(&rig, "paired-session").as_deref(),
+        Some("laptop"),
+        "the paired machine's declared host wasn't replaced by its pairing's name"
     );
 
     // Acting *as* the hook-registered session (MAR-80 through MAR-81): the
@@ -517,6 +526,10 @@ fn pairing_lets_a_machine_in_and_unpairing_throws_it_out() {
             shown.contains("hello from the laptop")
         }),
         "the tell never showed in the paired session's hook: {shown}"
+    );
+    assert!(
+        shown.contains("a terminal on laptop"),
+        "the terminal's sender label didn't carry the pairing's name: {shown}"
     );
 
     // Unpaired, it's out within the token cache's second, and stays out.
