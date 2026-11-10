@@ -162,9 +162,29 @@ loss. With the file store (`MARSHAL_PERSIST`) an older daemon refuses to start o
 know, so remove the offers from `store.jsonl` first (`grep -v '"MessageOffer"'` to a new file, then
 move it into place, with the daemon stopped).
 
-**Not yet:** Codex (its own story); a sender's `recipient.offered` in `read_messages`; splitting
-MAR-73's M3 into offered and seen; and MAR-79's live check 5 (kill a busy session mid-turn, start it
-again, and the mail arrives once), which needs this deployed on Murph. The matcher's tests include records
+**Not yet:** Codex (its own story); a sender's `recipient.offered` in `read_messages`; and splitting
+MAR-73's M3 into offered and seen.
+
+## Check 5, run live on Murph (2026-11-09)
+
+MAR-79's check 5, after MAR-82 was deployed (marshal-daemon and marshal-shim on ae24d3b, restarted by
+the lamplighter at 18:05:10, PID 3506578, with nothing new in the journal). It used a disposable kit
+session (`~/src/marshal-check5`, cutover-test-session.md's wiring, its own tmux socket), and read the
+`marshal` database read-only.
+
+| Step | What happened |
+|---|---|
+| Session | sincere-brook (`b633e7f7-28f8-4e91-a06b-47d39ab01d7c`) on Marshal, `wake: waiting`. Its first turn `cat`ed a file holding an inbox block (recorded as the `tool_result` fixture) |
+| Busy | A foreground loop of 30 × 10 s |
+| Send | 18:07:03.82, `Message` event 1742 (`01a1c290-ad0f-7970-ae9a-049b4cc79d15`); `MessageOffer` event 1746 at 18:07:03.99, **no `MessageRead`**. The session didn't show it: it was held for the end of the turn |
+| Kill | 18:07:20.07, `kill -9` of the session's `claude` (PID 3533146), mid-turn. Afterwards: the offer stands, still no `MessageRead`, and no waiter is left |
+| Resume | 18:07:52.50, `claude --resume b633e7f7-…` in the same directory. 18:07:52.85: `MessageOffer` DEL (event 1747), with the journal's `client withdrawn 1 message(s)`, then `MessageRead` SET (event 1748), with `client acked 1 message(s)`. The SessionStart waiter withdrew the unseen offer, and the SessionStart hook handed the now-unread mail to the model as hook context |
+| Seen once | Asked to quote what it had received since resuming, the session quoted the token exactly, once, with its inbox tag (`ids="01a1c290-…"`), said it came "in the SessionStart hook context", and named the `cat`ed block separately as tool output, not a delivery. The db has exactly one `MessageRead` for it |
+| Teardown | `/exit`, its tmux server killed, the directory's three kit files removed |
+
+Before MAR-82, the waiter's ack would have marked the message read at 18:07:03, and the kill would have
+lost it.
+ The matcher's tests include records
 recorded from a disposable test session on Claude Code 2.1.321 and scrubbed to their shapes
 (`crates/shim/tests/fixtures/claude-code-2.1.321`). They confirm the design: each delivery's first
 record is a `queue-operation` `enqueue`, written while the rewake is held, and the model-bound ones
