@@ -219,7 +219,25 @@ impl<A: Authorizer> SessionBinding<A> {
             // A Session with no id is myko's to refuse.
             let Some(id) = field("id") else { return Ok(()) };
             return match change {
-                EventChange::Set => self.table.claim(who, id),
+                EventChange::Set => {
+                    // A paired machine's row carries its pairing's name as its
+                    // host, or no host (MAR-85); the command and hook paths set
+                    // it, and a raw SET may not say otherwise.
+                    if let Some(machine) = who.and_then(paired_machine)
+                        && let Some(declared) = proposed
+                            .get("host")
+                            .and_then(|h| h.get("name"))
+                            .and_then(Value::as_str)
+                        && declared != machine
+                    {
+                        log::warn!(
+                            "[auth] a paired machine's Session SET declared another host name; \
+                             refused"
+                        );
+                        return Err(AuthError::Forbidden);
+                    }
+                    self.table.claim(who, id)
+                }
                 EventChange::Delete => {
                     self.table.must_own(who, id)?;
                     self.table.release(id);
@@ -283,6 +301,13 @@ fn daemon_owned(entity_type: &str) -> bool {
     entity_type == SessionIdentity::ENTITY_NAME_STATIC
         || entity_type == SessionNickname::ENTITY_NAME_STATIC
         || entity_type == Succession::ENTITY_NAME_STATIC
+}
+
+/// The machine behind a principal key, when it's a paired machine's: the
+/// subject of a `marshal-pairing` principal other than the local one.
+fn paired_machine(key: &str) -> Option<&str> {
+    let (issuer, subject) = key.split_once('\u{0}')?;
+    (issuer == crate::pairing::ISSUER && subject != crate::pairing::LOCAL_NAME).then_some(subject)
 }
 
 fn bind_to_local(table: &Table, local: Option<&str>, session: &str) -> bool {
@@ -786,5 +811,55 @@ mod tests {
         assert!(!held_by_another("s-free", &desk), "unbound is nobody's");
         assert!(release("s-laptop"));
         assert!(bind("s-laptop", &desk), "released, it's free again");
+    }
+
+    #[test]
+    fn a_paired_machines_session_set_may_not_declare_another_host() {
+        fn identity(subject: &str) -> AuthenticatedIdentity {
+            AuthenticatedIdentity {
+                user_id: None,
+                principal: Principal {
+                    issuer: crate::pairing::ISSUER.into(),
+                    subject: subject.into(),
+                    kind: PrincipalKind::Agent,
+                },
+                client_id: None,
+                scopes: vec![],
+                delegation: vec![],
+                claims: json!({}),
+                expires_at: SystemTime::now() + Duration::from_secs(60),
+            }
+        }
+        let binding = SessionBinding::new(AllowAll, Some(&identity("(local)").principal));
+        fn set(proposed: &serde_json::Value) -> AuthorizationRequest<'_> {
+            AuthorizationRequest::ClientEvent {
+                entity_type: Session::ENTITY_NAME_STATIC,
+                change: EventChange::Set,
+                proposed,
+            }
+        }
+        let laptop = identity("laptop");
+        let forged = json!({"id": "s-attest", "host": {"name": "forged"}});
+        let own = json!({"id": "s-attest", "host": {"name": "laptop"}});
+        let bare = json!({"id": "s-attest"});
+        let anything = json!({"id": "s-local", "host": {"name": "anything"}});
+        assert_eq!(
+            binding.authorize(&laptop, set(&forged)),
+            Err(AuthError::Forbidden),
+            "a forged host name under a paired principal"
+        );
+        assert!(
+            binding.authorize(&laptop, set(&own)).is_ok(),
+            "its own name"
+        );
+        assert!(
+            binding.authorize(&laptop, set(&bare)).is_ok(),
+            "no host at all is fine; the command path fills it"
+        );
+        let local = identity("(local)");
+        assert!(
+            binding.authorize(&local, set(&anything)).is_ok(),
+            "the local principal declares what it likes"
+        );
     }
 }
