@@ -377,12 +377,13 @@ stays the default and behaves as it does today.
   succession tests pass as they are; and an in-process test shows a same-principal takeover still
   happens and a cross-principal one doesn't, with the nickname, rooms and unread mail staying with
   the dead session. Done (#107), merged in 5e7cdc3.
-- [ ] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
+- [x] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
   listener is outside myko, so #129 doesn't cover it. Done when: with a provider on, every `/hook/*`
   request must carry the daemon host's local token or a paired machine's token as
   `Authorization: Bearer`, checked by the same `Authenticator`, and gets 401 otherwise; the local
   token is made at first start in an owner-only (0600) file that the hooks and local tools read; a
-  refused hook says which token file it wanted; and plain mode is unchanged, with tests.
+  refused hook says which token file it wanted; and plain mode is unchanged, with tests. Done (#111),
+  merged in f246940.
 - [ ] **MAR-85: Security: Attest a paired machine's host from its pairing, whatever the client
   declares.** After MAR-78 and MAR-80 the client-declared host is the forgeable field left. Done
   when: a Session registered under a paired principal records the pairing's name as its host whatever
