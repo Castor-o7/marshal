@@ -177,6 +177,12 @@ impl CommandHandler for SendMessage {
         // A pairing code or token pasted into a message would hand the
         // daemon to whoever reads it (MAR-86): it's replaced before storing.
         let body = redacted(&self.body, &sender.id);
+        // Over its allowance, if one is configured (MAR-88).
+        crate::rate::take(
+            sender.id.0.as_ref(),
+            sender.host.as_ref().map(|h| h.name.as_str()),
+        )
+        .map_err(|why| err(&ctx, &why))?;
 
         // Resolve the recipient token server-side so every harness (Claude via
         // the shim, the opencode plugin, raw HTTP-MCP) shares ONE resolution

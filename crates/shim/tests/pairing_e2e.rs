@@ -166,6 +166,8 @@ struct Rig {
     hook: u16,
     child: Option<Child>,
     fingerprint: String,
+    /// Extra environment for the daemon (MAR-88's allowances).
+    env: Vec<(String, String)>,
 }
 
 impl Rig {
@@ -188,12 +190,17 @@ impl Rig {
             .env("XDG_CONFIG_HOME", self.home().join("config"))
             .env("MARSHAL_STATE_DIR", self.state())
             .env("RUST_LOG", "info");
+        c.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         c
     }
 
     /// Start `marshal-daemon <flags>` on free ports. `--tls` daemons are
     /// waited for until myko answers; others until the WebSocket port does.
     fn start(flags: &[&str]) -> Self {
+        Self::start_with(flags, &[])
+    }
+
+    fn start_with(flags: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut rig = Self {
             dir,
@@ -201,6 +208,10 @@ impl Rig {
             hook: 0,
             child: None,
             fingerprint: String::new(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         };
         assert!(
             rig.restart(flags),
@@ -622,4 +633,52 @@ fn with_machines_paired_the_daemon_refuses_to_start_untold_and_runs_open_with_pl
     assert!(rig.restart(&["--plain"]), "--plain didn't start");
     assert!(rig.log().contains("running open"), "{}", rig.log());
     assert!(TcpStream::connect(("127.0.0.1", rig.ws)).is_ok());
+}
+
+/// MAR-88: with a machine allowance of `2/60`, a paired machine's third
+/// message in a minute is refused with a clear reason. Each `tell` is its own
+/// terminal session, so the machine's allowance is the one that bites across
+/// them; the session allowance is covered by the unit tests. Nothing is
+/// limited otherwise: the other tests here send freely with no allowance set.
+#[test]
+fn a_send_allowance_refuses_a_flood_with_a_reason() {
+    let Some(_) = daemon_bin() else {
+        return;
+    };
+    let rig = Rig::start_with(
+        &["--tls"],
+        &[
+            ("MARSHAL_SEND_ALLOWANCE", "2/60"),
+            ("MARSHAL_MACHINE_SEND_ALLOWANCE", "2/60"),
+        ],
+    );
+    std::fs::create_dir_all(rig.dir.path().join("work")).unwrap();
+    let code = rig.pair_code("laptop");
+    let out = rig.remote_shim(None, &["pair", &code]).output().unwrap();
+    assert!(out.status.success(), "pair: {}", text(&out));
+    let joined = rig.hook(rig.remote_shim(None, &[]), "session-start", "flood-target");
+    assert!(joined.status.success(), "session-start: {}", text(&joined));
+    assert!(wait_until(Duration::from_secs(10), || {
+        text(&roster_of(&rig)).contains("flood-target")
+    }));
+    for n in 1..=2 {
+        let out = rig
+            .remote_shim(None, &["tell", "flood-target", &format!("message {n}")])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "tell {n}: {}", text(&out));
+    }
+    let third = rig
+        .remote_shim(None, &["tell", "flood-target", "message 3"])
+        .output()
+        .unwrap();
+    let said = text(&third);
+    assert!(
+        !third.status.success() || said.contains("not sent"),
+        "the third message in a minute went through: {said}"
+    );
+    assert!(
+        said.contains("too many messages from this machine"),
+        "the refusal didn't say why: {said}"
+    );
 }

@@ -32,6 +32,11 @@ const DEFAULT_HOOK_BIND: &str = "127.0.0.1:6156";
 /// `MARSHAL_BIND` (MAR-23). Loopback only.
 const DEFAULT_MYKO_BIND: &str = "127.0.0.1:6157";
 
+/// Send allowances (MAR-88): `<burst>/<per minute>` per session, and per
+/// machine shared by its sessions. Unset means none.
+const SEND_ALLOWANCE_ENV: &str = "MARSHAL_SEND_ALLOWANCE";
+const MACHINE_SEND_ALLOWANCE_ENV: &str = "MARSHAL_MACHINE_SEND_ALLOWANCE";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Answer `--help` / `--version` before anything starts, and refuse any
@@ -93,6 +98,33 @@ async fn main() -> Result<()> {
     let tls = tls.unwrap_or(false);
     // Before anything builds a rustls config (see `tls::install_provider`).
     daemon::tls::install_provider();
+
+    // Send allowances (MAR-88): per session and per machine, each off unless
+    // its variable is set. Applied in every mode, since they're the operator's
+    // own setting; nothing is configured by default.
+    {
+        let read = |var: &str| -> Result<Option<marshal_entities::rate::Allowance>> {
+            match std::env::var(var) {
+                Ok(v) if v.trim().is_empty() => Ok(None),
+                Ok(v) => marshal_entities::rate::Allowance::parse(&v)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "marshal-daemon: {var} must be <burst>/<per minute>, got {v:?}"
+                        )
+                    }),
+                Err(_) => Ok(None),
+            }
+        };
+        let config = marshal_entities::rate::Config {
+            session: read(SEND_ALLOWANCE_ENV)?,
+            machine: read(MACHINE_SEND_ALLOWANCE_ENV)?,
+        };
+        if config.session.is_some() || config.machine.is_some() {
+            log::info!("send allowances: {config:?}");
+            marshal_entities::rate::install(config);
+        }
+    }
 
     init_logging();
 
@@ -431,14 +463,23 @@ impl TlsFront {
         // The public listener is bound now, so a taken port stops startup, but
         // it forwards only once myko answers on its loopback port.
         let myko_acceptor = acceptor.clone();
+        // Connection caps (MAR-88), one set per front, off unless configured.
+        let myko_limits = daemon::limits::ConnLimits::from_env()
+            .map_err(|e| anyhow::anyhow!("marshal-daemon --tls: {e}"))?;
+        let hook_limits = daemon::limits::ConnLimits::from_env()
+            .map_err(|e| anyhow::anyhow!("marshal-daemon --tls: {e}"))?;
+        if let Some(limits) = &myko_limits {
+            log::info!("[tls] connection caps per listener: {}", limits.describe());
+        }
         tokio::spawn(async move {
             daemon::tls::wait_for_upstream(myko).await;
-            daemon::tls::serve(public_listener, myko_acceptor, myko).await;
+            daemon::tls::serve(public_listener, myko_acceptor, myko, myko_limits).await;
         });
         tokio::spawn(daemon::tls::serve(
             public_hooks_listener,
             acceptor,
             hooks_inner,
+            hook_limits,
         ));
         Ok(Self {
             public,
@@ -558,6 +599,10 @@ Environment:
   MARSHAL_MYKO_BIND  With --tls, myko's own listener behind MARSHAL_BIND;
                      loopback only (default {DEFAULT_MYKO_BIND})
   MARSHAL_ADVERTISE  The host:port paired machines dial, for pair-code
+  MARSHAL_SEND_ALLOWANCE          <burst>/<per minute> a session may send; unset: no limit
+  MARSHAL_MACHINE_SEND_ALLOWANCE  the same for all of one machine's sessions together
+  MARSHAL_MAX_CONNECTIONS          open connections per TLS listener; unset: no cap
+  MARSHAL_MAX_CONNECTIONS_PER_PEER open connections per peer address per TLS listener
   MYKO_POSTGRES_URL  Postgres URL for durable state; without it the daemon
                      runs ephemeral and keeps nothing across a restart
   MARSHAL_PERSIST    Set to `file`, with no Postgres, to keep messages, read
