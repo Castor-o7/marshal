@@ -831,43 +831,34 @@ mod tests {
             }
         }
         let binding = SessionBinding::new(AllowAll, Some(&identity("(local)").principal));
-        let set = |proposed: serde_json::Value| AuthorizationRequest::ClientEvent {
-            entity_type: Session::ENTITY_NAME_STATIC,
-            change: EventChange::Set,
-            proposed: &proposed,
-        };
+        fn set(proposed: &serde_json::Value) -> AuthorizationRequest<'_> {
+            AuthorizationRequest::ClientEvent {
+                entity_type: Session::ENTITY_NAME_STATIC,
+                change: EventChange::Set,
+                proposed,
+            }
+        }
         let laptop = identity("laptop");
+        let forged = json!({"id": "s-attest", "host": {"name": "forged"}});
+        let own = json!({"id": "s-attest", "host": {"name": "laptop"}});
+        let bare = json!({"id": "s-attest"});
+        let anything = json!({"id": "s-local", "host": {"name": "anything"}});
         assert_eq!(
-            binding.authorize(
-                &laptop,
-                set(json!({"id": "s-attest", "host": {"name": "forged"}}))
-            ),
+            binding.authorize(&laptop, set(&forged)),
             Err(AuthError::Forbidden),
             "a forged host name under a paired principal"
         );
         assert!(
-            binding
-                .authorize(
-                    &laptop,
-                    set(json!({"id": "s-attest", "host": {"name": "laptop"}}))
-                )
-                .is_ok(),
+            binding.authorize(&laptop, set(&own)).is_ok(),
             "its own name"
         );
         assert!(
-            binding
-                .authorize(&laptop, set(json!({"id": "s-attest"})))
-                .is_ok(),
+            binding.authorize(&laptop, set(&bare)).is_ok(),
             "no host at all is fine; the command path fills it"
         );
         let local = identity("(local)");
         assert!(
-            binding
-                .authorize(
-                    &local,
-                    set(json!({"id": "s-local", "host": {"name": "anything"}}))
-                )
-                .is_ok(),
+            binding.authorize(&local, set(&anything)).is_ok(),
             "the local principal declares what it likes"
         );
     }
