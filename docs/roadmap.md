@@ -261,7 +261,7 @@ launcher.
   Design only. Done when: [two-phase-delivery.md](two-phase-delivery.md) sets out the gap and what's
   already safe, proposes offer-then-confirm from the session's own transcript (and the smaller Codex
   gap), and lists what changes, the tests it needs and the questions for the operator (#100).
-- [ ] **MAR-82: Durability: Two-phase delivery for Claude sessions.** The build of MAR-79, with the
+- [x] **MAR-82: Durability: Two-phase delivery for Claude sessions.** The build of MAR-79, with the
   operator's answers (2026-11-09): confirm "seen" from the session's own transcript; re-offer after
   6 h unconfirmed (at least once); Claude first, with Codex as its own story; built and proven on
   the fork first, then offered upstream as one PR in the one-at-a-time queue. Done when: a Claude
@@ -273,7 +273,8 @@ launcher.
   reap is dropped, so the mail is unread again for that session or, by MAR-42, its successor; one
   unconfirmed for 6 h is offered again; a shim that sends no phase keeps today's behaviour (the ack
   marks it read); and a test kills a session mid-turn and its mail is still unread (MAR-79's check
-  5).
+  5). Done: #103, merged in ae24d3b (squash), deployed on Murph at 18:05:10; check 5 run live,
+  recorded in two-phase-delivery.md (#108, merged in bb2a615).
 
 - [ ] **MAR-79: Supporting: Design two-phase delivery, so mail taken mid-turn isn't lost.** Found in
   MAR-70 and MAR-73: a Claude session's background `claude-hook wait` takes a message as soon as it's
@@ -340,11 +341,12 @@ stays the default and behaves as it does today.
   daemon's tree, through myko's telemetry). Done in two parts: the daemon (#102, merged in
   d2925e1) and the shim's pinned link (#104, merged in a49ade4). Each binary grows by 1.9 MB, on
   ring. Off until the operator starts the daemon with `--tls`.
-- [ ] **MAR-24: Security: Gate: per-machine pairing.** Depends on MAR-23. A Marshal `Authenticator`
+- [x] **MAR-24: Security: Gate: per-machine pairing.** Depends on MAR-23. A Marshal `Authenticator`
   on #129. Done when: a machine pairs with a single-use, expiring code and gets a token kept in a
   pairing store; the shim presents it through #129's `CredentialProvider`; an unpaired or revoked
   machine is refused, and revoking closes its open connection; and with pairings and neither `--tls`
-  nor `--plain` the daemon refuses to start, as it does when the store can't be read.
+  nor `--plain` the daemon refuses to start, as it does when the store can't be read. Done (#106),
+  merged in 37f1003.
 - [x] **MAR-25: Dropped: Gate: myko's own listener behind the gate.** Superseded by #129 (MAR-76):
   with `with_auth_provider`, myko checks every connection's token itself, so no vendored
   `RequestFilter` is needed. Its remnant, binding myko to loopback behind TLS, is part of MAR-23.
@@ -363,12 +365,43 @@ stays the default and behaves as it does today.
   each. The doc says plainly that the hook listener itself isn't covered (MAR-81), and that the local
   token is a loopback trust boundary: on a shared machine its file must be owner-only (0600). The
   doc is [session-binding.md](session-binding.md). Done (#105), merged in defa09c.
-- [ ] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
+- [x] **MAR-83: Security: With auth on, succession stays within a principal.** Found writing MAR-80:
+  a dead predecessor is chosen by identity key alone (cwd, harness, operator, host; or a declared
+  role), so under auth a session of principal B could take over the nickname, ad hoc rooms and
+  unread mail of principal A's dead session with the same key. Done when: with a binding installed,
+  `find_predecessor` skips a candidate whose principal isn't the successor's, and says why in the
+  log; unknown on either side counts as different (a hook-registered session with no local
+  principal, or a session from before a daemon restart), so it fails closed; the binding remembers a
+  released session's principal for the succession window, since the sweep releases it before the
+  late recheck runs in the same tick; plain mode (no binding) is unchanged, so the existing
+  succession tests pass as they are; and an in-process test shows a same-principal takeover still
+  happens and a cross-principal one doesn't, with the nickname, rooms and unread mail staying with
+  the dead session. Done (#107), merged in 5e7cdc3.
+- [x] **MAR-81: Security: With auth on, the hook listener needs a token too.** From MAR-76: the hook
   listener is outside myko, so #129 doesn't cover it. Done when: with a provider on, every `/hook/*`
   request must carry the daemon host's local token or a paired machine's token as
   `Authorization: Bearer`, checked by the same `Authenticator`, and gets 401 otherwise; the local
   token is made at first start in an owner-only (0600) file that the hooks and local tools read; a
-  refused hook says which token file it wanted; and plain mode is unchanged, with tests.
+  refused hook says which token file it wanted; and plain mode is unchanged, with tests. Done (#111),
+  merged in f246940.
+- [ ] **MAR-85: Security: Attest a paired machine's host from its pairing, whatever the client
+  declares.** After MAR-78 and MAR-80 the client-declared host is the forgeable field left. Done
+  when: a Session registered under a paired principal records the pairing's name as its host whatever
+  the client declares; the roster and sender labels show it; plain mode is unchanged; with a test that
+  a forged host is overridden.
+- [ ] **MAR-86: Security: Keep pairing codes and tokens out of message bodies.** From muster
+  (inventory row 74). Done when: SendMessage and BroadcastMessage redact a pairing code or token that
+  appears in a body, logged once, with a test.
+- [ ] **MAR-87: Docs: SECURITY.md and the threat model, for the gate on myko#129.** From muster (rows
+  51, 83). Done when: SECURITY.md and a threat model describe the gate as built (TLS, pairing, session
+  binding, the hook token) and what it doesn't cover, honestly.
+- [ ] **MAR-88: Security: Connection limits per listener and a per-machine send allowance, off unless
+  configured.** From muster (rows 79, 80). Done when: caps on open connections per listener and per
+  peer, and SendMessage/BroadcastMessage refusing over an allowance shared across a machine's
+  sessions, each off unless configured, with tests.
+- [ ] **MAR-89: Security: A sender allow-list the operator controls, off unless configured.** From
+  muster (row 81; the wake pause was dropped with MAR-11). Done when: a control file names who may
+  send, empty meaning everyone, applied to SendMessage and BroadcastMessage, with a test.
 - [ ] **MAR-8: Security: TLS restart doesn't miss its takeover.** From MUS-93: an intermittent miss
   on CI's slower runner. Depends on MAR-23. Done when: the restart-keeps-identity cell passes in TLS
   mode on CI 10 times in a row.
