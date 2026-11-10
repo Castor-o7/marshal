@@ -2,10 +2,10 @@
 //!
 //! With `--tls`, myko's listener gets myko#129's auth provider with this
 //! module's [`PairingAuthenticator`], so every WebSocket and MCP connection
-//! needs a bearer token the daemon knows. The hook listener is outside myko
-//! and isn't gated by this: until MAR-81, `/hook/*` takes any request that
-//! reaches it (TLS keeps it private on the wire, nothing more). Tokens come
-//! from pairing:
+//! needs a bearer token the daemon knows. The hook listener is outside myko,
+//! so it checks the same tokens itself (MAR-81, `http_listener::verify_caller`):
+//! a hook without one gets 401, and a hook for a session another machine
+//! registered gets 403. Tokens come from pairing:
 //!
 //! 1. On the daemon's host, `marshal-daemon pair-code <name>` writes a
 //!    single-use invite, good for a while, and prints an `Invite` code.
