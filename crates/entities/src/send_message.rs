@@ -174,6 +174,15 @@ impl CommandHandler for SendMessage {
         let sessions: Vec<Arc<Session>> = ctx.exec_query(GetAllSessions {})?;
 
         let sender = resolve_caller(&ctx, &sessions, self.as_session.as_ref())?;
+        // A pairing code or token pasted into a message would hand the
+        // daemon to whoever reads it (MAR-86): it's replaced before storing.
+        let body = redacted(&self.body, &sender.id);
+        // Over its allowance, if one is configured (MAR-88).
+        crate::rate::take(
+            sender.id.0.as_ref(),
+            sender.host.as_ref().map(|h| h.name.as_str()),
+        )
+        .map_err(|why| err(&ctx, &why))?;
 
         // Resolve the recipient token server-side so every harness (Claude via
         // the shim, the opencode plugin, raw HTTP-MCP) shares ONE resolution
@@ -223,8 +232,7 @@ impl CommandHandler for SendMessage {
                     // by now, or to none, and is still the same send. The
                     // stored message doesn't keep the `to` token, so the
                     // recipient isn't compared; the key is the sender's own.
-                    if first.body != self.body || first.response_required != self.response_required
-                    {
+                    if first.body != body || first.response_required != self.response_required {
                         return Err(err(
                             &ctx,
                             "this idempotency key was already used for a different message",
@@ -259,7 +267,7 @@ impl CommandHandler for SendMessage {
             to_session_id: Some(recipient.id.clone()),
             to_room_id: None,
             to_operator: to_operator.clone(),
-            body: self.body.clone(),
+            body: body.clone(),
             sent_at: now,
             from_kind: sender.kind.clone(),
             from_machine: sender.host.as_ref().map(|h| h.name.clone()),
@@ -384,6 +392,19 @@ impl CommandHandler for SendMessage {
             delivered_live,
         })
     }
+}
+
+/// `body` with pairing secrets replaced (MAR-86), said once in the log when
+/// anything was.
+pub(crate) fn redacted(body: &str, sender: &SessionId) -> String {
+    let (out, n) = crate::pairing::redact_secrets(body);
+    if n > 0 {
+        log::warn!(
+            "[pairing] redacted {n} pairing secret(s) from a message by {}",
+            sender.0
+        );
+    }
+    out
 }
 
 fn err(ctx: &CommandContext, message: &str) -> CommandError {

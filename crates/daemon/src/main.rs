@@ -32,6 +32,11 @@ const DEFAULT_HOOK_BIND: &str = "127.0.0.1:6156";
 /// `MARSHAL_BIND` (MAR-23). Loopback only.
 const DEFAULT_MYKO_BIND: &str = "127.0.0.1:6157";
 
+/// Send allowances (MAR-88): `<burst>/<per minute>` per session, and per
+/// machine shared by its sessions. Unset means none.
+const SEND_ALLOWANCE_ENV: &str = "MARSHAL_SEND_ALLOWANCE";
+const MACHINE_SEND_ALLOWANCE_ENV: &str = "MARSHAL_MACHINE_SEND_ALLOWANCE";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Answer `--help` / `--version` before anything starts, and refuse any
@@ -96,6 +101,46 @@ async fn main() -> Result<()> {
 
     init_logging();
 
+    // Send allowances (MAR-88): per session and per machine, each off unless
+    // its variable is set. Applied in every mode, since they're the operator's
+    // own setting; nothing is configured by default.
+    {
+        let read = |var: &str| -> Result<Option<marshal_entities::rate::Allowance>> {
+            match std::env::var(var) {
+                Ok(v) if v.trim().is_empty() => Ok(None),
+                Ok(v) => marshal_entities::rate::Allowance::parse(&v)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "marshal-daemon: {var} must be <burst>/<per minute>, got {v:?}"
+                        )
+                    }),
+                Err(_) => Ok(None),
+            }
+        };
+        let config = marshal_entities::rate::Config {
+            session: read(SEND_ALLOWANCE_ENV)?,
+            machine: read(MACHINE_SEND_ALLOWANCE_ENV)?,
+        };
+        if config.session.is_some() || config.machine.is_some() {
+            log::info!("send allowances: {config:?}");
+            marshal_entities::rate::install(config);
+        }
+    }
+
+    // Connection caps (MAR-88), read here in every mode so a malformed value
+    // stops startup whichever way the daemon runs; applied by the TLS fronts.
+    let myko_limits = daemon::limits::ConnLimits::from_env()
+        .map_err(|e| anyhow::anyhow!("marshal-daemon: {e}"))?;
+    let hook_limits = daemon::limits::ConnLimits::from_env()
+        .map_err(|e| anyhow::anyhow!("marshal-daemon: {e}"))?;
+    if let Some(limits) = &myko_limits {
+        log::info!(
+            "connection caps per TLS listener: {} (applied only with --tls)",
+            limits.describe()
+        );
+    }
+
     // Resolve via the system resolver (not bare `parse`) so a mesh DNS
     // name like `marshal-01.lucid.host:6155` works and survives the peer's
     // mesh IP being reassigned (next start re-resolves).
@@ -106,7 +151,7 @@ async fn main() -> Result<()> {
     // so a taken port stops startup, and myko and the hook listener move to
     // loopback behind them. Without it, nothing here runs.
     let tls_front = if tls {
-        Some(TlsFront::start(bind_addr, hook_bind).await?)
+        Some(TlsFront::start(bind_addr, hook_bind, myko_limits, hook_limits).await?)
     } else {
         None
     };
@@ -160,6 +205,11 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("marshal-daemon --tls: no state directory (set HOME)"))?
             .with_local_token(&local);
         daemon::pairing::install(store.clone());
+        // Message bodies lose any token the store knows (MAR-86).
+        let check_store = store.clone();
+        marshal_entities::pairing::install_secret_check(Arc::new(move |run: &str| {
+            check_store.verify(run).is_some()
+        }));
         // MAR-80: a connection acts only as its own sessions, and sessions
         // registered through the hook listener belong to the daemon host.
         let local = myko_auth::Principal {
@@ -389,7 +439,12 @@ struct TlsFront {
 }
 
 impl TlsFront {
-    async fn start(bind: SocketAddr, hook_bind: SocketAddr) -> Result<Self> {
+    async fn start(
+        bind: SocketAddr,
+        hook_bind: SocketAddr,
+        myko_limits: Option<Arc<daemon::limits::ConnLimits>>,
+        hook_limits: Option<Arc<daemon::limits::ConnLimits>>,
+    ) -> Result<Self> {
         let myko = resolve_bind("MARSHAL_MYKO_BIND", DEFAULT_MYKO_BIND)?;
         daemon::tls::require_loopback("MARSHAL_MYKO_BIND", myko)?;
         let dir = daemon::controls::state_dir().ok_or_else(|| {
@@ -428,12 +483,13 @@ impl TlsFront {
         let myko_acceptor = acceptor.clone();
         tokio::spawn(async move {
             daemon::tls::wait_for_upstream(myko).await;
-            daemon::tls::serve(public_listener, myko_acceptor, myko).await;
+            daemon::tls::serve(public_listener, myko_acceptor, myko, myko_limits).await;
         });
         tokio::spawn(daemon::tls::serve(
             public_hooks_listener,
             acceptor,
             hooks_inner,
+            hook_limits,
         ));
         Ok(Self {
             public,
@@ -553,6 +609,10 @@ Environment:
   MARSHAL_MYKO_BIND  With --tls, myko's own listener behind MARSHAL_BIND;
                      loopback only (default {DEFAULT_MYKO_BIND})
   MARSHAL_ADVERTISE  The host:port paired machines dial, for pair-code
+  MARSHAL_SEND_ALLOWANCE          <burst>/<per minute> a session may send; unset: no limit
+  MARSHAL_MACHINE_SEND_ALLOWANCE  the same for all of one machine's sessions together
+  MARSHAL_MAX_CONNECTIONS          open connections per TLS listener; unset: no cap
+  MARSHAL_MAX_CONNECTIONS_PER_PEER open connections per peer address per TLS listener
   MYKO_POSTGRES_URL  Postgres URL for durable state; without it the daemon
                      runs ephemeral and keeps nothing across a restart
   MARSHAL_PERSIST    Set to `file`, with no Postgres, to keep messages, read
