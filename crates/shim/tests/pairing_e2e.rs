@@ -674,11 +674,72 @@ fn a_send_allowance_refuses_a_flood_with_a_reason() {
         .unwrap();
     let said = text(&third);
     assert!(
-        !third.status.success() || said.contains("not sent"),
+        said.contains("--- 0 sent, 1 not sent"),
         "the third message in a minute went through: {said}"
     );
     assert!(
         said.contains("too many messages from this machine"),
         "the refusal didn't say why: {said}"
+    );
+}
+
+/// MAR-89: with `allowed-senders` naming only another machine, a paired
+/// machine's tell is refused with the reason; naming it, the next tell goes;
+/// removing the file, everyone may send again. The daemon reads the file every
+/// two seconds.
+#[test]
+fn the_operators_allow_list_decides_who_may_send() {
+    let Some(_) = daemon_bin() else {
+        return;
+    };
+    let rig = Rig::start(&["--tls"]);
+    std::fs::create_dir_all(rig.dir.path().join("work")).unwrap();
+    let code = rig.pair_code("laptop");
+    let out = rig.remote_shim(None, &["pair", &code]).output().unwrap();
+    assert!(out.status.success(), "pair: {}", text(&out));
+    let joined = rig.hook(rig.remote_shim(None, &[]), "session-start", "list-target");
+    assert!(joined.status.success(), "session-start: {}", text(&joined));
+    assert!(wait_until(Duration::from_secs(10), || {
+        text(&roster_of(&rig)).contains("list-target")
+    }));
+    let tell = |body: &str| {
+        rig.remote_shim(None, &["tell", "list-target", body])
+            .output()
+            .unwrap()
+    };
+    let out = tell("before any list");
+    assert!(
+        text(&out).contains("--- 1 sent"),
+        "no list set: {}",
+        text(&out)
+    );
+
+    let list = rig.state().join("allowed-senders");
+    std::fs::write(&list, "# only the desk\ndesk\n").unwrap();
+    let mut said = String::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let out = tell("from the laptop, not allowed");
+            said = text(&out);
+            said.contains("allows messages only from desk")
+        }),
+        "the list never took effect: {said}"
+    );
+    assert!(said.contains("this session is on laptop"), "{said}");
+
+    std::fs::write(&list, "desk\nlaptop\n").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            text(&tell("from the laptop, allowed now")).contains("--- 1 sent")
+        }),
+        "adding the laptop never took effect"
+    );
+
+    std::fs::remove_file(&list).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            text(&tell("list gone")).contains("--- 1 sent")
+        }),
+        "removing the list never took effect"
     );
 }

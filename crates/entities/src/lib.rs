@@ -18,6 +18,8 @@
 
 mod ack_messages;
 mod broadcast_message;
+/// Fork only (MAR-89): the operator's sender allow-list, off unless the daemon sets one.
+pub mod controls;
 mod message;
 mod message_offer;
 mod message_read;

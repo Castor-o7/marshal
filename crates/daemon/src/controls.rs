@@ -23,6 +23,9 @@ use myko::{core::item::Eventable as _, server::MykoServerContext, utils::downcas
 
 pub const FORGET_FILE: &str = "forget-sessions";
 pub const RESULTS_FILE: &str = "forget-results";
+/// `allowed-senders` (MAR-89): machines that may send, one name per line;
+/// `#` starts a comment. Absent or empty, everyone may send.
+pub const ALLOWED_SENDERS_FILE: &str = "allowed-senders";
 /// How soon the running daemon sees a change.
 pub const REFRESH: Duration = Duration::from_secs(2);
 /// How long a forgotten session's hooks are refused by default, so a waiter
@@ -422,10 +425,48 @@ pub fn apply(dir: &Path, ctx: &MykoServerContext) {
 /// Keep applying the control files, every [`REFRESH`]. Spawn on a tokio task.
 pub async fn run(dir: PathBuf, ctx: MykoServerContext) {
     let mut interval = tokio::time::interval(REFRESH);
+    let mut last_list: Option<Option<Vec<String>>> = None;
     loop {
         interval.tick().await;
         apply(&dir, &ctx);
+        let list = read_allowed_senders(&dir);
+        if last_list.as_ref() != Some(&list) {
+            match &list {
+                Some(machines) => log::info!(
+                    "[controls] messages are allowed only from: {}",
+                    machines.join(", ")
+                ),
+                None if last_list.is_some() => {
+                    log::info!("[controls] the sender allow-list is gone; everyone may send");
+                }
+                None => {}
+            }
+            marshal_entities::controls::set_allowed_senders(list.clone());
+            last_list = Some(list);
+        }
     }
+}
+
+/// The allow-list in `dir`, or `None` when the file is absent, empty, or
+/// can't be trusted (as for the other control files).
+pub fn read_allowed_senders(dir: &Path) -> Option<Vec<String>> {
+    let path = dir.join(ALLOWED_SENDERS_FILE);
+    if let Some(why) = untrusted(&path) {
+        log::warn!("[controls] ignoring {}: {why}", path.display());
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let machines: Vec<String> = parse_allowed_senders(&text);
+    (!machines.is_empty()).then_some(machines)
+}
+
+/// One machine name per line; blank lines and `#` comments are skipped.
+pub fn parse_allowed_senders(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -550,5 +591,21 @@ mod tests {
         )
         .unwrap();
         assert!(requests(&dir).is_empty());
+    }
+
+    #[test]
+    fn the_allow_list_parses_names_and_skips_comments_and_blanks() {
+        assert_eq!(
+            parse_allowed_senders("# who may send\nlaptop\n\nmurph # the host\n"),
+            vec!["laptop".to_string(), "murph".to_string()]
+        );
+        assert!(parse_allowed_senders("# nobody yet\n\n").is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_allowed_senders(dir.path()), None, "no file is no list");
+        std::fs::write(dir.path().join(ALLOWED_SENDERS_FILE), "desk\n").unwrap();
+        assert_eq!(
+            read_allowed_senders(dir.path()),
+            Some(vec!["desk".to_string()])
+        );
     }
 }
