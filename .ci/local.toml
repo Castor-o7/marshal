@@ -1,0 +1,101 @@
+# Marshal's CI on this fork, run on Murph by ci-local (Castor-o7/rally RAL-144, docs/ci-local.md
+# there). One entry per job in .github/workflows/ci.yml, which now runs only by hand. Each posts
+# `local/<job>`. Castor fork only: never send this file or ci.yml's trigger hunk upstream.
+
+workflows = ["ci.yml"]
+
+[exempt]
+"release.yml" = "upstream's release: every job is gated to ignition-is-go/marshal, so on this fork a push only records skipped jobs and spends nothing"
+"public-ci-red-team.yml" = "upstream's sandbox probes: gated to ignition-is-go/marshal (MAR-34), never runs on this fork"
+
+[jobs.check]
+mem = "12G"
+cpu = "600%"
+timeout_min = 45
+run = """
+tools="$HOME/.cache/ci/tools"
+# The workflow validator, pinned as the workflow pins it.
+if [ ! -x "$tools/actionlint-1.7.12/actionlint" ]; then bash scripts/ci/install-actionlint.sh "$tools/actionlint-1.7.12"; fi
+python3 -m venv "$TMPDIR/workflow-validator"
+"$TMPDIR/workflow-validator/bin/pip" install --quiet --disable-pip-version-check -r scripts/ci/requirements.txt
+"$TMPDIR/workflow-validator/bin/python" scripts/ci/check_workflows.py --actionlint "$tools/actionlint-1.7.12/actionlint"
+"$TMPDIR/workflow-validator/bin/python" -m unittest discover -s scripts/ci -p 'test_*.py' -v
+# cargo-flux, as the workflow installs it (unpinned there too).
+command -v cargo-flux >/dev/null || cargo install cargo-flux
+# bun 1.3.11 as the workflow's setup-bun, checked against that release's SHASUMS256.txt.
+bun_dir="$tools/bun-1.3.11"
+if [ ! -x "$bun_dir/bun-linux-x64/bun" ]; then
+  curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$TMPDIR/bun.zip" https://github.com/oven-sh/bun/releases/download/bun-v1.3.11/bun-linux-x64.zip
+  echo "8611ba935af886f05a6f38740a15160326c15e5d5d07adef966130b4493607ed  $TMPDIR/bun.zip" | sha256sum -c -
+  mkdir -p "$bun_dir" && python3 -m zipfile -e "$TMPDIR/bun.zip" "$bun_dir" && chmod +x "$bun_dir/bun-linux-x64/bun"
+fi
+export PATH="$bun_dir/bun-linux-x64:$PATH"
+npm ci --prefix plugins/marshal-opencode
+npm ci --prefix plugins/marshal-pi
+npm ci --prefix plugins/marshal-prime-agent --workspaces=false --ignore-scripts
+cargo flux run check
+cargo flux run lint
+cargo flux run test
+# Native embedding-agent registration and reconnect.
+cargo build -p marshal-daemon -p marshal-shim --bins
+target_dir=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+test -x "$target_dir/debug/marshal-daemon"
+test -x "$target_dir/debug/marshal-shim"
+MARSHAL_DAEMON_BIN="$target_dir/debug/marshal-daemon" bun test \
+  plugins/marshal-opencode/test/embedding-agent.test.ts \
+  plugins/marshal-opencode/test/channel.test.ts \
+  plugins/marshal-opencode/test/push-ack.test.ts \
+  plugins/marshal-opencode/test/push.test.ts \
+  plugins/marshal-opencode/test/reconnect.test.ts \
+  plugins/marshal-pi/test/embedding-agent.test.ts \
+  plugins/marshal-pi/test/push-ack.test.ts \
+  plugins/marshal-pi/test/live-push.test.ts \
+  plugins/marshal-pi/test/inbox-pull.test.ts \
+  plugins/marshal-pi/test/reconnect.test.ts \
+  plugins/marshal-prime-agent/test/embedding-agent.test.ts \
+  plugins/marshal-prime-agent/test/push-ack.test.ts \
+  plugins/marshal-prime-agent/test/live-push.test.ts \
+  plugins/marshal-prime-agent/test/inbox-pull.test.ts \
+  plugins/marshal-prime-agent/test/reconnect.test.ts
+python3 -m unittest discover -s scripts/sandbox -v
+python3 scripts/test_release_dispatch_contract.py
+"""
+
+# marshal-shim's #[cfg(windows)] code, cross-compiled.
+[jobs.windows-cross-check]
+mem = "6G"
+cpu = "400%"
+timeout_min = 25
+run = """
+command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "needs the mingw C cross-compiler (mingw-w64-gcc), which this machine doesn't have"; exit 1; }
+rustup target list --installed | grep -qx x86_64-pc-windows-gnu || rustup target add x86_64-pc-windows-gnu
+cargo check -p marshal-shim --target x86_64-pc-windows-gnu
+"""
+
+[jobs.windows-native-wake]
+manual = "Windows: run the workflow by hand; hosted Windows bills nothing on a public repo"
+
+# The delivery conformance grid; its restart cells persist to Postgres.
+[jobs.conformance]
+mem = "12G"
+cpu = "600%"
+timeout_min = 30
+postgres = true
+run = """
+export CONFORMANCE_POSTGRES_URL="$CI_POSTGRES_URL"
+export CONFORMANCE_REQUIRE_POSTGRES=1
+export CONFORMANCE_GRID="$TMPDIR/conformance-grid.txt"
+status=0
+cargo build --workspace && cargo test -p marshal-shim --test conformance -- --ignored --nocapture || status=$?
+cat "$CONFORMANCE_GRID" || true
+exit $status
+"""
+
+[jobs.dependency-audit]
+mem = "4G"
+cpu = "200%"
+timeout_min = 20
+run = """
+test "$(cargo deny --version)" = "cargo-deny 0.20.2" || cargo install --locked cargo-deny --version 0.20.2
+cargo deny check
+"""

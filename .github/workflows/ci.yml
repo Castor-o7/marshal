@@ -1,10 +1,10 @@
 name: CI
 
+# Castor fork only: CI runs on Murph (Castor-o7/rally RAL-144). ci-local runs these jobs from
+# .ci/local.toml and posts `local/<job>`; this workflow runs only by hand. Never send this hunk
+# upstream, which runs CI on its own self-hosted runners.
 on:
-  push:
-    branches: [main, dev]
-  pull_request:
-    branches: [main, dev]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
