@@ -132,6 +132,15 @@ launcher.
 - [ ] **MAR-35: Goal 2: Launcher: macOS terminal windows (Terminal, iTerm).** Depends on MAR-29.
   Done when: `spawn --window` opens a Terminal or iTerm window attached to the session on a Mac, tested
   on one.
+- [ ] **MAR-95: Goal 2: Launcher: join and first task without harness hooks.** Josh, 2026-11-17: "We
+  also need a method that does not use the hooks". Upstream's `marshal-launch` (ignition-is-go/marshal
+  #179/#180) proves a launched agent joined by the roster row its *hooks* register, and delivers the first
+  task through the hook waiter (`claude-hook wait`). An agent whose harness has no hooks, or that runs
+  without them, can't be launched that way. Options to weigh: registration by the agent's MCP shim (it
+  already registers a session when its MCP server starts, carrying `MARSHAL_AGENT_ID`), a row the
+  launcher registers for the agent, and delivery through the MCP server or channels rather than the
+  waiter. Done when: a design note picks one, and `marshal-launch` joins and hands a first task to an
+  agent with no hooks configured, tested end to end. Not to be PR'd upstream until Josh says.
 
 ## Goal 3: Message an agent from a terminal
 
