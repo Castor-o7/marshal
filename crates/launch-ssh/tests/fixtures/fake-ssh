@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stands in for `ssh` in the adapter's tests: runs the remote command here.
+# The adapter calls `<ssh> -o ... -o ... -- <dest> 'bash -l -s'`; this runs
+# `bash -s` (no -l, so the test's PATH survives /etc/profile) with the
+# script on stdin. FAKE_SSH_UNREACHABLE=1 exits 255, as ssh does when the
+# host can't be reached.
+[ "${FAKE_SSH_UNREACHABLE:-}" = 1 ] && { echo "ssh: connect to host: No route to host" >&2; exit 255; }
+exec bash -s
