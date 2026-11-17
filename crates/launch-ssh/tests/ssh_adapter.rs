@@ -712,17 +712,21 @@ fn check_passes_a1s_layout() {
 /// unquoted `=word` to a command path (EQUALS), so `-t =<name>` breaks there.
 /// This runs the adapter's scripts through `zsh -c` (as sshd would) with zsh
 /// as the login shell, on a live session.
+///
+/// Ignored by default so a machine without zsh or tmux can't count it as a
+/// pass; run it with `--ignored`, and it fails if either is missing.
 #[test]
+#[ignore = "needs zsh and tmux; run with --ignored"]
 fn status_stop_and_attach_work_when_the_login_shell_is_zsh() {
     let zsh = which("zsh");
-    if zsh.is_empty() {
-        eprintln!("skipping: no zsh on this machine, so the zsh login-shell case can't run");
-        return;
-    }
-    if !have_tmux() {
-        eprintln!("skipping: no tmux");
-        return;
-    }
+    assert!(
+        !zsh.is_empty(),
+        "no zsh on this machine, so the zsh login-shell case can't run"
+    );
+    assert!(
+        have_tmux(),
+        "no tmux on this machine, so the zsh login-shell case can't run"
+    );
     let e = Env::new();
     let shell = [
         ("SHELL", zsh.as_str()),
