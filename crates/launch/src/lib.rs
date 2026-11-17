@@ -148,10 +148,13 @@ pub fn harness_argv(harness: &str) -> Result<Vec<String>> {
 /// `MARSHAL_BASE_URL` is the daemon's hook listener when it isn't on port 6156 of
 /// the launch address's host. It travels with the launch address, and a
 /// non-local adapter is refused a loopback one ([`address::check_hook_base_for_adapter`]).
+/// `RUST_LOG`, set only when the launcher's caller sets it, is the agent's shim log
+/// level, so a launch that never joins can show the shim's connect errors.
 const PASSED_ENV: &[&str] = &[
     "MARSHAL_OPERATOR",
     "MARSHAL_WAITER_LOCK_WAIT_SECS",
     "MARSHAL_BASE_URL",
+    "RUST_LOG",
 ];
 
 /// Settings that only mean something on this machine, passed to the local
@@ -378,6 +381,14 @@ mod tests {
         };
         let id = new_agent_id();
         let env = launch_env(get, false, "ws://marshal.mesh:6155", &id);
+        // RUST_LOG goes only when it is set.
+        assert!(!env.contains_key("RUST_LOG"));
+        let with_log = |k: &str| match k {
+            "RUST_LOG" => Some("marshal_shim=debug".to_string()),
+            _ => get(k),
+        };
+        let logged = launch_env(with_log, false, "ws://marshal.mesh:6155", &id);
+        assert_eq!(logged["RUST_LOG"], "marshal_shim=debug");
         assert_eq!(
             env.keys().map(String::as_str).collect::<Vec<_>>(),
             [
