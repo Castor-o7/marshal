@@ -21,3 +21,11 @@ the session itself is left.
 
 To re-record for a newer Claude Code, run the same two deliveries in a fresh
 kit session and scrub the same way.
+
+`transcript-tool-result.jsonl` is one more record, from MAR-82's check 5
+session (also disposable, kit wiring only): the `user` record Claude Code
+wrote for a Bash tool result whose output was an inbox block, from `cat` of
+a file holding one. The block sits in `message.content[].tool_result` and in
+`toolUseResult.stdout`. It's scrubbed the same way. The matcher must not
+count it as delivery.
+
