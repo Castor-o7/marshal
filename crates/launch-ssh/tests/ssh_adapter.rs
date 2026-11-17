@@ -840,3 +840,98 @@ fn the_token_file_is_read_on_the_target_and_never_carried() {
             .success()
     );
 }
+
+/// a1 after run 2: the user's own Claude wiring (~/.claude.json and
+/// ~/.claude/settings.json) runs a second marshal-shim for live Marshal, and
+/// Claude merges user hooks with the folder's. Without --claude-config-dir,
+/// check refuses the two shims and points at the option. With it, Claude's
+/// user config comes from that dir (here empty), so only the folder's wiring
+/// counts and check passes.
+#[test]
+fn claude_config_dir_keeps_the_users_own_wiring_out() {
+    if !have_json_reader() {
+        eprintln!("skipping: neither python3 nor jq");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    e.bin("claude", "echo '[]'");
+    let shim = |dir: &str| {
+        let d = e.path(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("marshal-shim");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho 'marshal-shim {}'\n",
+                marshal_launch_ssh::VERSION
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.display().to_string()
+    };
+    let live = shim("home/.local/bin");
+    let test = shim("a1-test/bin");
+    let hooks = |exe: &str| {
+        let h =
+            |verb: &str| format!(r#"{{"type": "command", "command": "{exe} claude-hook {verb}"}}"#);
+        format!(
+            r#"{{"hooks": {{
+              "SessionStart": [{{"hooks": [{}, {}]}}],
+              "UserPromptSubmit": [{{"hooks": [{}]}}],
+              "Stop": [{{"hooks": [{}]}}]}}}}"#,
+            h("session-start"),
+            h("wait"),
+            h("prompt-submit"),
+            h("wait")
+        )
+    };
+    let server = |exe: &str| format!(r#"{{"mcpServers": {{"marshal": {{"command": "{exe}"}}}}}}"#);
+    // The user's own wiring, for live Marshal.
+    std::fs::write(e.path("home/.claude.json"), server(&live)).unwrap();
+    std::fs::create_dir_all(e.path("home/.claude")).unwrap();
+    std::fs::write(e.path("home/.claude/settings.json"), hooks(&live)).unwrap();
+    // The test folder's wiring.
+    let work = e.path("work");
+    std::fs::write(work.join(".mcp.json"), server(&test)).unwrap();
+    std::fs::create_dir_all(work.join(".claude")).unwrap();
+    std::fs::write(work.join(".claude/settings.json"), hooks(&test)).unwrap();
+    // The launch's own Claude config dir: nothing marshal in it.
+    let ccd = e.path("a1-test/claude");
+    std::fs::create_dir_all(&ccd).unwrap();
+    std::fs::write(ccd.join(".claude.json"), "{}").unwrap();
+
+    let mut req = e.request(&["claude"]);
+    let without = stderr(&e.run("check", &req, &[]));
+    assert!(without.contains("more than one marshal-shim"), "{without}");
+    assert!(
+        without.contains(&live) && without.contains(&test),
+        "{without}"
+    );
+    assert!(without.contains("--claude-config-dir"), "{without}");
+
+    req["options"] = json!([
+        "--host",
+        "target-1",
+        "--claude-config-dir",
+        ccd.display().to_string()
+    ]);
+    let with = stderr(&e.run("check", &req, &[]));
+    // Only the ports fail here (marshal.invalid doesn't resolve).
+    assert!(with.contains("can't reach the daemon at"), "{with}");
+    for not in ["Claude", "more than one", "fixed to", "isn't there"] {
+        assert!(!with.contains(not), "`{not}` in:\n{with}");
+    }
+
+    // Its own config dir without the folder's wiring names that dir.
+    std::fs::remove_file(work.join(".mcp.json")).unwrap();
+    let bare = stderr(&e.run("check", &req, &[]));
+    assert!(
+        bare.contains(&format!(
+            "{}/.claude.json (--claude-config-dir)",
+            ccd.display()
+        )),
+        "{bare}"
+    );
+}

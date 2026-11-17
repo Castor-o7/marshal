@@ -111,6 +111,10 @@ pub struct Target {
     /// token. The agent's shell reads it there into CLAUDE_CODE_OAUTH_TOKEN,
     /// so the token never leaves the target or enters a request or log.
     pub token_file: Option<String>,
+    /// `--claude-config-dir`: Claude's CLAUDE_CONFIG_DIR on the target. Claude
+    /// then reads its user config there (`.claude.json`, `settings.json`,
+    /// plugins), not from `~/.claude.json` and `~/.claude`.
+    pub claude_config_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +143,7 @@ impl Target {
             xdg,
             tmux,
             token_file,
+            claude_config_dir,
         } = parse_options(&req.options)?;
         validate_name(&req.name)?;
         if req.argv.is_empty() {
@@ -182,6 +187,7 @@ impl Target {
             xdg,
             tmux,
             token_file,
+            claude_config_dir,
         })
     }
 }
@@ -197,14 +203,17 @@ pub struct Options {
     pub tmux: Option<String>,
     /// `--oauth-token-file <absolute path>`.
     pub token_file: Option<String>,
+    /// `--claude-config-dir <absolute path>`.
+    pub claude_config_dir: Option<String>,
 }
 
 const OPTIONS_USAGE: &str = "the ssh adapter takes --host <destination>, --xdg-config-home <path>, \
-     --tmux <path> and --oauth-token-file <path>";
+     --tmux <path>, --oauth-token-file <path> and --claude-config-dir <path>";
 
 /// Read the adapter options: `--name value` or `--name=value`.
 pub fn parse_options(options: &[String]) -> Result<Options> {
-    let (mut host, mut xdg, mut tmux, mut token_file) = (None, None, None, None);
+    let (mut host, mut xdg, mut tmux, mut token_file, mut claude_config_dir) =
+        (None, None, None, None, None);
     let mut it = options.iter();
     while let Some(o) = it.next() {
         let (name, inline) = match o.split_once('=') {
@@ -216,6 +225,7 @@ pub fn parse_options(options: &[String]) -> Result<Options> {
             "--xdg-config-home" => &mut xdg,
             "--tmux" => &mut tmux,
             "--oauth-token-file" => &mut token_file,
+            "--claude-config-dir" => &mut claude_config_dir,
             _ => bail!("unknown option `{o}` ({OPTIONS_USAGE})"),
         };
         let value = match inline {
@@ -233,6 +243,7 @@ pub fn parse_options(options: &[String]) -> Result<Options> {
         ("--xdg-config-home", &xdg),
         ("--tmux", &tmux),
         ("--oauth-token-file", &token_file),
+        ("--claude-config-dir", &claude_config_dir),
     ] {
         if let Some(v) = v {
             validate_target_path(name, v)?;
@@ -243,6 +254,7 @@ pub fn parse_options(options: &[String]) -> Result<Options> {
         xdg,
         tmux,
         token_file,
+        claude_config_dir,
     })
 }
 
@@ -458,9 +470,20 @@ claude_facts() {
     say "no-json-reader"
     return 0
   fi
+  # With --claude-config-dir, Claude's user config is there and ~/.claude.json
+  # and ~/.claude aren't read (CLAUDE_CONFIG_DIR).
+  if [ -n "$req_ccd" ]; then
+    user_settings=$req_ccd/settings.json; user_json=$req_ccd/.claude.json; user_where=$req_ccd/.claude.json
+  else
+    user_settings=$HOME/.claude/settings.json; user_json=$HOME/.claude.json; user_where="~/.claude.json"
+  fi
   if command -v claude >/dev/null 2>&1; then
     list=$(mktemp)
-    claude plugin list --json > "$list" 2>/dev/null
+    if [ -n "$req_ccd" ]; then
+      CLAUDE_CONFIG_DIR=$req_ccd claude plugin list --json > "$list" 2>/dev/null
+    else
+      claude plugin list --json > "$list" 2>/dev/null
+    fi
     jfacts plugins "$list" | while IFS="$tab" read -r state p; do
       printf '@@claude-plugin %s\t%s\n' "$state" "$p"
       if [ "$state" = enabled ]; then
@@ -470,12 +493,12 @@ claude_facts() {
     done
     rm -f "$list"
   fi
-  for f in "$HOME/.claude/settings.json" "$cwd/.claude/settings.json" \
+  for f in "$user_settings" "$cwd/.claude/settings.json" \
            "$cwd/.claude/settings.local.json" /etc/claude-code/managed-settings.json; do
     hook_facts "$f" "$f"
   done
-  mcp_facts mcpServers user "~/.claude.json" "$HOME/.claude.json"
-  mcp_facts local local "~/.claude.json for $cwd" "$HOME/.claude.json"
+  mcp_facts mcpServers user "$user_where" "$user_json"
+  mcp_facts local local "$user_where for $cwd" "$user_json"
   mcp_facts mcpServers project "$cwd/.mcp.json" "$cwd/.mcp.json"
 }
 claude_wiring() {
@@ -500,7 +523,7 @@ claude_wiring() {
 /// The `check` script: reports each probe, starts nothing.
 pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
     let mut s = format!(
-        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\nreq_xdg={}\nreq_base={}\ntoken_file={}\n",
+        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\nreq_xdg={}\nreq_base={}\ntoken_file={}\nreq_ccd={}\n",
         sq(&t.daemon.host),
         t.daemon.port,
         sq(&t.hook.host),
@@ -520,6 +543,7 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
             .map(String::as_str)
             .unwrap_or("")),
         sq(t.token_file.as_deref().unwrap_or("")),
+        sq(t.claude_config_dir.as_deref().unwrap_or("")),
     );
     s.push_str(&script_head(t.tmux.as_deref()));
     s.push_str(PRELUDE);
@@ -883,10 +907,14 @@ impl Probe {
 
         let mut f = Vec::new();
         let servers = self.effective_mcp();
+        let user_json = match &t.claude_config_dir {
+            Some(d) => format!("{d}/.claude.json (--claude-config-dir)"),
+            None => "~/.claude.json".into(),
+        };
         if servers.is_empty() {
             f.push(format!(
                 "Claude on {host} has no MCP server that runs marshal-shim: none in the \
-                 marshal-shim plugin, ~/.claude.json or the folder's .mcp.json{why}"
+                 marshal-shim plugin, {user_json} or the folder's .mcp.json{why}"
             ));
         }
         for m in &servers {
@@ -948,8 +976,15 @@ impl Probe {
             let each: Vec<String> = found.iter().map(|(p, v)| format!("{p} ({v})")).collect();
             f.push(format!(
                 "Claude's marshal wiring on {host} runs more than one marshal-shim: {}. Its \
-                 hooks and MCP server must run the same one; name it by path in each",
-                each.join(", ")
+                 hooks and MCP server must run the same one; name it by path in each. {}",
+                each.join(", "),
+                match &t.claude_config_dir {
+                    Some(d) =>
+                        format!("Claude's user config was read from {d} (--claude-config-dir)"),
+                    None => "Claude's user config was read from ~/.claude.json and ~/.claude; \
+                             --claude-config-dir <dir> gives the agent its own"
+                        .into(),
+                }
             ));
         }
         f
@@ -1023,6 +1058,9 @@ pub fn launch_script(t: &Target, req: &LaunchRequest) -> String {
     }
     if let Some(x) = &t.xdg {
         inner.push_str(&format!("export XDG_CONFIG_HOME={}\n", sq(x)));
+    }
+    if let Some(d) = &t.claude_config_dir {
+        inner.push_str(&format!("export CLAUDE_CONFIG_DIR={}\n", sq(d)));
     }
     // Read on the target when the agent starts: the script, the tmux command
     // and the request carry only the path.
@@ -1363,8 +1401,17 @@ mod tests {
                 xdg: Some("/Users/j/x".into()),
                 tmux: Some("/opt/homebrew/bin/tmux".into()),
                 token_file: None,
+                claude_config_dir: None,
             }
         );
+        assert_eq!(
+            o(&["--host", "a1", "--claude-config-dir=/Users/j/cc"])
+                .unwrap()
+                .claude_config_dir
+                .as_deref(),
+            Some("/Users/j/cc")
+        );
+        assert!(o(&["--host", "a1", "--claude-config-dir", "~/cc"]).is_err());
         assert_eq!(
             o(&["--host", "a1", "--oauth-token-file=/Users/j/t"])
                 .unwrap()
@@ -1419,6 +1466,19 @@ mod tests {
         assert!(s.contains("inner=\"export PATH=$(q \"$PATH\")"), "{s}");
         let c = check_script(&t, &r);
         assert!(c.contains("req_xdg='/Users/j/xdg'"), "{c}");
+        assert!(c.contains("req_ccd=''"), "{c}");
+        assert!(!inner.contains("CLAUDE_CONFIG_DIR"), "{inner}");
+
+        r.options
+            .extend(["--claude-config-dir".into(), "/Users/j/cc".into()]);
+        let t = Target::from_request(&r).unwrap();
+        let s = launch_script(&t, &r);
+        let inner = &s[s.find("inner=").unwrap()..];
+        assert!(
+            inner.contains("CLAUDE_CONFIG_DIR='\"'\"'/Users/j/cc"),
+            "{inner}"
+        );
+        assert!(check_script(&t, &r).contains("req_ccd='/Users/j/cc'"));
     }
 
     #[test]
