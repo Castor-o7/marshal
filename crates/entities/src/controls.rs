@@ -3,17 +3,18 @@
 //!
 //! With a list set, only sessions on a named machine may send messages. The
 //! daemon reads the list from `allowed-senders` in its state directory and
-//! sets it here; no list, or an empty one, means everyone may send, which is
-//! upstream's behaviour.
+//! sets it here. No list means everyone may send, which is upstream's
+//! behaviour; a list with no names in it means no one may.
 
 use std::sync::RwLock;
 
 static ALLOWED_SENDERS: RwLock<Option<Vec<String>>> = RwLock::new(None);
 
-/// Set the machines that may send, or `None` for everyone.
+/// Set the machines that may send, or `None` for everyone. An empty list
+/// refuses everyone: the operator wrote a list and named no one in it, and a
+/// file caught mid-rewrite must not open sending to all.
 pub fn set_allowed_senders(machines: Option<Vec<String>>) {
-    *ALLOWED_SENDERS.write().unwrap_or_else(|e| e.into_inner()) =
-        machines.filter(|list| !list.is_empty());
+    *ALLOWED_SENDERS.write().unwrap_or_else(|e| e.into_inner()) = machines;
 }
 
 /// Whether a session on `machine` may send. A session with no machine is
@@ -44,13 +45,25 @@ mod tests {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn no_list_or_an_empty_one_lets_everyone_send() {
+    fn no_list_lets_everyone_send() {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         set_allowed_senders(None);
         assert!(sender_allowed(Some("anyone")).is_ok());
         assert!(sender_allowed(None).is_ok());
+    }
+
+    #[test]
+    fn an_empty_list_lets_no_one_send() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         set_allowed_senders(Some(vec![]));
-        assert!(sender_allowed(None).is_ok(), "an empty list is no list");
+        assert!(
+            sender_allowed(Some("murph"))
+                .unwrap_err()
+                .contains("doesn't allow messages from this machine (murph)"),
+            "an empty list let a machine send"
+        );
+        assert!(sender_allowed(None).is_err());
+        set_allowed_senders(None);
     }
 
     #[test]

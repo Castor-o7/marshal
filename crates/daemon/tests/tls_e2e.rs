@@ -355,6 +355,16 @@ async fn ws_with_token(
         .map(|(ws, _)| ws)
 }
 
+/// The HTTP status a refused upgrade got, or `None` if it wasn't refused that way.
+fn refused_with(result: Result<TlsWs, tokio_tungstenite::tungstenite::Error>) -> Option<u16> {
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Some(response.status().as_u16())
+        }
+        _ => None,
+    }
+}
+
 /// Whether `ws` closes within `wait`.
 async fn closes_within(ws: &mut TlsWs, wait: Duration) -> bool {
     tokio::time::timeout(wait, async {
@@ -385,8 +395,9 @@ async fn unpairing_or_repairing_a_machine_cuts_its_open_connection() {
     let mut old = ws_with_token(&daemon, &first)
         .await
         .expect("the paired token connects");
-    assert!(
-        ws_with_token(&daemon, "not-a-token").await.is_err(),
+    assert_eq!(
+        refused_with(ws_with_token(&daemon, "not-a-token").await),
+        Some(401),
         "a made-up token connected"
     );
 
@@ -400,8 +411,9 @@ async fn unpairing_or_repairing_a_machine_cuts_its_open_connection() {
         closes_within(&mut old, Duration::from_secs(5)).await,
         "re-pairing left the old token connected"
     );
-    assert!(
-        ws_with_token(&daemon, &first).await.is_err(),
+    assert_eq!(
+        refused_with(ws_with_token(&daemon, &first).await),
+        Some(401),
         "the old token still connects"
     );
     let mut current = ws_with_token(&daemon, &second)
@@ -414,8 +426,9 @@ async fn unpairing_or_repairing_a_machine_cuts_its_open_connection() {
         closes_within(&mut current, Duration::from_secs(5)).await,
         "unpair left the connection open"
     );
-    assert!(
-        ws_with_token(&daemon, &second).await.is_err(),
+    assert_eq!(
+        refused_with(ws_with_token(&daemon, &second).await),
+        Some(401),
         "an unpaired token still connects"
     );
 }
@@ -449,13 +462,20 @@ async fn a_per_peer_connection_cap_closes_the_second_connection() {
     );
     drop(first);
     // The place frees when the first ends; myko's side may take a moment.
-    let mut again = Err(());
+    let mut again = None;
+    let mut last_error = None;
     for _ in 0..20 {
-        if let Ok(ws) = ws_with_token(&daemon, &local_token).await {
-            again = Ok(ws);
-            break;
+        match ws_with_token(&daemon, &local_token).await {
+            Ok(ws) => {
+                again = Some(ws);
+                break;
+            }
+            Err(e) => last_error = Some(e),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(again.is_ok(), "the freed place wasn't a place again");
+    assert!(
+        again.is_some(),
+        "the freed place wasn't a place again; the last try: {last_error:?}"
+    );
 }
