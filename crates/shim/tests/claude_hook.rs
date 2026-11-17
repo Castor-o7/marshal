@@ -877,3 +877,224 @@ fn with_no_marker_a_hook_doesnt_ask_about_offers() {
             .any(|s| s.request_line.starts_with("POST /hook/offers"))
     );
 }
+
+// ---- MAR-84: Codex's hook, offered then confirmed from its rollout file ----
+
+/// As `routed_listener`, but `/hook/prompt-submit` (the Codex hook's inbox
+/// endpoint) gets `inbox` and the ack header naming `ids`.
+fn prompt_listener(
+    count: usize,
+    inbox: &'static str,
+    ids: &'static [&'static str],
+) -> (String, mpsc::Receiver<Seen>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for _ in 0..count {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let ids_json = serde_json::to_string(ids).unwrap();
+            let (headers, reply) = if request_line.starts_with("POST /hook/prompt-submit") {
+                (
+                    format!("X-Marshal-Ack-V1: {ids_json}\r\n"),
+                    inbox.to_string(),
+                )
+            } else if request_line.starts_with("POST /hook/offers") {
+                (String::new(), ids_json)
+            } else {
+                (String::new(), String::new())
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = tx.send(Seen {
+                request_line: request_line.trim_end().to_string(),
+                body: String::from_utf8(body).unwrap(),
+            });
+        }
+    });
+    (base, rx)
+}
+
+/// The Codex tests' own session id, so a Claude test's marker can't be read
+/// as theirs.
+const CODEX_SESSION: &str = "itest-codex";
+
+fn codex_marker(config: &std::path::Path) -> std::path::PathBuf {
+    config
+        .join("marshal")
+        .join(format!("offered-{CODEX_SESSION}"))
+}
+
+fn run_codex_prompt_submit(
+    base: &str,
+    config: &std::path::Path,
+    transcript: Option<&std::path::Path>,
+) {
+    let input = serde_json::json!({
+        "session_id": CODEX_SESSION,
+        "turn_id": "turn-1",
+        "transcript_path": transcript,
+        "cwd": "/tmp/proj",
+        "hook_event_name": "UserPromptSubmit",
+        "model": "gpt-5",
+        "permission_mode": "default",
+        "prompt": "go",
+    })
+    .to_string();
+    let mut child = support::shim(support::shared_home())
+        .args(["codex-hook", "prompt-submit"])
+        .env("MARSHAL_BASE_URL", base)
+        .env("XDG_CONFIG_HOME", config)
+        .env("APPDATA", config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn marshal-shim codex-hook prompt-submit");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+}
+
+/// A Codex rollout: the inbox block for `OFFERED_ID` as a developer
+/// `response_item`, then `after` (constructed, from Codex's source at
+/// `rust-v0.163.0`; see `transcript.rs`).
+fn rollout_with(dir: &std::path::Path, after: &[serde_json::Value]) -> std::path::PathBuf {
+    let inbox = format!(
+        "<marshal_inbox count=\"1\" ids=\"{OFFERED_ID}\">\n- from peer: hi\n</marshal_inbox>"
+    );
+    let mut lines = vec![serde_json::json!({
+        "timestamp": "t", "type": "response_item",
+        "payload": { "type": "message", "role": "developer",
+                     "content": [{ "type": "input_text", "text": inbox }] }
+    })];
+    lines.extend(after.iter().cloned());
+    let path = dir.join("rollout.jsonl");
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+fn assistant_line() -> serde_json::Value {
+    serde_json::json!({
+        "timestamp": "t", "type": "response_item",
+        "payload": { "type": "message", "role": "assistant",
+                     "content": [{ "type": "output_text", "text": "ok" }] }
+    })
+}
+
+#[test]
+fn a_codex_hook_with_a_rollout_acks_its_mail_offered() {
+    let inbox = "<marshal_inbox count=\"1\">\n- from peer: hi\n</marshal_inbox>\n";
+    let (base, seen) = prompt_listener(2, inbox, &[OFFERED_ID]);
+    let config = temp_config("codex-offered");
+    let rollout = rollout_with(&config, &[]);
+
+    run_codex_prompt_submit(&base, &config, Some(&rollout));
+
+    let seen = requests(&seen);
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("an ack");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert_eq!(ack["phase"], "offered", "{ack}");
+    assert!(codex_marker(&config).exists());
+}
+
+#[test]
+fn a_codex_hook_with_no_rollout_reads_at_once_and_says_so() {
+    let inbox = "<marshal_inbox count=\"1\">\n- from peer: hi\n</marshal_inbox>\n";
+    let (base, seen) = prompt_listener(2, inbox, &[OFFERED_ID]);
+    let config = temp_config("codex-no-rollout");
+
+    run_codex_prompt_submit(&base, &config, None);
+
+    let seen = requests(&seen);
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("an ack");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert!(ack.get("phase").is_none(), "{ack}");
+    assert_eq!(ack["rollout"], false, "{ack}");
+    assert!(!codex_marker(&config).exists());
+}
+
+#[test]
+fn a_codex_hook_confirms_mail_the_model_answered_after() {
+    let (base, seen) = prompt_listener(3, "", &[OFFERED_ID]);
+    let config = temp_config("codex-confirm");
+    std::fs::create_dir_all(config.join("marshal")).unwrap();
+    std::fs::write(codex_marker(&config), "").unwrap();
+    let rollout = rollout_with(&config, &[assistant_line()]);
+
+    run_codex_prompt_submit(&base, &config, Some(&rollout));
+
+    let seen = requests(&seen);
+    assert!(
+        seen.iter()
+            .any(|s| s.request_line.starts_with("POST /hook/offers"))
+    );
+    let ack = seen
+        .iter()
+        .find(|s| s.request_line.starts_with("POST /hook/ack"))
+        .expect("a seen ack");
+    let ack: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    assert_eq!(ack["message_ids"][0], OFFERED_ID);
+    assert!(ack.get("phase").is_none(), "{ack}");
+}
+
+#[test]
+fn a_codex_turn_that_stopped_before_the_model_isnt_confirmed() {
+    // The context is in the rollout, but no model output follows it.
+    let (base, seen) = prompt_listener(2, "", &[OFFERED_ID]);
+    let config = temp_config("codex-stopped");
+    std::fs::create_dir_all(config.join("marshal")).unwrap();
+    std::fs::write(codex_marker(&config), "").unwrap();
+    let rollout = rollout_with(&config, &[]);
+
+    run_codex_prompt_submit(&base, &config, Some(&rollout));
+
+    let seen = requests(&seen);
+    assert!(
+        seen.iter()
+            .any(|s| s.request_line.starts_with("POST /hook/offers"))
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|s| s.request_line.starts_with("POST /hook/ack")),
+        "confirmed a turn the model never ran"
+    );
+}

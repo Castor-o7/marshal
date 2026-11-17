@@ -21,6 +21,7 @@
 //! offered again after the daemon's offer timeout. It can only confirm too
 //! little, never too much.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -126,6 +127,133 @@ fn tag_ids(text: &str) -> Vec<String> {
     }
     ids
 }
+
+/// Which of `ids` a Codex rollout file (`transcript_path` in Codex's hook
+/// input, MAR-84) shows the model received. Codex records a hook's
+/// `additionalContext` as a developer `response_item` *before* it samples,
+/// and records it even when the turn then stops, so that line alone proves
+/// nothing (docs/codex-two-phase-delivery.md, from Codex's source at
+/// `rust-v0.163.0`). An id counts only when model output (an `assistant`
+/// message, `reasoning` or a `function_call`) comes after its developer line,
+/// in file order. Output before it, from an earlier turn, doesn't count. Only
+/// this file is read: a rollout resumed from another isn't followed.
+pub fn seen_codex(rollout: &Path, ids: &[String]) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    match read_tail(rollout) {
+        Some(text) => codex_seen_in(&text, ids),
+        None => Vec::new(),
+    }
+}
+
+/// `seen_codex` over rollout text already read.
+///
+/// Model output after a developer line can still be from the sampling that
+/// line arrived *during*. Codex records each `function_call` as the stream
+/// yields it and runs tools eagerly, so a `PostToolUse` hook's context can be
+/// recorded between two calls of one sampling. Their outputs are recorded
+/// only after that stream ends (`rust-v0.163.0`: `stream_events_utils.rs`,
+/// `tools/parallel.rs`, `drain_in_flight`). So a developer line remembers the
+/// calls still open when it was recorded, and its ids count only once each of
+/// those has an output and model output follows: that output is a new
+/// sampling, with the context in its input. A `UserPromptSubmit` line comes
+/// with no calls open, so the next model output is enough. Compaction clears
+/// whatever is waiting: the context may not survive it verbatim, so that
+/// mail stays offered (fail safe).
+pub fn codex_seen_in(text: &str, ids: &[String]) -> Vec<String> {
+    struct Waiting {
+        id: String,
+        open_then: HashSet<String>,
+    }
+    let mut open: HashSet<String> = HashSet::new();
+    let mut waiting: Vec<Waiting> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match record.get("type").and_then(|t| t.as_str()) {
+            Some("compacted") => {
+                waiting.clear();
+                continue;
+            }
+            Some("response_item") => {}
+            _ => continue,
+        }
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+        let kind = payload
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        let role = payload.get("role").and_then(|r| r.as_str());
+        let call_id = payload.get("call_id").and_then(|c| c.as_str());
+        if kind == "message" && role == Some("developer") {
+            if !line.contains("marshal_inbox") {
+                continue;
+            }
+            let mut named = Vec::new();
+            if let Some(content) = payload.get("content") {
+                walk_text(content, &mut |text| named.extend(tag_ids(text)));
+            }
+            for id in named {
+                if ids.contains(&id) && !found.contains(&id) && !waiting.iter().any(|w| w.id == id)
+                {
+                    waiting.push(Waiting {
+                        id,
+                        open_then: open.clone(),
+                    });
+                }
+            }
+        } else if matches!(
+            kind,
+            "compaction" | "context_compaction" | "compaction_trigger"
+        ) {
+            waiting.clear();
+        } else if kind.ends_with("_output") {
+            if let Some(call) = call_id {
+                open.remove(call);
+                for w in &mut waiting {
+                    w.open_then.remove(call);
+                }
+            }
+        } else if (kind == "message" && role == Some("assistant"))
+            || matches!(kind, "agent_message" | "reasoning")
+            || kind.ends_with("_call")
+        {
+            // Model output: confirms what was waiting on no open call, before
+            // this item's own call (if it opens one) is counted.
+            let (ready, still): (Vec<Waiting>, Vec<Waiting>) =
+                waiting.into_iter().partition(|w| w.open_then.is_empty());
+            waiting = still;
+            found.extend(ready.into_iter().map(|w| w.id));
+            if CLIENT_CALLS.contains(&kind)
+                && let Some(call) = call_id
+            {
+                open.insert(call.to_string());
+            }
+            if found.len() == ids.len() {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Call items Codex itself runs and records an output for (`*_output` with
+/// the same `call_id`). Server-side calls (`web_search_call`,
+/// `image_generation_call`) have no output and don't hold anything back.
+/// `local_shell_call` and `tool_search_call` may have a null `call_id`; such a
+/// call opens nothing, so a line recorded after it falls back to the plain
+/// rule (the next model output confirms it).
+const CLIENT_CALLS: &[&str] = &[
+    "function_call",
+    "custom_tool_call",
+    "local_shell_call",
+    "tool_search_call",
+];
 
 /// The last `TAIL_BYTES` of the file, from the first whole line on.
 fn read_tail(path: &Path) -> Option<String> {
@@ -294,7 +422,10 @@ mod tests {
     #[test]
     fn a_recorded_tool_result_holding_an_inbox_block_is_not_delivery() {
         let line = RECORDED_TOOL_RESULT.trim().replace("{ID}", A);
-        assert!(line.contains(&format!(r#"ids=\"{A}\""#)), "fixture names the id");
+        assert!(
+            line.contains(&format!(r#"ids=\"{A}\""#)),
+            "fixture names the id"
+        );
         assert!(seen_in(&line, &ids(&[A])).is_empty(), "{line}");
     }
 
@@ -342,6 +473,163 @@ mod tests {
         .unwrap();
         let line = format!(r#"{{"type":"user","message":{{"role":"user","content":{inbox}}}}}"#);
         assert_eq!(seen_in(&line, &ids(&[A, B])), ids(&[B]));
+    }
+
+    // ---- Codex rollout records (MAR-84). Constructed from Codex's source at
+    // `rust-v0.163.0` (`history/src/lib.rs` RolloutLine, `rollout_payload.rs`,
+    // `protocol/src/models.rs` ResponseItem); not yet recorded from a live
+    // Codex (pending one on Murph).
+
+    fn codex_developer(id: &str) -> String {
+        let text = serde_json::to_string(&format!(
+            "<marshal_inbox count=\"1\" ids=\"{id}\">\n- from x [response_required=false]: hi\n</marshal_inbox>"
+        ))
+        .unwrap();
+        format!(
+            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"message","role":"developer","content":[{{"type":"input_text","text":{text}}}]}}}}"#
+        )
+    }
+
+    const CODEX_ASSISTANT: &str = r#"{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#;
+    const CODEX_REASONING: &str =
+        r#"{"timestamp":"t","type":"response_item","payload":{"type":"reasoning","summary":[]}}"#;
+    const CODEX_CALL: &str = r#"{"timestamp":"t","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c"}}"#;
+    const CODEX_USER: &str = r#"{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}}"#;
+    const CODEX_META: &str = r#"{"timestamp":"t","type":"session_meta","payload":{"id":"s"}}"#;
+
+    #[test]
+    fn codex_context_followed_by_model_output_is_seen() {
+        for output in [CODEX_ASSISTANT, CODEX_REASONING, CODEX_CALL] {
+            let text = [CODEX_META, CODEX_USER, &codex_developer(A), output].join("\n");
+            assert_eq!(codex_seen_in(&text, &ids(&[A])), ids(&[A]), "{output}");
+        }
+    }
+
+    #[test]
+    fn codex_context_with_no_output_after_it_is_not_seen() {
+        // Recorded before sampling, and recorded when the turn then stops.
+        let text = [CODEX_USER, &codex_developer(A)].join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_output_before_the_context_proves_nothing() {
+        // An earlier turn's output, in file order before the developer line.
+        let text = [
+            CODEX_ASSISTANT,
+            CODEX_REASONING,
+            CODEX_USER,
+            &codex_developer(A),
+        ]
+        .join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_tool_output_holding_an_inbox_block_is_not_context() {
+        // A function_call_output whose output is an inbox block, then output.
+        let block =
+            serde_json::to_string(&format!("<marshal_inbox count=\"1\" ids=\"{A}\">")).unwrap();
+        let tool = format!(
+            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"function_call_output","call_id":"c","output":{block}}}}}"#
+        );
+        let text = [tool.as_str(), CODEX_ASSISTANT].join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_a_later_turn_confirms_what_an_earlier_stopped_turn_recorded() {
+        // The first turn stopped before sampling; the next one's output comes
+        // with that context still in history.
+        let text = [
+            &codex_developer(A),
+            CODEX_USER,
+            &codex_developer(B),
+            CODEX_ASSISTANT,
+        ]
+        .join("\n");
+        assert_eq!(codex_seen_in(&text, &ids(&[A, B])), ids(&[A, B]));
+    }
+
+    fn codex_call(id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{{}}","call_id":"{id}"}}}}"#
+        )
+    }
+
+    fn codex_output(id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"function_call_output","call_id":"{id}","output":"ok"}}}}"#
+        )
+    }
+
+    #[test]
+    fn codex_output_from_the_same_sampling_as_a_post_tool_use_line_doesnt_count() {
+        // Two calls in one sampling: X runs and its PostToolUse delivers mail
+        // (D) while the stream goes on to Y. Y comes after D but is the same
+        // sampling, so D isn't seen until both outputs are in and the next
+        // sampling produces output.
+        let d = codex_developer(A);
+        let held = [codex_call("x"), d.clone(), codex_call("y")].join("\n");
+        assert!(codex_seen_in(&held, &ids(&[A])).is_empty(), "same sampling");
+        let outputs_in = [held.clone(), codex_output("x"), codex_output("y")].join("\n");
+        assert!(
+            codex_seen_in(&outputs_in, &ids(&[A])).is_empty(),
+            "no new sampling yet"
+        );
+        let next = [outputs_in, CODEX_REASONING.to_string()].join("\n");
+        assert_eq!(
+            codex_seen_in(&next, &ids(&[A])),
+            ids(&[A]),
+            "the next sampling"
+        );
+    }
+
+    #[test]
+    fn codex_a_trailing_reasoning_item_in_the_same_sampling_doesnt_count() {
+        let text = [
+            codex_call("x"),
+            codex_developer(A),
+            CODEX_REASONING.to_string(),
+        ]
+        .join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_a_call_with_no_output_keeps_the_mail_offered() {
+        // Codex died before recording X's output: never confirmed.
+        let text = [
+            codex_call("x"),
+            codex_developer(A),
+            CODEX_ASSISTANT.to_string(),
+        ]
+        .join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn codex_compaction_clears_what_was_waiting() {
+        let compacted = r#"{"timestamp":"t","type":"compacted","payload":{"message":"summary"}}"#;
+        let text = [
+            codex_developer(A),
+            compacted.to_string(),
+            CODEX_ASSISTANT.to_string(),
+        ]
+        .join("\n");
+        assert!(codex_seen_in(&text, &ids(&[A])).is_empty());
+    }
+
+    #[test]
+    fn a_server_side_call_doesnt_hold_mail_back() {
+        let search = r#"{"timestamp":"t","type":"response_item","payload":{"type":"web_search_call","status":"completed"}}"#;
+        let text = [
+            search.to_string(),
+            codex_developer(A),
+            CODEX_ASSISTANT.to_string(),
+        ]
+        .join("\n");
+        assert_eq!(codex_seen_in(&text, &ids(&[A])), ids(&[A]));
     }
 
     #[test]
