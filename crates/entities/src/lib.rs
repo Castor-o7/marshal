@@ -25,6 +25,8 @@ mod nickname;
 mod notify;
 /// Fork only (MAR-24): pairing codes and token hashes, shared by the daemon and the shim.
 pub mod pairing;
+/// Fork only (MAR-88): send allowances, off unless the daemon installs them.
+pub mod rate;
 mod read_messages;
 mod room;
 mod room_member;

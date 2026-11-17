@@ -124,7 +124,12 @@ pub fn acceptor(identity: &Identity) -> io::Result<TlsAcceptor> {
 /// listener on loopback, copying bytes both ways until either side closes.
 /// Runs forever. A failed handshake or an unreachable upstream ends only that
 /// connection.
-pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, upstream: SocketAddr) {
+pub async fn serve(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    upstream: SocketAddr,
+    limits: Option<Arc<crate::limits::ConnLimits>>,
+) {
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -136,8 +141,21 @@ pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, upstream: Socke
                 continue;
             }
         };
+        // Over a cap (MAR-88): closed before the handshake, so a flooding
+        // peer costs nothing but the accept.
+        let guard = match &limits {
+            Some(limits) => match limits.try_acquire(peer.ip()) {
+                Some(guard) => Some(guard),
+                None => {
+                    log::debug!("[tls] refused a connection from {peer}: over a connection cap");
+                    continue;
+                }
+            },
+            None => None,
+        };
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            let _place = guard;
             if let Err(e) = forward(tcp, acceptor, upstream).await {
                 log::debug!("[tls] connection from {peer} ended: {e}");
             }

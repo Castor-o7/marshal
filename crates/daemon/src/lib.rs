@@ -14,6 +14,7 @@ pub mod controls;
 pub mod file_persister;
 pub mod hooks;
 pub mod http_listener;
+pub mod limits;
 pub mod liveness_filter;
 pub mod nickname_assign;
 pub mod pairing;
