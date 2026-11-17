@@ -5,133 +5,170 @@
 //! long-poll that wakes the idle session when a message comes. This test
 //! launches a real `claude` through the built-in tmux adapter, lets
 //! `marshal_launch::launch` send the first task, and never types into the
-//! pane. It passes when the launched session marks the task read and does
-//! what it says: send a token back to an observer row this test holds.
+//! pane. It passes when:
+//! - the session registers through the real hook listener (the launcher
+//!   joins it; nothing in this test registers a row);
+//! - the session marks the first task read;
+//! - the session does what the task says, which needs no tool: its reply
+//!   shows in the tmux pane.
 //!
-//! It is `#[ignore]`d: it needs a real daemon (the hook port is the daemon's,
-//! not the in-process cell's in launch_e2e.rs), a logged-in Claude with
-//! marshal-shim wired (the plugin, or by hand with the `claude-hook wait`
-//! hook), and it spends real model tokens. Run it with
+//! The daemon is a real one via `common::daemon::RealDaemon`
+//! (`MARSHAL_E2E_DAEMON` names the binary), in memory, on 127.0.0.1 test
+//! ports, never 6155/6156.
+//!
+//! Wiring: a throwaway folder under `~/src` (already trusted by Claude, so
+//! the trust prompt, which we never bypass, doesn't stop it) gets a
+//! `.claude/settings.json` with the marshal-shim hooks, running
+//! `MARSHAL_E2E_SHIM` by absolute path. It has no `.mcp.json`: a project MCP
+//! server would ask for approval, which we don't pre-answer. So the marshal
+//! MCP wiring a real target has (see the design's prerequisites) is not
+//! exercised here. The session also loads the operator's own user-wide
+//! settings and hooks, and their Claude login. The folder is removed and
+//! the session killed at the end, pass or fail.
+//!
+//! It is `#[ignore]`d: it starts a real Claude and spends model tokens. Run
+//! explicitly, a missing prerequisite is a failure, not a skip.
 //!
 //! ```text
-//! MARSHAL_E2E_DAEMON=ws://<host>:6155 \
-//! MARSHAL_SHIM_BIN=<dir>/marshal-shim \
+//! MARSHAL_E2E_DAEMON=<marshal-daemon binary> \
+//! MARSHAL_E2E_SHIM=<a marshal-shim of this tree's major.minor> \
 //! cargo test -p marshal-launch --test first_task_e2e -- --ignored --nocapture
 //! ```
 //!
-//! - `MARSHAL_E2E_DAEMON` (required): the daemon, at this tree's version.
-//! - `MARSHAL_SHIM_BIN`: the shim the launch checks, and whose folder goes
-//!   first on the agent's PATH, so Claude's `marshal-shim` hooks and MCP
-//!   server run it. Point it at a shim built from this tree when the
-//!   installed one is another major.minor.
-//! - `MARSHAL_E2E_CWD`: the folder to launch in. It must already be trusted
-//!   by Claude, or Claude stops at the trust prompt with nobody to answer.
-//!   Defaults to this crate's folder.
-//! - `MARSHAL_E2E_CLAUDE_CONFIG_DIR`: a `CLAUDE_CONFIG_DIR` for the agent
-//!   (a prepared login and wiring), instead of the operator's own.
+//! - `MARSHAL_E2E_PARENT`: where to make the throwaway folder (default
+//!   `~/src`). It must be trusted by Claude.
 //! - `MARSHAL_E2E_TIMEOUT_SECS`: how long the agent has to act (default 300).
 
 #![cfg(unix)]
 
 mod common;
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use common::daemon::RealDaemon;
 use hyphae::Gettable;
-use marshal_entities::{
-    DeleteSession, DeleteSessionResult, GetAllMessageReads, GetAllMessages, HostInfo,
-    RegisterSession, Session, SessionId,
-};
+use marshal_entities::GetAllMessageReads;
+use marshal_launch::Plan;
 use marshal_launch::join::Roster;
-use marshal_launch::tmux::{Tmux, this_host};
-use marshal_launch::{Adapter, Plan};
+use marshal_launch::tmux::Tmux;
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
 }
 
-/// A plain roster row the agent can address, held by this test's connection.
-fn observer(id: &str) -> Session {
-    let mut s: Session = serde_json::from_value(serde_json::json!({
-        "id": id,
-        "pid": std::process::id(),
-        "cwd": env!("CARGO_MANIFEST_DIR"),
-        "connectedAt": 1,
-        "sessionName": "first-task-e2e observer",
-    }))
-    .unwrap();
-    s.host = Some(HostInfo {
-        name: this_host(),
-        os: std::env::consts::OS.into(),
-        arch: std::env::consts::ARCH.into(),
-    });
-    s
-}
+/// The throwaway project folder, removed however the test ends.
+struct Folder(PathBuf);
 
-async fn wait_for<T>(
-    what: &str,
-    timeout: Duration,
-    mut found: impl FnMut() -> Option<T>,
-    pane: impl Fn() -> String,
-) -> T {
-    let started = Instant::now();
-    loop {
-        if let Some(t) = found() {
-            return t;
-        }
-        if started.elapsed() > timeout {
-            panic!(
-                "{what} didn't happen within {}s. The agent's pane:\n{}",
-                timeout.as_secs(),
-                pane()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-#[test]
-#[ignore = "needs a running daemon and a logged-in Claude with marshal-shim wired; see the module docs"]
-fn an_unattended_claude_wakes_for_its_first_task_and_acts_on_it() {
-    let daemon = env("MARSHAL_E2E_DAEMON")
-        .expect("set MARSHAL_E2E_DAEMON to a running daemon's ws:// address (see the module docs)");
-    let Some(server) = common::PrivateTmux::new("first-task") else {
-        return;
+/// The hooks the marshal-shim plugin ships, running `shim` by absolute path.
+fn hooks(shim: &Path) -> String {
+    let s = shim.display().to_string();
+    let cmd = |verb: &str| {
+        serde_json::json!({
+            "type": "command",
+            "command": format!("{s} claude-hook {verb}"),
+            "timeout": 10,
+        })
     };
-    let cwd =
-        PathBuf::from(env("MARSHAL_E2E_CWD").unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into()));
-    let cwd = std::fs::canonicalize(&cwd).expect("MARSHAL_E2E_CWD must exist");
+    let wait = serde_json::json!({
+        "type": "command",
+        "command": format!("{s} claude-hook wait"),
+        "asyncRewake": true,
+        "timeout": 2592000,
+    });
+    serde_json::json!({ "hooks": {
+        "SessionStart": [{ "hooks": [cmd("session-start"), wait.clone()] }],
+        "Stop": [{ "hooks": [wait] }],
+        "UserPromptSubmit": [{ "hooks": [cmd("prompt-submit")] }],
+        "PostToolUse": [{ "hooks": [cmd("post-tool-use")] }],
+    }})
+    .to_string()
+}
+
+#[test]
+#[ignore = "starts a real Claude and spends tokens; needs MARSHAL_E2E_DAEMON and MARSHAL_E2E_SHIM (see the module docs)"]
+fn an_unattended_claude_wakes_for_its_first_task_and_acts_on_it() {
+    let shim = PathBuf::from(
+        env("MARSHAL_E2E_SHIM")
+            .expect("set MARSHAL_E2E_SHIM to a marshal-shim of this tree's version"),
+    );
+    let shim = std::fs::canonicalize(&shim).expect("MARSHAL_E2E_SHIM must exist");
     let act_within = Duration::from_secs(
         env("MARSHAL_E2E_TIMEOUT_SECS")
             .and_then(|s| s.parse().ok())
             .unwrap_or(300),
     );
 
-    // The agent's PATH: the checked shim's folder first, so its hooks and MCP
-    // server run the same shim.
-    let mut path = std::env::var("PATH").unwrap_or_default();
-    if let Some(dir) = env("MARSHAL_SHIM_BIN")
-        .map(PathBuf::from)
-        .and_then(|b| b.parent().map(PathBuf::from))
-    {
-        path = format!("{}:{path}", dir.display());
-    }
-    let mut tmux = Tmux::new("tmux")
-        .with_socket(&server.socket)
-        .with_client_env("PATH", path);
-    if let Some(dir) = env("MARSHAL_E2E_CLAUDE_CONFIG_DIR") {
-        tmux = tmux.with_client_env("CLAUDE_CONFIG_DIR", dir);
+    // The tmux server, and so the agent, inherits this process's
+    // environment. Don't hand it the running session's Claude identity.
+    for (k, _) in std::env::vars() {
+        if k == "CLAUDECODE"
+            || k.starts_with("CLAUDE_CODE_")
+            || k == "CLAUDE_PID"
+            || k == "CLAUDE_EFFORT"
+            || k == "TMUX"
+        {
+            // SAFETY: this binary's only test changes the environment
+            // before it starts any thread of its own.
+            unsafe { std::env::remove_var(&k) };
+        }
     }
 
+    let d = RealDaemon::from_env().expect("set MARSHAL_E2E_DAEMON to a marshal-daemon binary");
+    // The shim derives the hook port (6156) from the address unless told.
+    // SAFETY: as above; the daemon is a child process, not a thread here.
+    unsafe { std::env::set_var("MARSHAL_BASE_URL", &d.hook_url) };
+
+    let parent = PathBuf::from(
+        env("MARSHAL_E2E_PARENT").unwrap_or_else(|| format!("{}/src", env("HOME").expect("HOME"))),
+    );
+    let folder = Folder(parent.join(format!(".marshal-first-task-e2e-{}", std::process::id())));
+    std::fs::create_dir_all(folder.0.join(".claude")).unwrap();
+    std::fs::write(folder.0.join(".claude/settings.json"), hooks(&shim)).unwrap();
+    let cwd = std::fs::canonicalize(&folder.0).unwrap();
+
+    // Declared after the folder, so it drops first: the session is killed
+    // before its folder goes.
+    let server = common::PrivateTmux::new("first-task").expect("needs tmux");
+    let tmux = Tmux::new("tmux")
+        .with_socket(&server.socket)
+        .with_shim(vec![shim.display().to_string()]);
     let name = format!("first-task-e2e-{}", std::process::id());
-    let observer_id = uuid::Uuid::new_v4().to_string();
-    let token = format!("first-task-{}", uuid::Uuid::new_v4().simple());
+    let pane = || {
+        let out = server
+            .tmux()
+            .args([
+                "capture-pane",
+                "-p",
+                "-J",
+                "-S",
+                "-500",
+                "-t",
+                &format!("={name}:"),
+            ])
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // In the task, lowercase; the answer it asks for, uppercase. So the
+    // answer showing in the pane is the agent's, not the task echoed.
+    let token = format!(
+        "launchok-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let answer = token.to_uppercase();
     let task = format!(
-        "This is an automated test of unattended task delivery. Use the marshal \
-         send_message tool once: send the text {token} to session {observer_id}. \
-         Do nothing else, and don't wait for a reply."
+        "This is an automated test of unattended task delivery. Reply with this token \
+         in capital letters, and nothing else: {token}"
     );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -139,89 +176,64 @@ fn an_unattended_claude_wakes_for_its_first_task_and_acts_on_it() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let roster = Roster::connect(&daemon)
+        let roster = Roster::connect(&d.address)
             .await
             .expect("connect to the daemon");
-        let client = roster.client();
-        let messages = client.watch_query::<GetAllMessages>(GetAllMessages {});
-        let reads = client.watch_query::<GetAllMessageReads>(GetAllMessageReads {});
-        client.send_command::<RegisterSession, ()>(&RegisterSession {
-            session: observer(&observer_id),
-        });
-        let pane = || server.pane(&name);
-        wait_for(
-            "the observer row appearing",
-            Duration::from_secs(10),
-            || {
-                roster
-                    .sessions()
-                    .iter()
-                    .any(|s| s.id.0.as_ref() == observer_id)
-                    .then_some(())
-            },
-            String::new,
-        )
-        .await;
-
+        let reads = roster
+            .client()
+            .watch_query::<GetAllMessageReads>(GetAllMessageReads {});
         let plan = Plan {
             harness: "claude".into(),
             cwd: cwd.display().to_string(),
             name: name.clone(),
-            launch_address: daemon.clone(),
-            daemon_address: daemon.clone(),
+            launch_address: d.address.clone(),
+            daemon_address: d.address.clone(),
             timeout: Duration::from_secs(120),
             check: true,
             options: vec![],
             task: Some(task),
-            records: Some(
-                PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}/launches.json")),
-            ),
+            records: None,
         };
         let outcome = match marshal_launch::launch(&tmux, &plan).await {
             Ok(o) => o,
-            Err(e) => panic!("launch failed: {e:#}\nThe agent's pane:\n{}", pane()),
+            Err(e) => panic!(
+                "launch failed: {e:#}\nThe agent's pane:\n{}\nDaemon log:\n{}",
+                pane(),
+                d.log_text()
+            ),
         };
         let agent = outcome.joined.session_id.clone();
         let task_id = outcome
             .task_message_id
             .clone()
             .expect("the first task was sent");
+        eprintln!(
+            "joined through the hook listener as {agent} ({}); first task {task_id}",
+            outcome.joined.nickname
+        );
 
         // Nobody types: the waiter has to wake the idle session.
-        let read_at = wait_for(
-            "the launched session marking its first task read",
-            act_within,
-            || {
-                reads.get().iter().find_map(|r| {
-                    (r.message_id.0.as_ref() == task_id && r.session_id.0.as_ref() == agent)
-                        .then_some(r.read_at)
-                })
-            },
-            pane,
-        )
-        .await;
-        let reply = wait_for(
-            "the launched agent sending the token back",
-            act_within,
-            || {
-                messages.get().iter().find_map(|m| {
-                    (m.from_session_id.0.as_ref() == agent
-                        && m.to_session_id
-                            .as_ref()
-                            .is_some_and(|t| t.0.as_ref() == observer_id)
-                        && m.body.contains(&token))
-                    .then(|| m.body.clone())
-                })
-            },
-            pane,
-        )
-        .await;
-        eprintln!("first task read at {read_at}; the agent answered: {reply}");
-
-        tmux.stop(&outcome.launched.handle).unwrap();
-        let _ = client.send_command::<DeleteSession, DeleteSessionResult>(&DeleteSession {
-            id: SessionId(Arc::from(observer_id.as_str())),
-        });
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = Instant::now();
+        let mut read = false;
+        loop {
+            read = read
+                || reads.get().iter().any(|r| {
+                    r.message_id.0.as_ref() == task_id && r.session_id.0.as_ref() == agent
+                });
+            if read && pane().contains(&answer) {
+                break;
+            }
+            if started.elapsed() > act_within {
+                panic!(
+                    "within {}s: task marked read: {read}; `{answer}` in the pane: false.\n\
+                     The agent's pane:\n{}",
+                    act_within.as_secs(),
+                    pane()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        eprintln!("the first task was marked read, and the agent answered {answer} in its pane");
     });
+    // `server` (the session), then `folder`, drop here, pass or fail.
 }
