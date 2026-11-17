@@ -82,6 +82,9 @@ const CLAUDE_HOOKS: &[(&str, &str, bool)] = &[
         "marshal-shim claude-hook post-tool-use",
         false,
     ),
+    // Without it an ended session's row stays until the daemon's 24-hour
+    // backstop for hook-only sessions reaps it.
+    ("SessionEnd", "marshal-shim claude-hook session-end", false),
 ];
 
 /// The plugin that supplies the hooks and the MCP server when it's installed

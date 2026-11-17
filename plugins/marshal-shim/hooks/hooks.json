@@ -1,5 +1,5 @@
 {
-  "description": "Deliver unread Marshal direct messages into the session at start, before each prompt, and after each tool call. Wake idle sessions when a message arrives. Works without the live-channel launch flag.",
+  "description": "Deliver unread Marshal direct messages into the session at start, before each prompt, and after each tool call. Wake idle sessions when a message arrives. Take the session off the roster when it ends. Works without the live-channel launch flag.",
   "hooks": {
     "SessionStart": [
       {
@@ -27,6 +27,13 @@
       {
         "hooks": [
           { "type": "command", "command": "marshal-shim claude-hook post-tool-use", "timeout": 10 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "marshal-shim claude-hook session-end", "timeout": 10 }
         ]
       }
     ]
