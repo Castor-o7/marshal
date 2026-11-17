@@ -52,6 +52,8 @@ impl Env {
             .env("TMUX_TMPDIR", self.path("tmux"))
             .env_remove("TMUX")
             .env_remove("MARSHAL_BASE_URL")
+            // The "target's" login shell: bash, unless a test says otherwise.
+            .env("SHELL", which("bash"))
             .env("PATH", path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -100,6 +102,14 @@ impl Drop for Env {
     fn drop(&mut self) {
         let _ = self.tmux(&["kill-server"]);
     }
+}
+
+fn which(p: &str) -> String {
+    let o = Command::new("sh")
+        .args(["-c", &format!("command -v {p}")])
+        .output()
+        .unwrap();
+    String::from_utf8(o.stdout).unwrap().trim().to_string()
 }
 
 fn stderr(o: &Output) -> String {
@@ -490,5 +500,124 @@ fn check_brings_no_secrets_back_from_the_target() {
     assert!(
         !shown.contains("SECRET"),
         "a secret left the target:\n{shown}"
+    );
+}
+
+/// A login shell other than bash (zsh on macOS) sets PATH in its profile.
+/// The scripts take PATH from it, so what's only on that PATH is found.
+#[test]
+fn the_targets_login_shell_supplies_path() {
+    let e = Env::new();
+    let login_bin = e.path("login-bin");
+    std::fs::create_dir_all(&login_bin).unwrap();
+    let shim = login_bin.join("marshal-shim");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\necho 'marshal-shim {}'\n",
+            marshal_launch_ssh::VERSION
+        ),
+    )
+    .unwrap();
+    let login_sh = e.path("login-sh");
+    std::fs::write(
+        &login_sh,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = -lc ] || exit 1\nPATH={}:$PATH\nexport PATH\nexec sh -c \"$2\"\n",
+            login_bin.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for f in [&shim, &login_sh] {
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let req = e.request(&["claude"]);
+    // With bash as the login shell, that shim isn't the one found: either
+    // none is, or another (on this machine, perhaps an installed one).
+    let err = stderr(&e.run("check", &req, &[]));
+    assert!(
+        err.contains("no marshal-shim on its login PATH")
+            || err.contains("the target's marshal-shim is"),
+        "{err}"
+    );
+    // With the other shell, its PATH has it.
+    let err = stderr(&e.run("check", &req, &[("SHELL", login_sh.to_str().unwrap())]));
+    assert!(!err.contains("marshal-shim on its login PATH"), "{err}");
+    assert!(!err.contains("the target's marshal-shim is"), "{err}");
+}
+
+/// `--tmux <path>` runs that tmux for every verb, through the handle.
+#[test]
+fn tmux_option_is_used_by_check_launch_status_and_stop() {
+    if !have_tmux() {
+        eprintln!("skipping: no tmux");
+        return;
+    }
+    let e = Env::new();
+    let mut req = e.request(&["sh", "-c", "sleep 60"]);
+    req["options"] = json!(["--host", "target-1", "--tmux", "/nonexistent/tmux"]);
+    let err = stderr(&e.run("check", &req, &[]));
+    assert!(
+        err.contains("has no tmux at /nonexistent/tmux (--tmux)"),
+        "{err}"
+    );
+    let o = e.run("launch", &req, &[]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("has no tmux (/nonexistent/tmux)"),
+        "{}",
+        stderr(&o)
+    );
+
+    let tmux = which("tmux");
+    req["options"] = json!(["--host", "target-1", "--tmux", tmux]);
+    let l = stdout_json(&e.run("launch", &req, &[]));
+    assert_eq!(l["handle"], format!("target-1 mar94-test tmux={tmux}"));
+    assert_eq!(
+        l["attach"],
+        format!("ssh -t target-1 {tmux} attach -t =mar94-test")
+    );
+    let h = json!({"version": 1, "handle": l["handle"]});
+    assert_eq!(stdout_json(&e.run("status", &h, &[]))["running"], true);
+    stdout_json(&e.run("stop", &h, &[]));
+    assert_eq!(stdout_json(&e.run("status", &h, &[]))["running"], false);
+}
+
+/// `--xdg-config-home` is where the harness's shim will read
+/// `marshal/daemon-address`, so check reads it there and not in ~/.config.
+#[test]
+fn xdg_config_home_option_steers_the_daemon_address_check() {
+    let e = Env::new();
+    // ~/.config names the live daemon: not this launch's, but not read either.
+    std::fs::create_dir_all(e.path("home/.config/marshal")).unwrap();
+    std::fs::write(
+        e.path("home/.config/marshal/daemon-address"),
+        "ws://live:6155\n",
+    )
+    .unwrap();
+    let xdg = e.path("xdg");
+    std::fs::create_dir_all(xdg.join("marshal")).unwrap();
+    std::fs::write(
+        xdg.join("marshal/daemon-address"),
+        "ws://marshal.invalid:6155\n",
+    )
+    .unwrap();
+    let mut req = e.request(&["claude"]);
+    // Without the option, ~/.config's file is the one the shim would read.
+    let err = stderr(&e.run("check", &req, &[]));
+    assert!(err.contains("naming ws://live:6155"), "{err}");
+    req["options"] = json!(["--host", "target-1", "--xdg-config-home", xdg]);
+    let err = stderr(&e.run("check", &req, &[]));
+    assert!(!err.contains("daemon-address"), "{err}");
+    // Its file naming another daemon is caught.
+    std::fs::write(xdg.join("marshal/daemon-address"), "ws://other:6155\n").unwrap();
+    let err = stderr(&e.run("check", &req, &[]));
+    assert!(
+        err.contains(&format!(
+            "{} naming ws://other:6155",
+            xdg.join("marshal/daemon-address").display()
+        )),
+        "{err}"
     );
 }

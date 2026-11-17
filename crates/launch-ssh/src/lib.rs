@@ -67,12 +67,12 @@ pub fn run(verb: &str, input: &str) -> Result<Value> {
             let req: HandleRequest =
                 serde_json::from_str(input).context("reading the request on stdin")?;
             check_version(req.version)?;
-            let (dest, name) = parse_handle(&req.handle)?;
+            let h = parse_handle(&req.handle)?;
             if verb == "stop" {
-                stop(&dest, &name)?;
+                stop(&h)?;
                 Ok(json!({ "version": PROTOCOL_VERSION }))
             } else {
-                let running = status(&dest, &name)?;
+                let running = status(&h)?;
                 Ok(json!({ "version": PROTOCOL_VERSION, "running": running }))
             }
         }
@@ -102,6 +102,11 @@ pub struct Target {
     pub name: String,
     pub daemon: HostPort,
     pub hook: HostPort,
+    /// `--xdg-config-home`: the harness's XDG_CONFIG_HOME on the target, so
+    /// its shim reads `marshal/daemon-address` from there.
+    pub xdg: Option<String>,
+    /// `--tmux`: the tmux to run, when the target's login PATH has none.
+    pub tmux: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +130,7 @@ impl Target {
     /// launch address: the agent runs on another machine, where `localhost`
     /// is not the daemon.
     pub fn from_request(req: &LaunchRequest) -> Result<Target> {
-        let dest = parse_options(&req.options)?;
+        let Options { dest, xdg, tmux } = parse_options(&req.options)?;
         validate_name(&req.name)?;
         if req.argv.is_empty() {
             bail!("the request's argv is empty");
@@ -165,30 +170,66 @@ impl Target {
             name: req.name.clone(),
             daemon,
             hook,
+            xdg,
+            tmux,
         })
     }
 }
 
-/// Read `--host <dest>` (or `--host=<dest>`) from the adapter options.
-pub fn parse_options(options: &[String]) -> Result<String> {
-    let mut host = None;
+/// The ssh adapter's options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    /// `--host <destination>`, required.
+    pub dest: String,
+    /// `--xdg-config-home <absolute path>`.
+    pub xdg: Option<String>,
+    /// `--tmux <absolute path>`.
+    pub tmux: Option<String>,
+}
+
+const OPTIONS_USAGE: &str =
+    "the ssh adapter takes --host <destination>, --xdg-config-home <path> and --tmux <path>";
+
+/// Read the adapter options: `--name value` or `--name=value`.
+pub fn parse_options(options: &[String]) -> Result<Options> {
+    let (mut host, mut xdg, mut tmux) = (None, None, None);
     let mut it = options.iter();
     while let Some(o) = it.next() {
-        if o == "--host" {
-            host = Some(
-                it.next()
-                    .ok_or_else(|| anyhow!("--host needs a value"))?
-                    .clone(),
-            );
-        } else if let Some(h) = o.strip_prefix("--host=") {
-            host = Some(h.to_string());
-        } else {
-            bail!("unknown option `{o}` (the ssh adapter takes --host <destination>)");
+        let (name, inline) = match o.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (o.as_str(), None),
+        };
+        let slot = match name {
+            "--host" => &mut host,
+            "--xdg-config-home" => &mut xdg,
+            "--tmux" => &mut tmux,
+            _ => bail!("unknown option `{o}` ({OPTIONS_USAGE})"),
+        };
+        let value = match inline {
+            Some(v) => v,
+            None => it
+                .next()
+                .ok_or_else(|| anyhow!("{name} needs a value"))?
+                .clone(),
+        };
+        *slot = Some(value);
+    }
+    let dest = host.ok_or_else(|| anyhow!("the ssh adapter needs --host <destination>"))?;
+    validate_dest(&dest)?;
+    for (name, v) in [("--xdg-config-home", &xdg), ("--tmux", &tmux)] {
+        if let Some(v) = v {
+            validate_target_path(name, v)?;
         }
     }
-    let host = host.ok_or_else(|| anyhow!("the ssh adapter needs --host <destination>"))?;
-    validate_dest(&host)?;
-    Ok(host)
+    Ok(Options { dest, xdg, tmux })
+}
+
+/// A path on the target: absolute, one word.
+fn validate_target_path(option: &str, p: &str) -> Result<()> {
+    if !p.starts_with('/') || p.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("{option} takes an absolute path on the target with no spaces, not `{p}`");
+    }
+    Ok(())
 }
 
 /// An ssh destination must not be read as an ssh option, and must be one word.
@@ -265,10 +306,31 @@ pub fn sq(s: &str) -> String {
 
 /// Shared prelude: `say` reports a line back; `cwd` is expanded and resolved
 /// the way the shim will see it (`getcwd`, so symlinks resolved).
-const PRELUDE: &str = r#"set -u
+/// Every script's start. PATH is the target's own login PATH: the script
+/// runs under `bash -l`, and when the login shell is another (zsh on macOS,
+/// where Homebrew's PATH is set in .zprofile) PATH is taken from it, since a
+/// harness started by hand there would see that PATH. `tmux` runs
+/// `$tmux_bin` (`--tmux`, else `tmux` on that PATH).
+const LOGIN: &str = r#"set -u
 say() { printf '@@%s\n' "$*"; }
-case "$cwd" in "~") cwd=$HOME ;; "~/"*) cwd=$HOME/${cwd#"~/"} ;; esac
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+case "${SHELL:-}" in
+  ""|*/bash) ;;
+  *) if [ -x "$SHELL" ]; then
+       p=$("$SHELL" -lc 'printf "%s" "$PATH"' </dev/null 2>/dev/null) && [ -n "$p" ] && PATH=$p
+       export PATH
+     fi ;;
+esac
+tmux() { command "$tmux_bin" "$@"; }
 "#;
+
+/// Scripts with a folder: `~` is the target's home.
+const PRELUDE: &str = r#"case "$cwd" in "~") cwd=$HOME ;; "~/"*) cwd=$HOME/${cwd#"~/"} ;; esac
+"#;
+
+fn script_head(tmux: Option<&str>) -> String {
+    format!("tmux_bin={}\n{LOGIN}", sq(tmux.unwrap_or("tmux")))
+}
 
 /// Claude's marshal wiring, worked out on the target, through the
 /// marshal-shim plugin or by hand as upstream's README documents (an MCP
@@ -379,15 +441,15 @@ claude_facts() {
 claude_wiring() {
   facts=$(claude_facts)
   printf '%s\n' "$facts"
-  # The version of each shim the wiring names by path (a bare marshal-shim
-  # is the one on PATH, checked already).
+  # Each shim the wiring runs, as the harness will find it (a bare
+  # marshal-shim through the login PATH), and its version.
   printf '%s\n' "$facts" | awk -F'\t' '
     /^@@claude-hook / { print $2 }
     /^@@claude-mcp / { sub(/^@@claude-mcp /, "", $1); print $1 }' \
     | sort -u | while IFS= read -r e; do
-        case "$e" in */*) ;; *) continue ;; esac
-        if [ -x "$e" ]; then
-          printf '@@shim-at %s\t%s\n' "$e" "$("$e" --version 2>&1 | head -n 1)"
+        case "$e" in */*) r=$e ;; *) r=$(command -v "$e" 2>/dev/null) || r= ;; esac
+        if [ -n "$r" ] && [ -x "$r" ]; then
+          printf '@@shim-at %s\t%s\t%s\n' "$e" "$r" "$("$r" --version 2>&1 | head -n 1)"
         else
           printf '@@shim-at-missing %s\n' "$e"
         fi
@@ -406,17 +468,19 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
         sq(&req.cwd),
         sq(&req.harness),
         sq(&req.argv[0]),
-        sq(req
-            .env
-            .get("XDG_CONFIG_HOME")
-            .map(String::as_str)
-            .unwrap_or("")),
+        sq(t.xdg.as_deref().unwrap_or_else(|| {
+            req.env
+                .get("XDG_CONFIG_HOME")
+                .map(String::as_str)
+                .unwrap_or("")
+        })),
         sq(req
             .env
             .get("MARSHAL_BASE_URL")
             .map(String::as_str)
             .unwrap_or("")),
     );
+    s.push_str(&script_head(t.tmux.as_deref()));
     s.push_str(PRELUDE);
     s.push_str(CLAUDE_FACTS);
     s.push_str(&format!(
@@ -444,7 +508,7 @@ fi
 if probe "$daemon_host" "$daemon_port"; then say "daemon-port ok"; else say "daemon-port fail"; fi
 if probe "$hook_host" "$hook_port"; then say "hook-port ok"; else say "hook-port fail"; fi
 if cd "$cwd" 2>/dev/null; then cwd=$(pwd -P); say "cwd $cwd"; else say "cwd-missing $cwd"; fi
-if command -v tmux >/dev/null 2>&1; then say "tmux ok"; else say "tmux missing"; fi
+if command -v "$tmux_bin" >/dev/null 2>&1; then say "tmux ok"; else say "tmux missing"; fi
 if command -v "$argv0" >/dev/null 2>&1; then say "harness ok"; else say "harness missing"; fi
 if command -v marshal-shim >/dev/null 2>&1; then
   say "shim $(marshal-shim --version 2>&1 | head -n 1)"
@@ -525,9 +589,9 @@ pub struct Probe {
     pub claude_hooks: Vec<ClaudeHook>,
     /// Each Claude MCP server that runs marshal-shim.
     pub claude_mcp: Vec<ClaudeMcp>,
-    /// Each shim the wiring names by path: its `--version`, or `None` if
-    /// it isn't there.
-    pub shims_at: Vec<(String, Option<String>)>,
+    /// Each shim the wiring runs, as written there: where the harness will
+    /// find it and its `--version`, or `None` if it isn't there.
+    pub shims_at: Vec<(String, Option<(String, String)>)>,
     pub codex_config_missing: Option<String>,
     /// The hook listener the target's own `MARSHAL_BASE_URL` names, when the
     /// request sets none: the shim there uses it, so the check probes it.
@@ -597,8 +661,10 @@ impl Probe {
                     }
                 }
                 "shim-at" => {
-                    let (exe, ver) = v.split_once('\t').unwrap_or((v, ""));
-                    p.shims_at.push((exe.into(), Some(ver.into())));
+                    let f: Vec<&str> = v.splitn(3, '\t').collect();
+                    if let [exe, at, ver] = f[..] {
+                        p.shims_at.push((exe.into(), Some((at.into(), ver.into()))));
+                    }
                 }
                 "shim-at-missing" => p.shims_at.push((v.into(), None)),
                 "hook-from-target" => {
@@ -653,7 +719,12 @@ impl Probe {
             f.push(format!("{host} has no folder {c}"));
         }
         if self.tmux != Some(true) {
-            f.push(format!("{host} has no tmux on PATH"));
+            f.push(match &t.tmux {
+                Some(p) => format!("{host} has no tmux at {p} (--tmux)"),
+                None => format!(
+                    "{host} has no tmux on its login PATH; install it, or pass --tmux <path>"
+                ),
+            });
         }
         if self.harness != Some(true) {
             f.push(format!(
@@ -661,13 +732,15 @@ impl Probe {
                 req.argv[0]
             ));
         }
-        match &self.shim {
-            None => f.push(format!(
-                "{host} has no marshal-shim on PATH (in a login shell)"
-            )),
-            Some(v) => {
-                if let Err(e) = check_shim_version(v, &req.marshal_version) {
-                    f.push(format!("on {host}: {e:#}"));
+        // The shims the harness's wiring runs are versioned where they are
+        // found (below). Without any, the one on PATH is what it would run.
+        if self.shims_at.is_empty() {
+            match &self.shim {
+                None => f.push(format!("{host} has no marshal-shim on its login PATH")),
+                Some(v) => {
+                    if let Err(e) = check_shim_version(v, &req.marshal_version) {
+                        f.push(format!("on {host}: {e:#}"));
+                    }
                 }
             }
         }
@@ -741,19 +814,33 @@ impl Probe {
                  asyncRewake hook on SessionStart and Stop, as the marshal-shim plugin does"
             ));
         }
-        for (exe, ver) in &self.shims_at {
-            match ver {
+        // The shims the harness will actually run: hooks and MCP server must
+        // agree on one, at this launch's major.minor.
+        let mut found: Vec<(&str, &str)> = Vec::new();
+        for (exe, at) in &self.shims_at {
+            match at {
                 None => f.push(format!(
                     "Claude's marshal wiring on {host} runs {exe}, which isn't there"
                 )),
-                Some(v) => {
-                    if let Err(e) = check_shim_version(v, &req.marshal_version) {
+                Some((path, ver)) => {
+                    if !found.iter().any(|(p, _)| p == path) {
+                        found.push((path, ver));
+                    }
+                    if let Err(e) = check_shim_version(ver, &req.marshal_version) {
                         f.push(format!(
                             "on {host}, {exe} (in Claude's marshal wiring): {e:#}"
                         ));
                     }
                 }
             }
+        }
+        if found.len() > 1 {
+            let each: Vec<String> = found.iter().map(|(p, v)| format!("{p} ({v})")).collect();
+            f.push(format!(
+                "Claude's marshal wiring on {host} runs more than one marshal-shim: {}. Its \
+                 hooks and MCP server must run the same one; name it by path in each",
+                each.join(", ")
+            ));
         }
         f
     }
@@ -824,6 +911,9 @@ pub fn launch_script(t: &Target, req: &LaunchRequest) -> String {
     for (k, v) in &req.env {
         inner.push_str(&format!("export {k}={}\n", sq(v)));
     }
+    if let Some(x) = &t.xdg {
+        inner.push_str(&format!("export XDG_CONFIG_HOME={}\n", sq(x)));
+    }
     inner.push_str("exec");
     for a in &req.argv {
         inner.push(' ');
@@ -836,12 +926,17 @@ pub fn launch_script(t: &Target, req: &LaunchRequest) -> String {
         sq(&req.cwd),
         sq(&inner)
     );
+    s.push_str(&script_head(t.tmux.as_deref()));
     s.push_str(PRELUDE);
     s.push_str(
         r#"h=$(uname -n)
 cd "$cwd" 2>/dev/null || { echo "$h has no folder $cwd" >&2; exit 1; }
 cwd=$(pwd -P)
-command -v tmux >/dev/null 2>&1 || { echo "$h has no tmux on PATH" >&2; exit 1; }
+command -v "$tmux_bin" >/dev/null 2>&1 || { echo "$h has no tmux ($tmux_bin)" >&2; exit 1; }
+# The harness gets this login PATH, after its own login profile has run
+# (macOS's path_helper reorders PATH), and whatever env the tmux server has.
+inner="export PATH=$(q "$PATH")
+$inner"
 if tmux has-session -t "=$name" 2>/dev/null; then
   echo "$h already has a tmux session named $name" >&2; exit 1
 fi
@@ -854,10 +949,11 @@ say "done"
     s
 }
 
-pub fn stop_script(name: &str) -> String {
+pub fn stop_script(name: &str, tmux: Option<&str>) -> String {
     format!(
-        "name={}\n{}",
+        "name={}\n{}{}",
         sq(name),
+        script_head(tmux),
         r#"if tmux has-session -t "=$name" 2>/dev/null; then
   tmux kill-session -t "=$name" || exit 1
   printf '@@stopped\n'
@@ -869,27 +965,58 @@ fi
     )
 }
 
-pub fn status_script(name: &str) -> String {
+pub fn status_script(name: &str, tmux: Option<&str>) -> String {
     format!(
-        "name={}\n{}",
+        "name={}\n{}{}",
         sq(name),
+        script_head(tmux),
         r#"if tmux has-session -t "=$name" 2>/dev/null; then printf '@@running true\n'; else printf '@@running false\n'; fi
 "#
     )
 }
 
-/// Handles are `<destination> <session>`: both are single words.
-pub fn handle(dest: &str, name: &str) -> String {
-    format!("{dest} {name}")
+/// What a handle names: `<destination> <session>`, plus ` tmux=<path>`
+/// when `--tmux` was given, so stop and status run the same tmux.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handle {
+    pub dest: String,
+    pub name: String,
+    pub tmux: Option<String>,
 }
 
-pub fn parse_handle(h: &str) -> Result<(String, String)> {
-    let (d, n) = h
-        .split_once(' ')
-        .ok_or_else(|| anyhow!("`{h}` is not an ssh adapter handle"))?;
-    validate_dest(d)?;
-    validate_name(n)?;
-    Ok((d.to_string(), n.to_string()))
+impl std::fmt::Display for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.dest, self.name)?;
+        if let Some(t) = &self.tmux {
+            write!(f, " tmux={t}")?;
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_handle(h: &str) -> Result<Handle> {
+    let bad = || anyhow!("`{h}` is not an ssh adapter handle");
+    let mut words = h.split(' ');
+    let (Some(dest), Some(name)) = (words.next(), words.next()) else {
+        return Err(bad());
+    };
+    let tmux = match words.next() {
+        None => None,
+        Some(w) => Some(w.strip_prefix("tmux=").ok_or_else(bad)?.to_string()),
+    };
+    if words.next().is_some() {
+        return Err(bad());
+    }
+    validate_dest(dest)?;
+    validate_name(name)?;
+    if let Some(t) = &tmux {
+        validate_target_path("tmux=", t)?;
+    }
+    Ok(Handle {
+        dest: dest.into(),
+        name: name.into(),
+        tmux,
+    })
 }
 
 /// Run `script` with `bash -l -s` on `dest`. stderr passes through to the
@@ -956,21 +1083,32 @@ pub fn launch(t: &Target, req: &LaunchRequest) -> Result<Launched> {
             t.dest
         );
     };
+    let h = Handle {
+        dest: t.dest.clone(),
+        name: t.name.clone(),
+        tmux: t.tmux.clone(),
+    };
     Ok(Launched {
-        handle: handle(&t.dest, &t.name),
+        handle: h.to_string(),
         r#where: format!("{host} tmux:{}", t.name),
-        attach: Some(format!("ssh -t {} tmux attach -t ={}", t.dest, t.name)),
+        attach: Some(format!(
+            "ssh -t {} {} attach -t ={}",
+            t.dest,
+            t.tmux.as_deref().unwrap_or("tmux"),
+            t.name
+        )),
         host,
         cwd,
     })
 }
 
-pub fn stop(dest: &str, name: &str) -> Result<()> {
-    remote(dest, &stop_script(name)).map(|_| ())
+pub fn stop(h: &Handle) -> Result<()> {
+    remote(&h.dest, &stop_script(&h.name, h.tmux.as_deref())).map(|_| ())
 }
 
-pub fn status(dest: &str, name: &str) -> Result<bool> {
-    let out = remote(dest, &status_script(name))?;
+pub fn status(h: &Handle) -> Result<bool> {
+    let dest = &h.dest;
+    let out = remote(dest, &status_script(&h.name, h.tmux.as_deref()))?;
     out.lines()
         .find_map(|l| l.strip_prefix("@@running "))
         .map(|v| v == "true")
@@ -1085,17 +1223,143 @@ mod tests {
     }
 
     #[test]
+    fn options() {
+        let o = |v: &[&str]| parse_options(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            o(&[
+                "--host",
+                "a1",
+                "--xdg-config-home=/Users/j/x",
+                "--tmux",
+                "/opt/homebrew/bin/tmux"
+            ])
+            .unwrap(),
+            Options {
+                dest: "a1".into(),
+                xdg: Some("/Users/j/x".into()),
+                tmux: Some("/opt/homebrew/bin/tmux".into()),
+            }
+        );
+        assert!(
+            o(&["--host", "a1", "--tmux", "tmux"])
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
+        assert!(o(&["--host", "a1", "--xdg-config-home", "~/x"]).is_err());
+        assert!(
+            o(&["--host", "a1", "--shim", "/x"])
+                .unwrap_err()
+                .to_string()
+                .contains("unknown option")
+        );
+        assert!(
+            o(&["--host", "a1", "--tmux"])
+                .unwrap_err()
+                .to_string()
+                .contains("needs a value")
+        );
+    }
+
+    #[test]
+    fn the_launch_script_exports_the_login_path_and_xdg_config_home() {
+        let mut r = req("ws://marshal.mesh:6155");
+        r.options = vec![
+            "--host".into(),
+            "a1".into(),
+            "--xdg-config-home".into(),
+            "/Users/j/xdg".into(),
+            "--tmux".into(),
+            "/opt/homebrew/bin/tmux".into(),
+        ];
+        r.env
+            .insert("XDG_CONFIG_HOME".into(), "/from/launcher".into());
+        let t = Target::from_request(&r).unwrap();
+        let s = launch_script(&t, &r);
+        assert!(s.starts_with("name='claude-app'"), "{s}");
+        assert!(s.contains("tmux_bin='/opt/homebrew/bin/tmux'"), "{s}");
+        // --xdg-config-home is exported after the request's env, so it wins.
+        let inner = &s[s.find("inner=").unwrap()..];
+        let launcher = inner.find("XDG_CONFIG_HOME='\"'\"'/from/launcher").unwrap();
+        let option = inner.find("XDG_CONFIG_HOME='\"'\"'/Users/j/xdg").unwrap();
+        assert!(launcher < option, "{inner}");
+        assert!(s.contains("inner=\"export PATH=$(q \"$PATH\")"), "{s}");
+        let c = check_script(&t, &r);
+        assert!(c.contains("req_xdg='/Users/j/xdg'"), "{c}");
+    }
+
+    #[test]
+    fn hooks_and_mcp_must_run_one_shim() {
+        let r = req("ws://marshal.mesh:6155");
+        let t = Target::from_request(&r).unwrap();
+        let two = format!(
+            "@@host a1\n@@daemon-port ok\n@@hook-port ok\n@@cwd /w\n@@tmux ok\n@@harness ok\n\
+             @@shim marshal-shim 0.58.1\n\
+             @@claude-hook wait\t/Users/j/t/bin/marshal-shim\t/w/.claude/settings.json\n\
+             @@claude-mcp marshal-shim\t\t/w/.mcp.json\n\
+             @@shim-at /Users/j/t/bin/marshal-shim\t/Users/j/t/bin/marshal-shim\tmarshal-shim {VERSION}\n\
+             @@shim-at marshal-shim\t/opt/homebrew/bin/marshal-shim\tmarshal-shim 0.58.1\n\
+             @@done\n"
+        );
+        let f = Probe::parse(&two).failures(&t, &r);
+        assert!(
+            f.iter().any(|x| x.contains("more than one marshal-shim")
+                && x.contains("/Users/j/t/bin/marshal-shim (marshal-shim 0.60")
+                && x.contains("/opt/homebrew/bin/marshal-shim (marshal-shim 0.58.1)")),
+            "{f:#?}"
+        );
+        // Named by path in both, the old shim first on PATH isn't run, so
+        // it isn't checked: a1's case.
+        let one = two
+            .replace(
+                "@@claude-mcp marshal-shim\t",
+                "@@claude-mcp /Users/j/t/bin/marshal-shim\t",
+            )
+            .replace(
+                "@@shim-at marshal-shim\t/opt/homebrew/bin/marshal-shim\tmarshal-shim 0.58.1\n",
+                "",
+            );
+        assert_eq!(Probe::parse(&one).failures(&t, &r), Vec::<String>::new());
+        // A bare marshal-shim in the wiring is versioned as PATH finds it.
+        let bare = two.replace(
+            "@@claude-hook wait\t/Users/j/t/bin/marshal-shim\t",
+            "@@claude-hook wait\tmarshal-shim\t",
+        ).replace(
+            &format!("@@shim-at /Users/j/t/bin/marshal-shim\t/Users/j/t/bin/marshal-shim\tmarshal-shim {VERSION}\n"),
+            "",
+        );
+        let e = one_failure(&bare, &r);
+        assert!(
+            e.contains("marshal-shim (in Claude's marshal wiring)") && e.contains("0.58.1"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn single_quotes_survive() {
         assert_eq!(sq("it's"), r#"'it'"'"'s'"#);
     }
 
     #[test]
     fn handles_round_trip() {
-        let h = handle("u@build-03", "claude-app");
+        let h = Handle {
+            dest: "u@build-03".into(),
+            name: "claude-app".into(),
+            tmux: None,
+        };
+        assert_eq!(h.to_string(), "u@build-03 claude-app");
+        assert_eq!(parse_handle(&h.to_string()).unwrap(), h);
+        let h = Handle {
+            tmux: Some("/opt/homebrew/bin/tmux".into()),
+            ..h
+        };
         assert_eq!(
-            parse_handle(&h).unwrap(),
-            ("u@build-03".into(), "claude-app".into())
+            h.to_string(),
+            "u@build-03 claude-app tmux=/opt/homebrew/bin/tmux"
         );
+        assert_eq!(parse_handle(&h.to_string()).unwrap(), h);
+        assert!(parse_handle("a b c").is_err());
+        assert!(parse_handle("a b tmux=rel").is_err());
         assert!(parse_handle("nospace").is_err());
     }
 
@@ -1141,7 +1405,7 @@ mod tests {
         }
         s.push_str("@@claude-mcp /home/u/.local/bin/marshal-shim\t\t~/.claude.json\n");
         s.push_str(&format!(
-            "@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}\n@@done\n"
+            "@@shim-at /home/u/.local/bin/marshal-shim\t/home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}\n@@done\n"
         ));
         s
     }
@@ -1164,8 +1428,8 @@ mod tests {
         assert!(e.contains("not `marshal-shim claude-hook wait`"), "{e}");
         // A shim named by path is checked at this launch's version too.
         let old = hand_wired_claude_probe(&["wait"]).replace(
-            &format!("@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}"),
-            "@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim 0.1.0",
+            &format!("@@shim-at /home/u/.local/bin/marshal-shim\t/home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}"),
+            "@@shim-at /home/u/.local/bin/marshal-shim\t/home/u/.local/bin/marshal-shim\tmarshal-shim 0.1.0",
         );
         let e = one_failure(&old, &r);
         assert!(
@@ -1174,7 +1438,7 @@ mod tests {
             "{e}"
         );
         let gone = hand_wired_claude_probe(&["wait"]).replace(
-            &format!("@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}"),
+            &format!("@@shim-at /home/u/.local/bin/marshal-shim\t/home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}"),
             "@@shim-at-missing /home/u/.local/bin/marshal-shim",
         );
         assert!(one_failure(&gone, &r).contains("which isn't there"));
@@ -1282,7 +1546,7 @@ mod tests {
         let garbage = good.replace(&format!("@@shim marshal-shim {VERSION}"), "@@shim oops");
         assert!(one_failure(&garbage, &r).contains("has no version in it"));
         let none = good.replace(&format!("@@shim marshal-shim {VERSION}"), "@@shim-missing");
-        assert!(one_failure(&none, &r).contains("no marshal-shim on PATH"));
+        assert!(one_failure(&none, &r).contains("no marshal-shim on its login PATH"));
         let fixed = good.replace(
             "@@claude-mcp marshal-shim\t\t",
             "@@claude-mcp marshal-shim\tws://other:6155\t",
