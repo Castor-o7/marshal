@@ -341,9 +341,9 @@ async fn ws_with_token(
     daemon: &Daemon,
     token: &str,
 ) -> Result<TlsWs, tokio_tungstenite::tungstenite::Error> {
-    let tls = tls_connect(daemon.public, &daemon.fingerprint)
-        .await
-        .unwrap();
+    // A refused connection is an Err, not a panic: callers that retry until a
+    // capped place frees (MAR-88) see the front's reset as one more try.
+    let tls = tls_connect(daemon.public, &daemon.fingerprint).await?;
     let mut request = format!("wss://{}/myko", daemon.public)
         .into_client_request()
         .unwrap();
