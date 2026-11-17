@@ -1,4 +1,4 @@
-//! MAR-94 item 2: the ssh adapter against a real marshal-daemon.
+//! The ssh adapter against a real marshal-daemon.
 //!
 //! `marshal_launch::launch` drives `marshal-launch-ssh` (found on PATH as an
 //! external adapter) through `tests/fixtures/fake-ssh`, so the adapter's real
