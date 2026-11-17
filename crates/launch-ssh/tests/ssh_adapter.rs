@@ -533,16 +533,18 @@ fn the_targets_login_shell_supplies_path() {
         std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let req = e.request(&["claude"]);
-    // With bash as the login shell, that shim isn't the one found: either
-    // none is, or another (on this machine, perhaps an installed one).
-    let err = stderr(&e.run("check", &req, &[]));
-    assert!(
-        err.contains("no marshal-shim on its login PATH")
-            || err.contains("the target's marshal-shim is"),
-        "{err}"
-    );
+    // Only the test's own bin and the system dirs: no machine install of
+    // marshal-shim (~/.cargo/bin, ~/.local/bin) leaks in.
+    let path = format!("{}:/usr/bin:/bin", e.path("bin").display());
+    // With bash as the login shell, the shim isn't on PATH.
+    let err = stderr(&e.run("check", &req, &[("PATH", &path)]));
+    assert!(err.contains("no marshal-shim on its login PATH"), "{err}");
     // With the other shell, its PATH has it.
-    let err = stderr(&e.run("check", &req, &[("SHELL", login_sh.to_str().unwrap())]));
+    let err = stderr(&e.run(
+        "check",
+        &req,
+        &[("PATH", &path), ("SHELL", login_sh.to_str().unwrap())],
+    ));
     assert!(!err.contains("marshal-shim on its login PATH"), "{err}");
     assert!(!err.contains("the target's marshal-shim is"), "{err}");
 }
