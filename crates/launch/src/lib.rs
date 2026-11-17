@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// The version of the adapter request/response contract this crate speaks.
@@ -33,6 +33,9 @@ pub struct LaunchRequest {
     pub name: String,
     /// The `launch-<uuid>` id the agent's roster row will carry.
     pub agent_id: String,
+    /// The launcher's own version. `check` requires the target's `marshal-shim`
+    /// to have the same major.minor ([`same_major_minor`]).
+    pub marshal_version: String,
     /// Variables to add to the agent's environment. Never secrets.
     pub env: BTreeMap<String, String>,
     /// Adapter-specific options, passed through after `--`.
@@ -56,6 +59,47 @@ pub struct Launched {
     /// A command that attaches a terminal to the agent, if there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
+}
+
+/// This build's version, sent as the request's `marshal_version`.
+pub const MARSHAL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whether two versions share major.minor. Marshal releases every crate at one
+/// version, so that is what a target's shim must match.
+pub fn same_major_minor(a: &str, b: &str) -> bool {
+    let mm = |v: &str| {
+        let mut it = v.trim().trim_start_matches('v').split('.');
+        match (it.next(), it.next()) {
+            (Some(major), Some(minor)) if !major.is_empty() && !minor.is_empty() => Some((
+                major.to_string(),
+                minor.split(['-', '+']).next().unwrap_or("").to_string(),
+            )),
+            _ => None,
+        }
+    };
+    matches!((mm(a), mm(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Check `marshal-shim --version` output (`marshal-shim 0.60.2`) against the
+/// request's `marshal_version`, and say plainly what's wrong if it doesn't match.
+pub fn check_shim_version(output: &str, wanted: &str) -> Result<()> {
+    let found = output
+        .split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("");
+    if found.is_empty() {
+        bail!(
+            "marshal-shim --version printed {:?}, which has no version in it",
+            output.trim()
+        );
+    }
+    if !same_major_minor(found, wanted) {
+        bail!(
+            "the target's marshal-shim is {found}, but this launcher is {wanted}: they must share \
+             major.minor, so nothing was started. Install a matching marshal-shim there"
+        );
+    }
+    Ok(())
 }
 
 /// Something that can start an agent somewhere.
@@ -88,6 +132,7 @@ mod tests {
             cwd: "~/work/app".into(),
             name: "claude-app".into(),
             agent_id: "launch-6f1c".into(),
+            marshal_version: "0.60.2".into(),
             env: BTreeMap::from([("MARSHAL_AGENT_ID".into(), "launch-6f1c".into())]),
             options: vec!["--host".into(), "build-03".into()],
         };
@@ -101,11 +146,32 @@ mod tests {
                 "cwd": "~/work/app",
                 "name": "claude-app",
                 "agent_id": "launch-6f1c",
+                "marshal_version": "0.60.2",
                 "env": {"MARSHAL_AGENT_ID": "launch-6f1c"},
                 "options": ["--host", "build-03"],
             })
         );
         assert_eq!(serde_json::from_value::<LaunchRequest>(v).unwrap(), req);
+    }
+
+    #[test]
+    fn the_target_shim_must_share_major_minor() {
+        assert!(same_major_minor("0.60.2", "0.60.9"));
+        assert!(same_major_minor("v1.2.3-rc1", "1.2.0"));
+        assert!(same_major_minor("0.60", "0.60.1"));
+        assert!(!same_major_minor("0.58.1", "0.60.2"));
+        assert!(!same_major_minor("1.60.2", "0.60.2"));
+        assert!(!same_major_minor("0", "0.60.2"));
+        assert!(!same_major_minor("", ""));
+        check_shim_version("marshal-shim 0.60.5\n", "0.60.2").unwrap();
+        let err = check_shim_version("marshal-shim 0.58.1", "0.60.2")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("0.58.1") && err.contains("nothing was started"),
+            "{err}"
+        );
+        assert!(check_shim_version("command not found", "0.60.2").is_err());
     }
 
     #[test]

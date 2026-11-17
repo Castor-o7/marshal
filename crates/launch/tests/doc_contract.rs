@@ -27,6 +27,7 @@ fn the_docs_launch_request_parses() {
     assert_eq!(req.argv, ["claude"]);
     assert_eq!(req.options, ["--host", "build-03"]);
     assert_eq!(req.env.get("MARSHAL_AGENT_ID"), Some(&req.agent_id));
+    assert_eq!(req.marshal_version, "0.60.2");
     // Nothing in the doc's example is dropped on the way through.
     assert_eq!(serde_json::to_value(&req).unwrap(), v);
 }
