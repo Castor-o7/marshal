@@ -34,7 +34,7 @@ case "$reason" in
   not-object) echo '[1,2]'; exit 0 ;;
   wrong-version) echo '{"version":2,"handle":"h","host":"fake-host","cwd":"/w","where":"x"}'; exit 0 ;;
   no-host) echo '{"version":1,"handle":"h","cwd":"/w","where":"x"}'; exit 0 ;;
-  *) fail "fake adapter: unknown --fail=$reason" 2 ;;
+  *) fail "fake adapter: unknown --fail=$reason" 4 ;;
 esac
 
 echo "fake adapter: $verb ok" >&2
