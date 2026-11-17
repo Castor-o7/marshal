@@ -493,7 +493,7 @@ fn check_brings_no_secrets_back_from_the_target() {
         "{wire}"
     );
     assert!(
-        wire.contains("@@claude-mcp marshal-shim\t\t~/.claude.json"),
+        wire.contains("@@claude-mcp user\tmarshal\tmarshal-shim\t\t~/.claude.json"),
         "{wire}"
     );
     let shown = format!("{wire}{}{}", String::from_utf8_lossy(&o.stdout), stderr(&o));
@@ -620,4 +620,87 @@ fn xdg_config_home_option_steers_the_daemon_address_check() {
         )),
         "{err}"
     );
+}
+
+/// Exactly a1's layout: a user-scope `marshal` on an old shim (one that
+/// rejects --version) fixed to the live daemon, and the launch folder's own
+/// .mcp.json `marshal` plus hooks with an `XDG_CONFIG_HOME=…` prefix, both
+/// on the new shim by path. The folder's server is the effective one.
+#[test]
+fn check_passes_a1s_layout() {
+    if !have_json_reader() {
+        eprintln!("skipping: neither python3 nor jq");
+        return;
+    }
+    let e = Env::new();
+    e.bin(
+        "marshal-shim",
+        "echo 'Error: unknown argument: --version' >&2; exit 1",
+    );
+    e.bin("claude", "echo '[]'");
+    let new_dir = e.path("a1-test/bin");
+    std::fs::create_dir_all(&new_dir).unwrap();
+    let new_shim = new_dir.join("marshal-shim");
+    std::fs::write(
+        &new_shim,
+        format!(
+            "#!/bin/sh\necho 'marshal-shim {}'\n",
+            marshal_launch_ssh::VERSION
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&new_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let xdg = e.path("a1-test/xdg");
+    std::fs::write(
+        e.path("home/.claude.json"),
+        r#"{"mcpServers": {"marshal": {"command": "marshal-shim",
+              "env": {"MARSHAL_DAEMON_ADDRESS": "ws://192.168.1.241:6155"}}}}"#,
+    )
+    .unwrap();
+    let work = e.path("work");
+    std::fs::write(
+        work.join(".mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"marshal": {{"command": "{}"}}}}}}"#,
+            new_shim.display()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(work.join(".claude")).unwrap();
+    let hook = |verb: &str| {
+        format!(
+            r#"{{"type": "command", "command": "XDG_CONFIG_HOME={} {} claude-hook {verb}"}}"#,
+            xdg.display(),
+            new_shim.display()
+        )
+    };
+    std::fs::write(
+        work.join(".claude/settings.json"),
+        format!(
+            r#"{{"hooks": {{
+              "SessionStart": [{{"hooks": [{}, {}]}}],
+              "UserPromptSubmit": [{{"hooks": [{}]}}],
+              "Stop": [{{"hooks": [{}]}}]}}}}"#,
+            hook("session-start"),
+            hook("wait"),
+            hook("prompt-submit"),
+            hook("wait")
+        ),
+    )
+    .unwrap();
+    let mut req = e.request(&["claude"]);
+    req["options"] = json!(["--host", "target-1", "--xdg-config-home", xdg]);
+    let err = stderr(&e.run("check", &req, &[]));
+    // Only the ports fail here (marshal.invalid doesn't resolve).
+    assert!(err.contains("can't reach the daemon at"), "{err}");
+    for not in [
+        "Claude",
+        "marshal-shim is",
+        "more than one",
+        "has no version",
+        "fixed to",
+    ] {
+        assert!(!err.contains(not), "`{not}` in:\n{err}");
+    }
 }

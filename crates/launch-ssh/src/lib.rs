@@ -372,10 +372,10 @@ else:
     if mode == "local":
         d = ((d.get("projects") or {}).get(cwd) or {}) if isinstance(d, dict) else {}
     servers = d.get("mcpServers") if isinstance(d, dict) else None
-    for s in (servers or {}).values() if isinstance(servers, dict) else []:
+    for n, s in (servers or {}).items() if isinstance(servers, dict) else []:
         if isinstance(s, dict):
             e = s.get("env") if isinstance(s.get("env"), dict) else {}
-            print(one(s.get("command", "")) + "\t" + one(e.get("MARSHAL_DAEMON_ADDRESS", "")))
+            print(one(n) + "\t" + one(s.get("command", "")) + "\t" + one(e.get("MARSHAL_DAEMON_ADDRESS", "")))
 ' "$1" "$2" "$cwd"
   else
     case "$1" in
@@ -384,8 +384,8 @@ else:
                  | map(gsub("\\s+"; " ")) | join("\t")' "$2" 2>/dev/null ;;
       hooks) jq -r '.hooks? // {} | .. | objects | .command? | strings | gsub("\\s+"; " ")' "$2" 2>/dev/null ;;
       *) jq -r --arg m "$1" --arg c "$cwd" '(if $m == "local" then (.projects[$c]? // {}) else . end)
-           | .mcpServers? // {} | .[]? | objects
-           | [(.command // "" | tostring), (.env.MARSHAL_DAEMON_ADDRESS? // "" | tostring)]
+           | .mcpServers? // {} | to_entries[]? | select(.value | type == "object")
+           | [.key, (.value.command // "" | tostring), (.value.env.MARSHAL_DAEMON_ADDRESS? // "" | tostring)]
            | map(gsub("\\s+"; " ")) | join("\t")' "$2" 2>/dev/null ;;
     esac
   fi
@@ -397,20 +397,34 @@ hook_facts() {
   w=$1
   jfacts hooks "$2" | while IFS= read -r c; do
     set -f; set -- $c; set +f
+    # Leading `VAR=value` words (and `env`) set the environment, not the command.
+    [ "${1:-}" = env ] && shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        [A-Za-z_]*=*) case "${1%%=*}" in *[!A-Za-z0-9_]*) break ;; esac; shift ;;
+        *) break ;;
+      esac
+    done
     e=$(unq "${1:-}")
     if is_shim "$e" && [ "${2:-}" = claude-hook ] && [ -n "${3:-}" ]; then
       printf '@@claude-hook %s\t%s\t%s\n' "$3" "$e" "$w"
     fi
   done
 }
+# mcp_facts <mode> <scope> <where> <file>: each server by scope and name.
+# Only marshal-shim servers say more (their executable and any fixed
+# address); for any other, its name is enough to tell what it shadows.
 mcp_facts() {
-  w=$2
-  jfacts "$1" "$3" | while IFS="$tab" read -r c a; do
+  scope=$2; w=$3
+  jfacts "$1" "$4" | while IFS="$tab" read -r n c a; do
     set -f; set -- $c; set +f
     e=$(unq "${1:-}")
-    is_shim "$e" || continue
-    case "$a" in *'${MARSHAL_DAEMON_ADDRESS'*) a= ;; esac
-    printf '@@claude-mcp %s\t%s\t%s\n' "$e" "$a" "$w"
+    if is_shim "$e"; then
+      case "$a" in *'${MARSHAL_DAEMON_ADDRESS'*) a= ;; esac
+      printf '@@claude-mcp %s\t%s\t%s\t%s\t%s\n' "$scope" "$n" "$e" "$a" "$w"
+    else
+      printf '@@claude-mcp-other %s\t%s\n' "$scope" "$n"
+    fi
   done
 }
 claude_facts() {
@@ -425,7 +439,7 @@ claude_facts() {
       printf '@@claude-plugin %s\t%s\n' "$state" "$p"
       if [ "$state" = enabled ]; then
         hook_facts "$p/hooks/hooks.json" "$p/hooks/hooks.json"
-        mcp_facts plugin "$p/.mcp.json" "$p/.mcp.json"
+        mcp_facts mcpServers plugin "$p/.mcp.json" "$p/.mcp.json"
       fi
     done
     rm -f "$list"
@@ -434,9 +448,9 @@ claude_facts() {
            "$cwd/.claude/settings.local.json" /etc/claude-code/managed-settings.json; do
     hook_facts "$f" "$f"
   done
-  mcp_facts mcpServers "~/.claude.json" "$HOME/.claude.json"
-  mcp_facts local "~/.claude.json for $cwd" "$HOME/.claude.json"
-  mcp_facts mcpServers "$cwd/.mcp.json" "$cwd/.mcp.json"
+  mcp_facts mcpServers user "~/.claude.json" "$HOME/.claude.json"
+  mcp_facts local local "~/.claude.json for $cwd" "$HOME/.claude.json"
+  mcp_facts mcpServers project "$cwd/.mcp.json" "$cwd/.mcp.json"
 }
 claude_wiring() {
   facts=$(claude_facts)
@@ -445,7 +459,7 @@ claude_wiring() {
   # marshal-shim through the login PATH), and its version.
   printf '%s\n' "$facts" | awk -F'\t' '
     /^@@claude-hook / { print $2 }
-    /^@@claude-mcp / { sub(/^@@claude-mcp /, "", $1); print $1 }' \
+    /^@@claude-mcp / { print $3 }' \
     | sort -u | while IFS= read -r e; do
         case "$e" in */*) r=$e ;; *) r=$(command -v "$e" 2>/dev/null) || r= ;; esac
         if [ -n "$r" ] && [ -x "$r" ]; then
@@ -562,7 +576,13 @@ pub struct ClaudeHook {
 /// A Claude MCP server that runs marshal-shim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeMcp {
-    pub exe: String,
+    /// `plugin`, `local` (this folder's entry in ~/.claude.json), `project`
+    /// (the folder's .mcp.json) or `user` (~/.claude.json).
+    pub scope: String,
+    /// The server's name: a name defined in a nearer scope shadows it.
+    pub name: String,
+    /// Its executable, if it runs marshal-shim.
+    pub exe: Option<String>,
     /// A MARSHAL_DAEMON_ADDRESS fixed in its config, if any.
     pub fixed_address: Option<String>,
     /// The file it's in.
@@ -651,12 +671,25 @@ impl Probe {
                     }
                 }
                 "claude-mcp" => {
-                    let f: Vec<&str> = v.splitn(3, '\t').collect();
-                    if let [exe, addr, from] = f[..] {
+                    let f: Vec<&str> = v.splitn(5, '\t').collect();
+                    if let [scope, name, exe, addr, from] = f[..] {
                         p.claude_mcp.push(ClaudeMcp {
-                            exe: exe.into(),
+                            scope: scope.into(),
+                            name: name.into(),
+                            exe: Some(exe.into()),
                             fixed_address: (!addr.is_empty()).then(|| addr.to_string()),
                             from: from.into(),
+                        });
+                    }
+                }
+                "claude-mcp-other" => {
+                    if let Some((scope, name)) = v.split_once('\t') {
+                        p.claude_mcp.push(ClaudeMcp {
+                            scope: scope.into(),
+                            name: name.into(),
+                            exe: None,
+                            fixed_address: None,
+                            from: String::new(),
                         });
                     }
                 }
@@ -764,6 +797,31 @@ impl Probe {
         f
     }
 
+    /// The marshal-shim MCP servers Claude will start in this folder. A
+    /// server name resolves to its nearest scope, local, then project, then
+    /// user, so a user-scope `marshal` shadowed by the folder's own is not
+    /// what runs. Plugin servers are namespaced by their plugin and stand
+    /// alone.
+    fn effective_mcp(&self) -> Vec<&ClaudeMcp> {
+        let rank = |scope: &str| match scope {
+            "local" => 0,
+            "project" => 1,
+            _ => 2,
+        };
+        self.claude_mcp
+            .iter()
+            .filter(|m| {
+                m.exe.is_some()
+                    && (m.scope == "plugin"
+                        || !self.claude_mcp.iter().any(|o| {
+                            o.scope != "plugin"
+                                && o.name == m.name
+                                && rank(&o.scope) < rank(&m.scope)
+                        }))
+            })
+            .collect()
+    }
+
     /// Claude is wired when some MCP server it loads runs marshal-shim and
     /// its hooks run `marshal-shim claude-hook`, including `wait`, through
     /// the marshal-shim plugin or by hand; and every shim they name by path
@@ -783,13 +841,14 @@ impl Probe {
         };
 
         let mut f = Vec::new();
-        if self.claude_mcp.is_empty() {
+        let servers = self.effective_mcp();
+        if servers.is_empty() {
             f.push(format!(
                 "Claude on {host} has no MCP server that runs marshal-shim: none in the \
                  marshal-shim plugin, ~/.claude.json or the folder's .mcp.json{why}"
             ));
         }
-        for m in &self.claude_mcp {
+        for m in &servers {
             // A fixed address elsewhere would send the agent to another daemon.
             if let Some(a) = &m.fixed_address
                 && ws_host_port(a).as_ref() != Some(&t.daemon)
@@ -816,8 +875,18 @@ impl Probe {
         }
         // The shims the harness will actually run: hooks and MCP server must
         // agree on one, at this launch's major.minor.
+        let runs: Vec<&str> = self
+            .claude_hooks
+            .iter()
+            .map(|h| h.exe.as_str())
+            .chain(servers.iter().filter_map(|m| m.exe.as_deref()))
+            .collect();
         let mut found: Vec<(&str, &str)> = Vec::new();
-        for (exe, at) in &self.shims_at {
+        for (exe, at) in self
+            .shims_at
+            .iter()
+            .filter(|(e, _)| runs.contains(&e.as_str()))
+        {
             match at {
                 None => f.push(format!(
                     "Claude's marshal wiring on {host} runs {exe}, which isn't there"
@@ -1296,7 +1365,7 @@ mod tests {
             "@@host a1\n@@daemon-port ok\n@@hook-port ok\n@@cwd /w\n@@tmux ok\n@@harness ok\n\
              @@shim marshal-shim 0.58.1\n\
              @@claude-hook wait\t/Users/j/t/bin/marshal-shim\t/w/.claude/settings.json\n\
-             @@claude-mcp marshal-shim\t\t/w/.mcp.json\n\
+             @@claude-mcp project\tmarshal\tmarshal-shim\t\t/w/.mcp.json\n\
              @@shim-at /Users/j/t/bin/marshal-shim\t/Users/j/t/bin/marshal-shim\tmarshal-shim {VERSION}\n\
              @@shim-at marshal-shim\t/opt/homebrew/bin/marshal-shim\tmarshal-shim 0.58.1\n\
              @@done\n"
@@ -1312,8 +1381,8 @@ mod tests {
         // it isn't checked: a1's case.
         let one = two
             .replace(
-                "@@claude-mcp marshal-shim\t",
-                "@@claude-mcp /Users/j/t/bin/marshal-shim\t",
+                "@@claude-mcp project\tmarshal\tmarshal-shim\t",
+                "@@claude-mcp project\tmarshal\t/Users/j/t/bin/marshal-shim\t",
             )
             .replace(
                 "@@shim-at marshal-shim\t/opt/homebrew/bin/marshal-shim\tmarshal-shim 0.58.1\n",
@@ -1332,6 +1401,41 @@ mod tests {
         assert!(
             e.contains("marshal-shim (in Claude's marshal wiring)") && e.contains("0.58.1"),
             "{e}"
+        );
+    }
+
+    /// a1's layout: a user-scope `marshal` on an old shim fixed to the live
+    /// daemon, shadowed by the folder's own `marshal` on the new shim.
+    #[test]
+    fn a_shadowed_user_scope_server_is_not_the_wiring() {
+        let r = req("ws://marshal.mesh:6155");
+        let t = Target::from_request(&r).unwrap();
+        let probe = format!(
+            "@@host a1\n@@daemon-port ok\n@@hook-port ok\n@@cwd /w\n@@tmux ok\n@@harness ok\n\
+             @@shim Error: unknown argument: --version\n\
+             @@claude-hook wait\t/t/bin/marshal-shim\t/w/.claude/settings.json\n\
+             @@claude-mcp user\tmarshal\tmarshal-shim\tws://live:6155\t~/.claude.json\n\
+             @@claude-mcp project\tmarshal\t/t/bin/marshal-shim\t\t/w/.mcp.json\n\
+             @@claude-mcp-other user\tgithub\n\
+             @@shim-at /t/bin/marshal-shim\t/t/bin/marshal-shim\tmarshal-shim {VERSION}\n\
+             @@shim-at marshal-shim\t/u/.local/bin/marshal-shim\tError: unknown argument: --version\n\
+             @@done\n"
+        );
+        assert_eq!(Probe::parse(&probe).failures(&t, &r), Vec::<String>::new());
+        // The local entry beats the project one; a non-shim local `marshal`
+        // leaves no marshal-shim server at all.
+        let local = probe.replace("@@done\n", "@@claude-mcp-other local\tmarshal\n@@done\n");
+        let e = one_failure(&local, &r);
+        assert!(e.contains("no MCP server that runs marshal-shim"), "{e}");
+        // Unshadowed, the user-scope server is the wiring and is refused.
+        let unshadowed = probe.replace(
+            "@@claude-mcp project\tmarshal\t/t/bin/marshal-shim\t\t/w/.mcp.json\n",
+            "",
+        );
+        let f = Probe::parse(&unshadowed).failures(&t, &r);
+        assert!(
+            f.iter().any(|x| x.contains("fixed to ws://live:6155")),
+            "{f:#?}"
         );
     }
 
@@ -1371,7 +1475,7 @@ mod tests {
              @@claude-plugin enabled\t{path}\n\
              @@claude-hook session-start\tmarshal-shim\t{path}/hooks/hooks.json\n\
              @@claude-hook wait\tmarshal-shim\t{path}/hooks/hooks.json\n\
-             @@claude-mcp marshal-shim\t\t{path}/.mcp.json\n\
+             @@claude-mcp plugin\tplugin:marshal-shim:marshal\tmarshal-shim\t\t{path}/.mcp.json\n\
              @@done\n"
         )
     }
@@ -1403,7 +1507,9 @@ mod tests {
                 "@@claude-hook {v}\t/home/u/.local/bin/marshal-shim\t/home/u/.claude/settings.json\n"
             ));
         }
-        s.push_str("@@claude-mcp /home/u/.local/bin/marshal-shim\t\t~/.claude.json\n");
+        s.push_str(
+            "@@claude-mcp user\tmarshal\t/home/u/.local/bin/marshal-shim\t\t~/.claude.json\n",
+        );
         s.push_str(&format!(
             "@@shim-at /home/u/.local/bin/marshal-shim\t/home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}\n@@done\n"
         ));
@@ -1514,7 +1620,7 @@ mod tests {
                 "not `marshal-shim claude-hook wait`",
             ),
             (
-                "@@claude-mcp marshal-shim\t\t/p/marshal-shim/0.60.2/.mcp.json\n",
+                "@@claude-mcp plugin\tplugin:marshal-shim:marshal\tmarshal-shim\t\t/p/marshal-shim/0.60.2/.mcp.json\n",
                 "",
                 "has no MCP server that runs marshal-shim",
             ),
@@ -1548,13 +1654,13 @@ mod tests {
         let none = good.replace(&format!("@@shim marshal-shim {VERSION}"), "@@shim-missing");
         assert!(one_failure(&none, &r).contains("no marshal-shim on its login PATH"));
         let fixed = good.replace(
-            "@@claude-mcp marshal-shim\t\t",
-            "@@claude-mcp marshal-shim\tws://other:6155\t",
+            "@@claude-mcp plugin\tplugin:marshal-shim:marshal\tmarshal-shim\t\t",
+            "@@claude-mcp plugin\tplugin:marshal-shim:marshal\tmarshal-shim\tws://other:6155\t",
         );
         assert!(one_failure(&fixed, &r).contains("fixed to ws://other:6155"));
         let same_addr = good.replace(
-            "@@claude-mcp marshal-shim\t\t",
-            "@@claude-mcp marshal-shim\tws://marshal.mesh:6155\t",
+            "@@claude-mcp plugin\tplugin:marshal-shim:marshal\tmarshal-shim\t\t",
+            "@@claude-mcp plugin\tplugin:marshal-shim:marshal\tmarshal-shim\tws://marshal.mesh:6155\t",
         );
         assert_eq!(
             Probe::parse(&same_addr).failures(&Target::from_request(&r).unwrap(), &r),
