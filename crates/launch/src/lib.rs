@@ -221,7 +221,6 @@ pub struct Outcome {
 pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
     let local = adapter.name() == address::LOCAL_ADAPTER;
     address::check_for_adapter(adapter.name(), &plan.launch_address)?;
-    let roster = join::Roster::connect(&plan.daemon_address).await?;
     let agent_id = new_agent_id();
     let req = LaunchRequest {
         version: PROTOCOL_VERSION,
@@ -243,6 +242,8 @@ pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
         adapter.name(),
         req.env.get("MARSHAL_BASE_URL").map(String::as_str),
     )?;
+    // The address checks above need no daemon, so a refused launch fails at once.
+    let roster = join::Roster::connect(&plan.daemon_address).await?;
     if plan.check {
         adapter
             .check(&req)
