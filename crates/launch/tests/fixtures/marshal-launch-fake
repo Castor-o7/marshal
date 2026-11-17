@@ -21,7 +21,8 @@ case "$reason" in
   unreachable) fail "can't reach fake-host: No route to host; nothing was started" ;;
   daemon-port) fail "fake-host can't reach the daemon at marshal.mesh:6155 (the launch address)" ;;
   hook-port) fail "fake-host can't reach the daemon's hook port at marshal.mesh:6156" ;;
-  shim-version) fail "marshal-shim on fake-host is 0.1.0; this launcher accepts 0.60.x" ;;
+  shim-version) fail "on fake-host: the target's marshal-shim is 0.1.0, but this launcher is 0.60.2" ;;
+  daemon-address) fail "fake-host has ~/.config/marshal/daemon-address naming ws://elsewhere:6155; the shim reads that file ahead of MARSHAL_DAEMON_ADDRESS" ;;
   hooks) fail "Claude's hooks on fake-host don't run \`marshal-shim claude-hook\`" ;;
   mcp) fail "Claude's MCP server on fake-host is not marshal-shim" ;;
   silent) exit 3 ;;

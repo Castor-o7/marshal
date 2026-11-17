@@ -24,6 +24,7 @@ fn req(options: &[&str]) -> LaunchRequest {
         cwd: "~/work/app".into(),
         name: "claude-app".into(),
         agent_id: "launch-6f1c".into(),
+        marshal_version: marshal_launch::MARSHAL_VERSION.into(),
         env: BTreeMap::from([
             ("MARSHAL_AGENT_ID".into(), "launch-6f1c".into()),
             (
@@ -101,13 +102,17 @@ fn check_failures_carry_the_adapters_reason() {
         ),
         (
             "shim-version",
-            "marshal-shim on fake-host is 0.1.0; this launcher accepts 0.60.x",
+            "the target's marshal-shim is 0.1.0, but this launcher is 0.60.2",
         ),
         (
             "hooks",
             "hooks on fake-host don't run `marshal-shim claude-hook`",
         ),
         ("mcp", "MCP server on fake-host is not marshal-shim"),
+        (
+            "daemon-address",
+            "fake-host has ~/.config/marshal/daemon-address naming ws://elsewhere:6155",
+        ),
     ] {
         let e = fake()
             .check(&req(&[&format!("--fail={reason}")]))

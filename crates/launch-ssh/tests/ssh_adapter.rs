@@ -76,6 +76,7 @@ impl Env {
             "cwd": self.path("work"),
             "name": "mar94-test",
             "agent_id": "launch-test-1",
+            "marshal_version": marshal_launch_ssh::VERSION,
             "env": {
                 "MARSHAL_AGENT_ID": "launch-test-1",
                 "MARSHAL_DAEMON_ADDRESS": "ws://marshal.invalid:6155",
@@ -227,8 +228,7 @@ fn check_runs_its_probes_on_the_target_and_names_each_failure() {
         "can't reach the daemon's hook port at marshal.invalid:6156",
         "has no folder",
         "no-such-folder",
-        "marshal-shim on",
-        "is 0.1.0; this launcher accepts",
+        "the target's marshal-shim is 0.1.0, but this launcher is",
         "has no marshal-shim plugin installed",
     ] {
         assert!(err.contains(want), "missing `{want}` in:\n{err}");
@@ -271,5 +271,40 @@ fn check_reads_a_wired_claude_plugin_on_the_target() {
     assert!(!err.contains("plugin"), "{err}");
     assert!(!err.contains("Claude's hooks"), "{err}");
     assert!(!err.contains("MCP"), "{err}");
-    assert!(!err.contains("marshal-shim on"), "{err}");
+    assert!(!err.contains("the target's marshal-shim is"), "{err}");
+}
+
+#[test]
+fn check_fails_when_the_targets_daemon_address_file_names_another_daemon() {
+    let e = Env::new();
+    let write = |dir: PathBuf, addr: &str| {
+        std::fs::create_dir_all(dir.join("marshal")).unwrap();
+        std::fs::write(dir.join("marshal/daemon-address"), format!("  {addr}\n")).unwrap();
+    };
+    // The target's own ~/.config.
+    let home_cfg = e.path("home/.config");
+    write(home_cfg.clone(), "ws://elsewhere:6155");
+    let err = stderr(&e.run("check", &e.request(&["claude"]), &[]));
+    let file = home_cfg.join("marshal/daemon-address");
+    assert!(
+        err.contains(&format!(
+            "has {} naming ws://elsewhere:6155",
+            file.display()
+        )),
+        "{err}"
+    );
+    assert!(err.contains("ahead of MARSHAL_DAEMON_ADDRESS"), "{err}");
+
+    // A file naming the launch address is fine.
+    write(home_cfg.clone(), "ws://marshal.invalid:6155");
+    let err = stderr(&e.run("check", &e.request(&["claude"]), &[]));
+    assert!(!err.contains("daemon-address"), "{err}");
+
+    // The request's XDG_CONFIG_HOME is the agent's, so its file wins.
+    let xdg = e.path("xdg");
+    write(xdg.clone(), "ws://other:7000");
+    let mut req = e.request(&["claude"]);
+    req["env"]["XDG_CONFIG_HOME"] = serde_json::json!(xdg);
+    let err = stderr(&e.run("check", &req, &[]));
+    assert!(err.contains("naming ws://other:7000"), "{err}");
 }

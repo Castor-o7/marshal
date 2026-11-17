@@ -22,18 +22,15 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
-use marshal_launch::{LaunchRequest, Launched, PROTOCOL_VERSION};
+use marshal_launch::address::{host_port, is_loopback_host};
+use marshal_launch::{LaunchRequest, Launched, PROTOCOL_VERSION, check_shim_version};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// The daemon's websocket port, when the launch address names none.
-pub const DAEMON_PORT: u16 = 6155;
 /// The daemon's hook port. The shim derives it from the launch address the
 /// same way (`ws://host:6155` → `http://host:6156`).
 pub const HOOK_PORT: u16 = 6156;
-/// This adapter's version. The workspace releases the shim, the daemon and the
-/// launcher at one version, so a target's shim is accepted when it matches
-/// this one's release line (see [`shim_compatible`]).
+/// This adapter's version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Begin/end markers `marshal-shim codex-setup` writes around its block in
@@ -139,9 +136,9 @@ impl Target {
         let addr = req.env.get("MARSHAL_DAEMON_ADDRESS").ok_or_else(|| {
             anyhow!("the request's env has no MARSHAL_DAEMON_ADDRESS (the launch address)")
         })?;
-        let daemon = parse_address(addr, &["ws://", "wss://"], DAEMON_PORT)
-            .ok_or_else(|| anyhow!("can't read the launch address `{addr}`"))?;
-        if is_loopback(&daemon.host) {
+        let daemon =
+            ws_host_port(addr).ok_or_else(|| anyhow!("can't read the launch address `{addr}`"))?;
+        if is_loopback_host(&daemon.host) {
             bail!(
                 "the launch address {addr} is a loopback address, which on {dest} would not be \
                  this daemon; launch with an address the target can reach (a mesh name or IP)"
@@ -153,7 +150,7 @@ impl Target {
             Some(base) => {
                 let hp = parse_address(base, &["http://", "https://"], HOOK_PORT)
                     .ok_or_else(|| anyhow!("can't read MARSHAL_BASE_URL `{base}`"))?;
-                if is_loopback(&hp.host) {
+                if is_loopback_host(&hp.host) {
                     bail!("MARSHAL_BASE_URL {base} is a loopback address; {dest} can't reach it");
                 }
                 hp
@@ -254,21 +251,11 @@ pub fn parse_address(addr: &str, schemes: &[&str], default_port: u16) -> Option<
     })
 }
 
-/// `localhost`, `*.localhost`, 127/8, `::1`, and the unspecified addresses.
-pub fn is_loopback(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    if h == "localhost" || h.ends_with(".localhost") {
-        return true;
-    }
-    match h.parse::<std::net::IpAddr>() {
-        Ok(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || matches!(ip, std::net::IpAddr::V6(v6)
-                    if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified()))
-        }
-        Err(_) => false,
-    }
+/// A `ws://` or `wss://` address's host and port, read the way the launcher reads it.
+pub fn ws_host_port(addr: &str) -> Option<HostPort> {
+    host_port(addr)
+        .ok()
+        .map(|(host, port)| HostPort { host, port })
 }
 
 /// Shell single-quote.
@@ -286,7 +273,7 @@ case "$cwd" in "~") cwd=$HOME ;; "~/"*) cwd=$HOME/${cwd#"~/"} ;; esac
 /// The `check` script: reports each probe, starts nothing.
 pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
     let mut s = format!(
-        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\n",
+        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\nreq_xdg={}\n",
         sq(&t.daemon.host),
         t.daemon.port,
         sq(&t.hook.host),
@@ -294,6 +281,11 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
         sq(&req.cwd),
         sq(&req.harness),
         sq(&req.argv[0]),
+        sq(req
+            .env
+            .get("XDG_CONFIG_HOME")
+            .map(String::as_str)
+            .unwrap_or("")),
     );
     s.push_str(PRELUDE);
     s.push_str(&format!(
@@ -315,6 +307,18 @@ if command -v marshal-shim >/dev/null 2>&1; then
 else
   say "shim-missing"
 fi
+# The shim reads marshal/daemon-address ahead of MARSHAL_DAEMON_ADDRESS: the
+# first of these with a non-empty first line wins. The agent's XDG_CONFIG_HOME
+# is the request's if it sets one.
+xdg=${{req_xdg:-${{XDG_CONFIG_HOME:-}}}}
+for f in ${{xdg:+"$xdg/marshal/daemon-address"}} "$HOME/.config/marshal/daemon-address"; do
+  [ -f "$f" ] || continue
+  line=$(head -n 1 "$f" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$line" ] || continue
+  say "daemon-address-file $f"
+  say "daemon-address $line"
+  break
+done
 case "$harness" in
 claude)
   if command -v claude >/dev/null 2>&1; then
@@ -366,6 +370,9 @@ pub struct Probe {
     /// `claude-plugin-hooks <path>`, `codex-managed`, ...).
     pub blocks: BTreeMap<String, String>,
     pub codex_config_missing: Option<String>,
+    /// The shim's `marshal/daemon-address` file, if one names an address:
+    /// its path and that address.
+    pub daemon_address_file: Option<(String, String)>,
     pub done: bool,
 }
 
@@ -398,6 +405,14 @@ impl Probe {
                 "harness" => p.harness = Some(v == "ok"),
                 "shim" => p.shim = Some(v.to_string()),
                 "codex-config-missing" => p.codex_config_missing = Some(v.to_string()),
+                "daemon-address-file" => {
+                    p.daemon_address_file = Some((v.to_string(), String::new()))
+                }
+                "daemon-address" => {
+                    if let Some((_, a)) = &mut p.daemon_address_file {
+                        *a = v.to_string();
+                    }
+                }
                 "begin" => block = Some((v.to_string(), String::new())),
                 "done" => p.done = true,
                 _ => {}
@@ -444,16 +459,21 @@ impl Probe {
             None => f.push(format!(
                 "{host} has no marshal-shim on PATH (in a login shell)"
             )),
-            Some(v) => match shim_version(v) {
-                Some(found) if shim_compatible(found, VERSION) => {}
-                Some(found) => f.push(format!(
-                    "marshal-shim on {host} is {found}; this launcher accepts {}",
-                    accepted_range(VERSION)
-                )),
-                None => f.push(format!(
-                    "marshal-shim --version on {host} printed `{v}`, not a marshal-shim version"
-                )),
-            },
+            Some(v) => {
+                if let Err(e) = check_shim_version(v, &req.marshal_version) {
+                    f.push(format!("on {host}: {e:#}"));
+                }
+            }
+        }
+        if let Some((path, named)) = &self.daemon_address_file
+            && ws_host_port(named).as_ref() != Some(&t.daemon)
+        {
+            f.push(format!(
+                "{host} has {path} naming {named}; the shim reads that file ahead of \
+                 MARSHAL_DAEMON_ADDRESS, so the agent would join that daemon and not the launch \
+                 address {}. Remove the file or make it name the launch address",
+                t.daemon
+            ));
         }
         match req.harness.as_str() {
             "claude" => f.extend(self.claude_wiring(host, t)),
@@ -517,8 +537,7 @@ impl Probe {
                 // a fixed address elsewhere would send the agent to another daemon.
                 if let Some(a) = server["env"]["MARSHAL_DAEMON_ADDRESS"].as_str()
                     && !a.contains("${MARSHAL_DAEMON_ADDRESS")
-                    && parse_address(a, &["ws://", "wss://"], DAEMON_PORT).as_ref()
-                        != Some(&t.daemon)
+                    && ws_host_port(a).as_ref() != Some(&t.daemon)
                 {
                     f.push(format!(
                         "Claude's marshal-shim MCP server on {host} is fixed to {a}, not the launch \
@@ -566,7 +585,7 @@ impl Probe {
         // codex-setup writes the daemon address into the block; it must be
         // this launch's, or the agent joins some other daemon.
         if let Some(a) = toml_string_after(block, "MARSHAL_DAEMON_ADDRESS")
-            && parse_address(&a, &["ws://", "wss://"], DAEMON_PORT).as_ref() != Some(&t.daemon)
+            && ws_host_port(&a).as_ref() != Some(&t.daemon)
         {
             f.push(format!(
                 "Codex on {host} is set up for the daemon at {a}, not the launch address {}; run \
@@ -592,35 +611,6 @@ fn toml_string_after(s: &str, key: &str) -> Option<String> {
 fn is_shim_command(c: &str) -> bool {
     let base = c.rsplit(['/', '\\']).next().unwrap_or(c);
     base == "marshal-shim" || base == "marshal-shim.exe"
-}
-
-/// `marshal-shim 0.60.2` → `0.60.2`.
-pub fn shim_version(out: &str) -> Option<&str> {
-    let v = out.trim().strip_prefix("marshal-shim ")?.trim();
-    semver_triple(v).map(|_| v)
-}
-
-fn semver_triple(v: &str) -> Option<(u64, u64, u64)> {
-    let core = v.split(['-', '+']).next()?;
-    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
-    let t = (it.next()??, it.next()??, it.next()??);
-    it.next().is_none().then_some(t)
-}
-
-/// Same release line: same major, and for `0.x` the same minor too.
-pub fn shim_compatible(found: &str, ours: &str) -> bool {
-    match (semver_triple(found), semver_triple(ours)) {
-        (Some((fm, fn_, _)), Some((om, on, _))) => fm == om && (om != 0 || fn_ == on),
-        _ => false,
-    }
-}
-
-fn accepted_range(ours: &str) -> String {
-    match semver_triple(ours) {
-        Some((0, m, _)) => format!("0.{m}.x"),
-        Some((m, _, _)) => format!("{m}.x"),
-        None => ours.to_string(),
-    }
 }
 
 /// The `launch` script: start `argv` in a detached tmux session, in `cwd`,
@@ -796,6 +786,7 @@ mod tests {
             cwd: "~/work/app".into(),
             name: "claude-app".into(),
             agent_id: "launch-1".into(),
+            marshal_version: VERSION.into(),
             env: BTreeMap::from([
                 ("MARSHAL_AGENT_ID".into(), "launch-1".into()),
                 ("MARSHAL_DAEMON_ADDRESS".into(), addr.into()),
@@ -811,7 +802,6 @@ mod tests {
             "ws://127.0.0.1:6155",
             "ws://127.9.9.9",
             "ws://[::1]:6155",
-            "ws://0.0.0.0:6155",
             "ws://foo.localhost:6155",
             "ws://[::ffff:127.0.0.1]:6155",
         ] {
@@ -838,7 +828,7 @@ mod tests {
 
     #[test]
     fn hook_port_follows_marshal_base_url_and_refuses_its_loopback() {
-        let mut r = req("ws://100.86.1.2");
+        let mut r = req("ws://100.86.1.2:6155");
         r.env
             .insert("MARSHAL_BASE_URL".into(), "http://hooks.mesh:7000/".into());
         let t = Target::from_request(&r).unwrap();
@@ -897,17 +887,6 @@ mod tests {
     }
 
     #[test]
-    fn shim_versions() {
-        assert_eq!(shim_version("marshal-shim 0.60.2\n"), Some("0.60.2"));
-        assert_eq!(shim_version("bash: marshal-shim: not found"), None);
-        assert!(shim_compatible("0.60.9", "0.60.2"));
-        assert!(!shim_compatible("0.59.0", "0.60.2"));
-        assert!(shim_compatible("1.4.0", "1.0.0"));
-        assert!(!shim_compatible("2.0.0", "1.9.0"));
-        assert_eq!(accepted_range("0.60.2"), "0.60.x");
-    }
-
-    #[test]
     fn handles_round_trip() {
         let h = handle("u@build-03", "claude-app");
         assert_eq!(
@@ -959,11 +938,6 @@ mod tests {
                 "hook port at marshal.mesh:6156",
             ),
             (
-                "@@shim marshal-shim",
-                "@@shim marshal-shim 0.1.0 x",
-                "not a marshal-shim version",
-            ),
-            (
                 "@@cwd /home/u/work/app",
                 "@@cwd-missing /home/u/work/app",
                 "has no folder",
@@ -993,7 +967,26 @@ mod tests {
             assert!(f.contains(want), "{from} → {to}: {f}");
         }
         let old = good.replace(&format!("marshal-shim {VERSION}"), "marshal-shim 0.1.0");
-        assert!(one_failure(&old, &r).contains("is 0.1.0; this launcher accepts"));
+        assert!(one_failure(&old, &r).contains("on build-03: the target's marshal-shim is 0.1.0"));
+        let file = good.replace(
+            "@@done\n",
+            "@@daemon-address-file /home/u/.config/marshal/daemon-address\n@@daemon-address ws://old:6155\n@@done\n",
+        );
+        let e = one_failure(&file, &r);
+        assert!(
+            e.contains("/home/u/.config/marshal/daemon-address naming ws://old:6155"),
+            "{e}"
+        );
+        let same = good.replace(
+            "@@done\n",
+            "@@daemon-address-file /x\n@@daemon-address ws://marshal.mesh:6155\n@@done\n",
+        );
+        assert_eq!(
+            Probe::parse(&same).failures(&Target::from_request(&r).unwrap(), &r),
+            Vec::<String>::new()
+        );
+        let garbage = good.replace(&format!("@@shim marshal-shim {VERSION}"), "@@shim oops");
+        assert!(one_failure(&garbage, &r).contains("has no version in it"));
         let none = good.replace(&format!("@@shim marshal-shim {VERSION}"), "@@shim-missing");
         assert!(one_failure(&none, &r).contains("no marshal-shim on PATH"));
         let fixed = good.replace(
