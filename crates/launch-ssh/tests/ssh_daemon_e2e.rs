@@ -22,11 +22,11 @@
 //! ```text
 //! MARSHAL_E2E_DAEMON=~/.cache/marshal-release-0.60.2/marshal-daemon-x86_64-unknown-linux-gnu \
 //! MARSHAL_E2E_SHIM=<target>/debug/marshal-shim \
-//! cargo test -p marshal-launch-ssh --test ssh_daemon_e2e -- --nocapture
+//! cargo test -p marshal-launch-ssh --test ssh_daemon_e2e -- --ignored --nocapture
 //! ```
 //!
-//! Without both variables, a non-loopback address, tmux and python3 or jq,
-//! it says why and passes without running.
+//! It is `#[ignore]`d. Run explicitly, it fails unless both variables, a
+//! non-loopback address, tmux and python3 or jq are there.
 
 #![cfg(unix)]
 
@@ -166,19 +166,18 @@ fn block_on<T>(f: impl std::future::Future<Output = T>) -> T {
 }
 
 #[test]
+#[ignore = "needs MARSHAL_E2E_DAEMON and MARSHAL_E2E_SHIM (see the module docs)"]
 fn the_ssh_adapter_registers_through_the_hook_listener_and_names_a_loopback_one() {
-    let (Some(_), Some(shim)) = (env("MARSHAL_E2E_DAEMON"), env("MARSHAL_E2E_SHIM")) else {
-        eprintln!("skipped: set MARSHAL_E2E_DAEMON and MARSHAL_E2E_SHIM (see the module docs)");
-        return;
-    };
-    let Some(ip) = lan_ip() else {
-        eprintln!("skipped: no non-loopback address here");
-        return;
-    };
-    if !have("tmux", "-V") || !(have("python3", "--version") || have("jq", "--version")) {
-        eprintln!("skipped: needs tmux, and python3 or jq");
-        return;
-    }
+    // Run explicitly, a missing prerequisite fails rather than skips.
+    env("MARSHAL_E2E_DAEMON").expect("set MARSHAL_E2E_DAEMON to a marshal-daemon binary");
+    let shim = env("MARSHAL_E2E_SHIM")
+        .expect("set MARSHAL_E2E_SHIM to a marshal-shim of this tree's version");
+    let ip = lan_ip().expect("needs a non-loopback address");
+    assert!(have("tmux", "-V"), "needs tmux");
+    assert!(
+        have("python3", "--version") || have("jq", "--version"),
+        "needs python3 or jq"
+    );
     let target = Target::new(Path::new(&shim));
     let adapter_dir = Path::new(env!("CARGO_BIN_EXE_marshal-launch-ssh"))
         .parent()
@@ -233,6 +232,10 @@ fn the_ssh_adapter_registers_through_the_hook_listener_and_names_a_loopback_one(
         "{}",
         outcome.agent_id
     );
+    eprintln!(
+        "joined {} (agent {}): the row the stub's SessionStart hook registered through {}",
+        outcome.joined.session_id, outcome.agent_id, d.hook_url
+    );
 
     // The first task reaches the target through the hook listener too.
     let started = Instant::now();
@@ -248,6 +251,11 @@ fn the_ssh_adapter_registers_through_the_hook_listener_and_names_a_loopback_one(
         std::thread::sleep(Duration::from_millis(250));
     }
     assert!(outcome.task_message_id.is_some());
+    eprintln!(
+        "first task {} reached the target through prompt-submit: {}",
+        outcome.task_message_id.as_deref().unwrap_or(""),
+        target.read("prompt-submit.out").trim()
+    );
 
     assert_eq!(ssh.status(&outcome.launched.handle).unwrap(), Some(true));
     ssh.stop(&outcome.launched.handle).unwrap();
@@ -273,6 +281,7 @@ fn the_ssh_adapter_registers_through_the_hook_listener_and_names_a_loopback_one(
     assert!(err.contains("hook listener"), "{err}");
     assert!(err.contains("MARSHAL_HOOK_BIND"), "{err}");
     assert!(!err.contains("can't reach the daemon at"), "{err}");
+    eprintln!("hook listener on loopback, refused: {err}");
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "it waited out the timeout"
