@@ -454,6 +454,13 @@ fn find_predecessor(
         .filter(|i| i.key == key && i.id.0.as_ref() != me && i.assigned_at <= before)
     {
         let id = ident.id.0.as_ref();
+        // MAR-83: with auth on, a session succeeds only its own principal's.
+        // Unknown on either side counts as different. The other session isn't
+        // named, as with any denial.
+        if crate::auth::session_binding::same_principal(me, id) == Some(false) {
+            log::info!("[identity] {me} won't take over a different principal's session");
+            continue;
+        }
         let Some(nick) = nicknames.iter().find(|n| n.id.0.as_ref() == id) else {
             continue;
         };

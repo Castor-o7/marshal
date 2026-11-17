@@ -67,9 +67,13 @@ without bound. A re-registered id after a release is free to whoever registers i
 - **A daemon restart under file persistence empties the table while the store keeps its rows.** Until
   a session's owner re-registers it (the shim does on reconnect), the id is unowned, and the first
   principal to claim it wins. A session-end or sweep of a row with no binding is harmless.
-- **Succession isn't principal-aware.** A dead principal A's session can be succeeded by a session of
-  principal B with the same identity key, which takes its nickname and unread mail (MAR-9, MAR-42).
-  That's MAR-83.
+- **Succession stays within a principal (MAR-83).** A session takes over a dead predecessor (its
+  nickname, ad hoc rooms and unread mail: MAR-9, MAR-42) only when both are one principal's. The
+  binding remembers a released session's principal for a day, since the sweep releases it before the
+  late recheck runs. Unknown on either side counts as different, so a predecessor that died before a
+  daemon restart can't be succeeded under auth: the same limit as the one above, applied to succession.
+  The refusal is logged without naming the other principal or its session. Plain mode succeeds as
+  before.
 
 ## Tests
 
