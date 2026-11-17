@@ -51,6 +51,7 @@ impl Env {
             .env("HOME", self.path("home"))
             .env("TMUX_TMPDIR", self.path("tmux"))
             .env_remove("TMUX")
+            .env_remove("MARSHAL_BASE_URL")
             .env("PATH", path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -225,7 +226,8 @@ fn check_runs_its_probes_on_the_target_and_names_each_failure() {
     let err = stderr(&o);
     for want in [
         "can't reach the daemon at marshal.invalid:6155",
-        "can't reach the daemon's hook port at marshal.invalid:6156",
+        "can't reach the daemon's hook listener at marshal.invalid:6156",
+        "MARSHAL_HOOK_BIND",
         "has no folder",
         "no-such-folder",
         "the target's marshal-shim is 0.1.0, but this launcher is",
@@ -366,4 +368,41 @@ fn check_accepts_claude_wired_by_hand_once_it_has_the_wait_hook() {
     let err = stderr(&e.run("check", &e.request(&["claude"]), &[]));
     assert!(err.contains("can't reach the daemon at"), "{err}");
     assert!(!err.contains("Claude"), "{err}");
+}
+
+/// The shim there takes MARSHAL_BASE_URL from the target's own environment
+/// when the request sets none, so the check probes that hook listener.
+#[test]
+fn check_probes_the_hook_listener_the_targets_marshal_base_url_names() {
+    let e = Env::new();
+    for (base, want) in [
+        (
+            "http://hooks.invalid:7001/",
+            "hook listener at hooks.invalid:7001",
+        ),
+        ("http://[fd00::1]:7002", "hook listener at [fd00::1]:7002"),
+        (
+            "https://hooks.invalid",
+            "hook listener at hooks.invalid:443",
+        ),
+    ] {
+        let err = stderr(&e.run(
+            "check",
+            &e.request(&["claude"]),
+            &[("MARSHAL_BASE_URL", base)],
+        ));
+        assert!(err.contains(want), "{base}: {err}");
+    }
+    // The request's own MARSHAL_BASE_URL wins over the target's.
+    let mut req = e.request(&["claude"]);
+    req["env"]["MARSHAL_BASE_URL"] = json!("http://chosen.invalid:7003");
+    let err = stderr(&e.run(
+        "check",
+        &req,
+        &[("MARSHAL_BASE_URL", "http://hooks.invalid:7001")],
+    ));
+    assert!(
+        err.contains("hook listener at chosen.invalid:7003"),
+        "{err}"
+    );
 }

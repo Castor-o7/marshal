@@ -322,7 +322,7 @@ claude_hand_wired() {
 /// The `check` script: reports each probe, starts nothing.
 pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
     let mut s = format!(
-        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\nreq_xdg={}\n",
+        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\nreq_xdg={}\nreq_base={}\n",
         sq(&t.daemon.host),
         t.daemon.port,
         sq(&t.hook.host),
@@ -333,6 +333,11 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
         sq(req
             .env
             .get("XDG_CONFIG_HOME")
+            .map(String::as_str)
+            .unwrap_or("")),
+        sq(req
+            .env
+            .get("MARSHAL_BASE_URL")
             .map(String::as_str)
             .unwrap_or("")),
     );
@@ -347,6 +352,19 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
   fi
 }}
 say "host $(uname -n)"
+# Without one in the request, the shim there takes MARSHAL_BASE_URL from the
+# target's own environment, so probe the hook listener that names.
+if [ -z "$req_base" ] && [ -n "${{MARSHAL_BASE_URL:-}}" ]; then
+  a=${{MARSHAL_BASE_URL#*://}}; a=${{a%%/*}}
+  case "$MARSHAL_BASE_URL" in https://*) dp=443 ;; *) dp=80 ;; esac
+  case "$a" in
+    \[*\]:*) hook_host=${{a%%]:*}}; hook_host=${{hook_host#[}}; hook_port=${{a##*]:}} ;;
+    \[*\]) hook_host=${{a#[}}; hook_host=${{hook_host%]}}; hook_port=$dp ;;
+    *:*) hook_host=${{a%:*}}; hook_port=${{a##*:}} ;;
+    *) hook_host=$a; hook_port=$dp ;;
+  esac
+  say "hook-from-target $hook_host $hook_port"
+fi
 if probe "$daemon_host" "$daemon_port"; then say "daemon-port ok"; else say "daemon-port fail"; fi
 if probe "$hook_host" "$hook_port"; then say "hook-port ok"; else say "hook-port fail"; fi
 if cd "$cwd" 2>/dev/null; then cwd=$(pwd -P); say "cwd $cwd"; else say "cwd-missing $cwd"; fi
@@ -421,6 +439,9 @@ pub struct Probe {
     /// `claude-plugin-hooks <path>`, `codex-managed`, ...).
     pub blocks: BTreeMap<String, String>,
     pub codex_config_missing: Option<String>,
+    /// The hook listener the target's own `MARSHAL_BASE_URL` names, when the
+    /// request sets none: the shim there uses it, so the check probes it.
+    pub hook_from_target: Option<HostPort>,
     /// Neither python3 nor jq on the target, so hand-wired Claude settings
     /// couldn't be read.
     pub no_json_reader: bool,
@@ -460,6 +481,14 @@ impl Probe {
                 "shim" => p.shim = Some(v.to_string()),
                 "codex-config-missing" => p.codex_config_missing = Some(v.to_string()),
                 "no-json-reader" => p.no_json_reader = true,
+                "hook-from-target" => {
+                    p.hook_from_target = v.split_once(' ').and_then(|(h, port)| {
+                        Some(HostPort {
+                            host: h.to_string(),
+                            port: port.parse().ok()?,
+                        })
+                    })
+                }
                 "daemon-address-file" => {
                     p.daemon_address_file = Some((v.to_string(), String::new()))
                 }
@@ -487,15 +516,17 @@ impl Probe {
         }
         if self.daemon_port_ok != Some(true) {
             f.push(format!(
-                "{host} can't reach the daemon at {} (the launch address); the agent could not join",
+                "{host} can't reach the daemon at {} (the launch address), so the agent could not \
+                 join. Check that the daemon's MARSHAL_BIND listens on an address {host} can reach",
                 t.daemon
             ));
         }
         if self.hook_port_ok != Some(true) {
             f.push(format!(
-                "{host} can't reach the daemon's hook port at {}; the agent's hooks could not \
-                 register it or deliver its mail",
-                t.hook
+                "{host} can't reach the daemon's hook listener at {}, so the agent's hooks could \
+                 not register it or deliver its mail. Check that the daemon's MARSHAL_HOOK_BIND \
+                 listens on an address {host} can reach (it listens on loopback unless set)",
+                self.hook_from_target.as_ref().unwrap_or(&t.hook)
             ));
         }
         if let Some(c) = &self.cwd_missing {
@@ -1125,7 +1156,7 @@ mod tests {
             (
                 "@@hook-port ok",
                 "@@hook-port fail",
-                "hook port at marshal.mesh:6156",
+                "hook listener at marshal.mesh:6156",
             ),
             (
                 "@@cwd /home/u/work/app",
