@@ -306,6 +306,10 @@ pub fn sq(s: &str) -> String {
 
 /// Shared prelude: `say` reports a line back; `cwd` is expanded and resolved
 /// the way the shim will see it (`getcwd`, so symlinks resolved).
+/// Every script runs in bash (`bash -l -s`), whatever the target's login
+/// shell, and quotes its exact-match tmux targets (`"=$name"`): zsh would
+/// expand an unquoted `=word` (EQUALS) to a command path.
+///
 /// Every script's start. PATH is the target's own login PATH: the script
 /// runs under `bash -l`, and when the login shell is another (zsh on macOS,
 /// where Homebrew's PATH is set in .zprofile) PATH is taken from it, since a
@@ -1161,7 +1165,9 @@ pub fn launch(t: &Target, req: &LaunchRequest) -> Result<Launched> {
         handle: h.to_string(),
         r#where: format!("{host} tmux:{}", t.name),
         attach: Some(format!(
-            "ssh -t {} {} attach -t ={}",
+            // The user runs this; ssh hands it to the target's login shell,
+            // and zsh expands an unquoted `=word` (EQUALS) to a command path.
+            "ssh -t {} {} attach -t '={}'",
             t.dest,
             t.tmux.as_deref().unwrap_or("tmux"),
             t.name

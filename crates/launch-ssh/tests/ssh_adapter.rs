@@ -151,7 +151,7 @@ fn launch_runs_argv_in_cwd_with_env_then_status_and_stop() {
     assert_eq!(l["host"], host.trim());
     assert_eq!(l["cwd"], work.display().to_string());
     assert_eq!(l["where"], format!("{} tmux:mar94-test", host.trim()));
-    assert_eq!(l["attach"], "ssh -t target-1 tmux attach -t =mar94-test");
+    assert_eq!(l["attach"], "ssh -t target-1 tmux attach -t '=mar94-test'");
     // The response parses as the launcher's type.
     let _: marshal_launch::Launched = serde_json::from_value(l.clone()).unwrap();
 
@@ -578,7 +578,7 @@ fn tmux_option_is_used_by_check_launch_status_and_stop() {
     assert_eq!(l["handle"], format!("target-1 mar94-test tmux={tmux}"));
     assert_eq!(
         l["attach"],
-        format!("ssh -t target-1 {tmux} attach -t =mar94-test")
+        format!("ssh -t target-1 {tmux} attach -t '=mar94-test'")
     );
     let h = json!({"version": 1, "handle": l["handle"]});
     assert_eq!(stdout_json(&e.run("status", &h, &[]))["running"], true);
@@ -705,4 +705,56 @@ fn check_passes_a1s_layout() {
     ] {
         assert!(!err.contains(not), "`{not}` in:\n{err}");
     }
+}
+
+/// a1's login shell is zsh. Real ssh hands the remote command to the login
+/// shell, and the user's attach command goes the same way. zsh expands an
+/// unquoted `=word` to a command path (EQUALS), so `-t =<name>` breaks there.
+/// This runs the adapter's scripts through `zsh -c` (as sshd would) with zsh
+/// as the login shell, on a live session.
+#[test]
+fn status_stop_and_attach_work_when_the_login_shell_is_zsh() {
+    let zsh = which("zsh");
+    if zsh.is_empty() {
+        eprintln!("skipping: no zsh on this machine, so the zsh login-shell case can't run");
+        return;
+    }
+    if !have_tmux() {
+        eprintln!("skipping: no tmux");
+        return;
+    }
+    let e = Env::new();
+    let shell = [
+        ("SHELL", zsh.as_str()),
+        ("FAKE_SSH_LOGIN_SHELL", zsh.as_str()),
+    ];
+    let l = stdout_json(&e.run("launch", &e.request(&["sh", "-c", "sleep 60"]), &shell));
+    let h = json!({"version": 1, "handle": l["handle"]});
+    assert_eq!(stdout_json(&e.run("status", &h, &shell))["running"], true);
+
+    // The attach command, minus `ssh -t <dest>`, is what the target's zsh
+    // runs. Checked with has-session, which needs no terminal.
+    let remote = l["attach"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("ssh -t target-1 ")
+        .unwrap()
+        .replace(" attach ", " has-session ");
+    let in_zsh = |cmd: &str| {
+        Command::new(&zsh)
+            .args(["-c", cmd])
+            .env("TMUX_TMPDIR", e.path("tmux"))
+            .env_remove("TMUX")
+            .output()
+            .unwrap()
+    };
+    let o = in_zsh(&remote);
+    assert!(o.status.success(), "{remote}: {}", stderr(&o));
+    // The unquoted form is the bug: zsh fails it before tmux runs.
+    let o = in_zsh("tmux has-session -t =mar94-test");
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("not found"), "{}", stderr(&o));
+
+    stdout_json(&e.run("stop", &h, &shell));
+    assert_eq!(stdout_json(&e.run("status", &h, &shell))["running"], false);
 }
