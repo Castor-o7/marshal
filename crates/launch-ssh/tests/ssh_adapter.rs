@@ -406,3 +406,30 @@ fn check_probes_the_hook_listener_the_targets_marshal_base_url_names() {
         "{err}"
     );
 }
+
+/// The check's probes connect: listeners on this machine's non-loopback
+/// address are reported reachable (loopback launch addresses are refused).
+#[test]
+fn check_reaches_listening_ports() {
+    let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("10.255.255.255:9").map(|_| s))
+        .and_then(|s| s.local_addr())
+        .ok()
+        .map(|a| a.ip())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+    else {
+        eprintln!("skipping: no non-loopback address");
+        return;
+    };
+    let daemon = std::net::TcpListener::bind((ip, 0)).unwrap();
+    let hook = std::net::TcpListener::bind((ip, 0)).unwrap();
+    let e = Env::new();
+    let mut req = e.request(&["claude"]);
+    req["env"]["MARSHAL_DAEMON_ADDRESS"] =
+        json!(format!("ws://{ip}:{}", daemon.local_addr().unwrap().port()));
+    req["env"]["MARSHAL_BASE_URL"] =
+        json!(format!("http://{ip}:{}", hook.local_addr().unwrap().port()));
+    let err = stderr(&e.run("check", &req, &[]));
+    assert!(err.contains("can't run this launch"), "{err}");
+    assert!(!err.contains("can't reach the daemon"), "{err}");
+}

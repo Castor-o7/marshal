@@ -346,9 +346,9 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
     s.push_str(&format!(
         r#"probe() {{
   if command -v timeout >/dev/null 2>&1; then
-    timeout 5 bash -c ': </dev/tcp/"$1"/"$2"' 2>/dev/null
+    timeout 5 bash -c ': </dev/tcp/"$1"/"$2"' probe "$1" "$2" 2>/dev/null
   else
-    bash -c ': </dev/tcp/"$1"/"$2"' 2>/dev/null
+    bash -c ': </dev/tcp/"$1"/"$2"' probe "$1" "$2" 2>/dev/null
   fi
 }}
 say "host $(uname -n)"
