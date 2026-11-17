@@ -180,6 +180,25 @@ pub fn check_for_adapter(adapter: &str, address: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a loopback hook base (`MARSHAL_BASE_URL`) for any adapter but `tmux`,
+/// before anything starts, for the same reason as [`check_for_adapter`]: the
+/// agent's hooks would dial its own machine and the agent would never join.
+pub fn check_hook_base_for_adapter(adapter: &str, hook_base: Option<&str>) -> Result<()> {
+    let Some(base) = hook_base.map(str::trim).filter(|b| !b.is_empty()) else {
+        return Ok(());
+    };
+    let (host, _) = http_host_port(base)?;
+    if adapter != LOCAL_ADAPTER && is_loopback_host(&host) {
+        bail!(
+            "MARSHAL_BASE_URL {base} is loopback, which only reaches this machine, so the \
+             {adapter} adapter wasn't run and nothing was started. Set it to the daemon's hook \
+             listener at an address the target can reach, or unset it to use port {HOOK_PORT} \
+             on the launch address's host"
+        );
+    }
+    Ok(())
+}
+
 /// Connect to both of the daemon's listeners at `address`, from here, and say
 /// which one can't be reached. An agent whose hooks can't reach the hook port
 /// never appears on the roster, and that would otherwise show only as a timeout.
@@ -263,6 +282,29 @@ mod tests {
             resolve(None, None, None, None, None),
             DEFAULT_DAEMON_ADDRESS
         );
+    }
+
+    #[test]
+    fn only_tmux_may_launch_with_a_loopback_hook_base() {
+        for b in [
+            "http://localhost:26156",
+            "http://127.0.0.1:26156/",
+            "http://[::1]:26156",
+            "http://0.0.0.0:6156",
+        ] {
+            assert!(check_hook_base_for_adapter("tmux", Some(b)).is_ok(), "{b}");
+            let err = check_hook_base_for_adapter("ssh", Some(b))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("MARSHAL_BASE_URL") && err.contains("nothing was started"),
+                "{err}"
+            );
+        }
+        assert!(check_hook_base_for_adapter("ssh", Some("http://192.168.1.241:26156")).is_ok());
+        assert!(check_hook_base_for_adapter("ssh", None).is_ok());
+        assert!(check_hook_base_for_adapter("ssh", Some(" ")).is_ok());
+        assert!(check_hook_base_for_adapter("ssh", Some("ws://h:1")).is_err());
     }
 
     #[test]

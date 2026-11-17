@@ -67,7 +67,7 @@ fn a_real_daemon_sees_the_launch_join_read_its_task_and_leave() {
     std::fs::create_dir_all(&config).unwrap();
     let cwd = std::fs::canonicalize(&cwd).unwrap();
 
-    // The launcher passes these to a local agent (its LOCAL_ENV): the hook
+    // The launcher passes these to a local agent (its environment): the hook
     // listener on its test port, and a config dir with no daemon-address file,
     // so neither the shim nor the check reads the user's own. This test binary
     // runs only this test, and sets them before starting any thread of its own.

@@ -145,13 +145,19 @@ pub fn harness_argv(harness: &str) -> Result<Vec<String>> {
 }
 
 /// Settings passed from the launcher's environment to any target. None is a secret.
-const PASSED_ENV: &[&str] = &["MARSHAL_OPERATOR", "MARSHAL_WAITER_LOCK_WAIT_SECS"];
+/// `MARSHAL_BASE_URL` is the daemon's hook listener when it isn't on port 6156 of
+/// the launch address's host. It travels with the launch address, and a
+/// non-local adapter is refused a loopback one ([`address::check_hook_base_for_adapter`]).
+const PASSED_ENV: &[&str] = &[
+    "MARSHAL_OPERATOR",
+    "MARSHAL_WAITER_LOCK_WAIT_SECS",
+    "MARSHAL_BASE_URL",
+];
 
 /// Settings that only mean something on this machine, passed to the local
 /// adapter only: a running tmux server would otherwise give the agent the
 /// server's values. None is a secret, and none names an identity.
 const LOCAL_ENV: &[&str] = &[
-    "MARSHAL_BASE_URL",
     "MARSHAL_HOST",
     "MARSHAL_BIN_DIR",
     "MARSHAL_CODEX_BIN",
@@ -208,7 +214,7 @@ pub struct Outcome {
 }
 
 /// Launch `plan` through `adapter` and wait for it to join. Nothing starts if
-/// the launch address is loopback for a non-local adapter, if the daemon can't
+/// the launch address or hook base is loopback for a non-local adapter, if the daemon can't
 /// be reached, or if the adapter's `check` fails.
 pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
     let local = adapter.name() == address::LOCAL_ADAPTER;
@@ -231,6 +237,10 @@ pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
         ),
         options: plan.options.clone(),
     };
+    address::check_hook_base_for_adapter(
+        adapter.name(),
+        req.env.get("MARSHAL_BASE_URL").map(String::as_str),
+    )?;
     if plan.check {
         adapter
             .check(&req)
@@ -359,6 +369,7 @@ mod tests {
             "MARSHAL_CODEX_APP_SERVER_SOCKET" | "XDG_CONFIG_HOME" | "MARSHAL_OPERATOR" => {
                 Some(format!("{k}-value"))
             }
+            "MARSHAL_BASE_URL" => Some("http://marshal.mesh:26156".to_string()),
             _ => None,
         };
         let id = new_agent_id();
@@ -367,10 +378,13 @@ mod tests {
             env.keys().map(String::as_str).collect::<Vec<_>>(),
             [
                 "MARSHAL_AGENT_ID",
+                "MARSHAL_BASE_URL",
                 "MARSHAL_DAEMON_ADDRESS",
                 "MARSHAL_OPERATOR"
             ]
         );
+        // A non-default hook port travels with the launch address to any adapter.
+        assert_eq!(env["MARSHAL_BASE_URL"], "http://marshal.mesh:26156");
         assert_eq!(env["MARSHAL_AGENT_ID"], id);
         assert_eq!(env["MARSHAL_DAEMON_ADDRESS"], "ws://marshal.mesh:6155");
         let local = launch_env(get, true, "ws://localhost:6155", &id);

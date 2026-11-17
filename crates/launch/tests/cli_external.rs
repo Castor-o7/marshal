@@ -82,6 +82,30 @@ fn marshal_launch_fake_goes_end_to_end_through_the_fake_adapter() {
     );
     assert!(!log.exists(), "the fake was run for a refused launch");
 
+    // A loopback hook base is refused for a non-local adapter, before it runs.
+    let loop_hook = launcher(&root, &cell)
+        .env("MARSHAL_BASE_URL", "http://127.0.0.1:26156")
+        .args([
+            "fake",
+            "claude",
+            "--cwd",
+            "/work/app",
+            "--daemon",
+            "ws://marshal.invalid:6155",
+            "--",
+        ])
+        .arg(format!("--log={}", log.display()))
+        .output()
+        .unwrap();
+    assert!(!loop_hook.status.success(), "{}", text(&loop_hook));
+    assert!(
+        String::from_utf8_lossy(&loop_hook.stderr)
+            .contains("MARSHAL_BASE_URL http://127.0.0.1:26156 is loopback"),
+        "{}",
+        text(&loop_hook)
+    );
+    assert!(!log.exists(), "the fake was run for a loopback hook base");
+
     // A missing adapter is named.
     let missing = launcher(&root, &cell)
         .args([
@@ -103,6 +127,7 @@ fn marshal_launch_fake_goes_end_to_end_through_the_fake_adapter() {
     // The real launch. The launch address is what the agent would be given; the
     // launcher itself reaches the cell through MARSHAL_DAEMON_ADDRESS.
     let mut child = launcher(&root, &cell)
+        .env("MARSHAL_BASE_URL", "http://marshal.invalid:26156")
         .args([
             "fake",
             "claude",
@@ -157,6 +182,11 @@ fn marshal_launch_fake_goes_end_to_end_through_the_fake_adapter() {
     assert!(
         launch_req["env"].get("XDG_CONFIG_HOME").is_none(),
         "{launch_req}"
+    );
+    // A non-default hook port travels to a non-local adapter too.
+    assert_eq!(
+        launch_req["env"]["MARSHAL_BASE_URL"],
+        "http://marshal.invalid:26156"
     );
 
     // The agent's hooks register it where the fake said it runs.
