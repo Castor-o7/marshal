@@ -14,6 +14,7 @@ fn launch(agent_id: &str, name: &str) -> Launch {
         r#where: format!("murph tmux:{name}"),
         attach: Some(format!("tmux attach -t ={name}")),
         started_at: 1,
+        daemon: None,
         session_id: None,
     }
 }

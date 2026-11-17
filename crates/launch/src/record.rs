@@ -28,6 +28,10 @@ pub struct Launch {
     pub attach: Option<String>,
     /// Milliseconds since the epoch.
     pub started_at: i64,
+    /// The daemon the launch was made against (its launch address), which
+    /// `list` reads the roster from. Absent in records written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<String>,
     /// The joined session's id, once it joined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -206,6 +210,7 @@ mod tests {
             r#where: format!("murph tmux:{name}"),
             attach: None,
             started_at: 1,
+            daemon: None,
             session_id: None,
         }
     }

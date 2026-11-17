@@ -192,7 +192,9 @@ pub struct Plan {
     pub name: String,
     /// Where the agent finds the daemon.
     pub launch_address: String,
-    /// Where the launcher itself reaches the daemon.
+    /// Where the launcher itself reaches the same daemon, to wait for the join
+    /// and send the first task. The binary uses the launch address. A library
+    /// caller may give another route to the same daemon.
     pub daemon_address: String,
     pub timeout: Duration,
     pub check: bool,
@@ -271,6 +273,7 @@ pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
+            daemon: Some(plan.daemon_address.clone()),
             session_id: None,
         };
         if let Err(e) = store.add(entry) {
