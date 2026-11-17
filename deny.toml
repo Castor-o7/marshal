@@ -29,6 +29,15 @@ ignore = [
   # Unmaintained, not vulnerable: only myko's optional TypeScript code generation
   # (the entities crate's `ts-export` feature) pulls it in; no binary uses it.
   { id = "RUSTSEC-2026-0249", reason = "smartstring: only under myko's optional codegen-ts feature, not in any binary" },
+  # chrono 0.4.45 is unmaintained (informational, 2026-09-14), and there's no
+  # safe upgrade. This is an unmaintained notice, not a vulnerability: no flaw
+  # is reported in the code Marshal runs. Marshal uses chrono directly, for
+  # timestamps (Utc::now, and one NaiveDateTime parse) in the daemon, entities,
+  # shim and tui crates; it also comes in through myko, myko-server, ts-rs,
+  # postgres-types (tokio-postgres -> postgres), rquickjs-core and, for the web
+  # UI, leptos-use. Drop this entry once Marshal's own timestamps and myko move
+  # to jiff or time.
+  { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, not a vulnerability; Marshal's own timestamps plus myko, ts-rs, postgres-types, rquickjs-core and leptos-use; review by 2027-02-17" },
 ]
 
 [licenses]
