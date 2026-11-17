@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod daemon;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 

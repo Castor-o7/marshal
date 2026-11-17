@@ -183,15 +183,19 @@ pub fn check_for_adapter(adapter: &str, address: &str) -> Result<()> {
 /// Connect to both of the daemon's listeners at `address`, from here, and say
 /// which one can't be reached. An agent whose hooks can't reach the hook port
 /// never appears on the roster, and that would otherwise show only as a timeout.
-pub fn probe(address: &str, timeout: Duration) -> Result<()> {
-    probe_ports(address, HOOK_PORT, timeout)
-}
-
-fn probe_ports(address: &str, hook_port: u16, timeout: Duration) -> Result<()> {
-    let (host, port) = host_port(address)?;
-    for (what, port, bind) in [
-        ("daemon", port, "MARSHAL_BIND"),
-        ("hook", hook_port, "MARSHAL_HOOK_BIND"),
+///
+/// The hook listener is the one the agent's shim will use: `hook_base` (the
+/// `MARSHAL_BASE_URL` the agent is given) if set, else port 6156 on the launch
+/// address's host, as the shim derives it.
+pub fn probe(address: &str, hook_base: Option<&str>, timeout: Duration) -> Result<()> {
+    let daemon = host_port(address)?;
+    let hook = match hook_base.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(base) => http_host_port(base)?,
+        None => (daemon.0.clone(), HOOK_PORT),
+    };
+    for (what, (host, port), bind) in [
+        ("daemon", daemon, "MARSHAL_BIND"),
+        ("hook", hook, "MARSHAL_HOOK_BIND"),
     ] {
         if !reachable(&host, port, timeout) {
             bail!(
@@ -202,6 +206,19 @@ fn probe_ports(address: &str, hook_port: u16, timeout: Duration) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The host and port of an `http://` or `https://` hook base, such as
+/// `http://h:6156/`; the port defaults to 80 or 443 by scheme.
+pub fn http_host_port(base: &str) -> Result<(String, u16)> {
+    let (rest, scheme) = if let Some(r) = base.strip_prefix("http://") {
+        (r, "ws")
+    } else if let Some(r) = base.strip_prefix("https://") {
+        (r, "wss")
+    } else {
+        bail!("the hook base {base:?} isn't an http:// or https:// URL");
+    };
+    host_port(&format!("{scheme}://{rest}"))
 }
 
 fn reachable(host: &str, port: u16, timeout: Duration) -> bool {
@@ -246,6 +263,22 @@ mod tests {
             resolve(None, None, None, None, None),
             DEFAULT_DAEMON_ADDRESS
         );
+    }
+
+    #[test]
+    fn a_hook_base_gives_its_host_and_port() {
+        assert_eq!(http_host_port("http://h:7156").unwrap(), ("h".into(), 7156));
+        assert_eq!(
+            http_host_port("http://h:7156/").unwrap(),
+            ("h".into(), 7156)
+        );
+        assert_eq!(
+            http_host_port("http://[::1]:7156").unwrap(),
+            ("::1".into(), 7156)
+        );
+        assert_eq!(http_host_port("http://h").unwrap(), ("h".into(), 80));
+        assert_eq!(http_host_port("https://h/x").unwrap(), ("h".into(), 443));
+        assert!(http_host_port("ws://h:1").is_err());
     }
 
     #[test]
@@ -319,15 +352,16 @@ mod tests {
         let address = format!("ws://127.0.0.1:{}", daemon.local_addr().unwrap().port());
         let hook_port = hook.local_addr().unwrap().port();
         let t = Duration::from_millis(500);
-        probe_ports(&address, hook_port, t).unwrap();
+        let base = format!("http://127.0.0.1:{hook_port}/");
+        probe(&address, Some(&base), t).unwrap();
         drop(hook);
-        let err = probe_ports(&address, hook_port, t).unwrap_err().to_string();
+        let err = probe(&address, Some(&base), t).unwrap_err().to_string();
         assert!(
             err.contains("hook listener") && err.contains("MARSHAL_HOOK_BIND"),
             "{err}"
         );
         drop(daemon);
-        let err = probe_ports(&address, hook_port, t).unwrap_err().to_string();
+        let err = probe(&address, Some(&base), t).unwrap_err().to_string();
         assert!(
             err.contains("daemon listener") && err.contains("MARSHAL_BIND"),
             "{err}"

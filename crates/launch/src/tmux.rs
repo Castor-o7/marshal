@@ -287,7 +287,13 @@ impl Adapter for Tmux {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        let host = this_host();
+        // The name the agent's shim reports: MARSHAL_HOST if it's given one.
+        let host = req
+            .env
+            .get("MARSHAL_HOST")
+            .filter(|h| !h.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(this_host);
         Ok(Launched {
             handle: req.name.clone(),
             r#where: format!("{host} tmux:{}", req.name),

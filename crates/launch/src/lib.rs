@@ -234,7 +234,8 @@ pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
             .with_context(|| format!("the {} adapter's check failed", adapter.name()))?;
         if local {
             // The agent runs here, so this machine's view of both ports is the agent's.
-            address::probe(&plan.launch_address, Duration::from_secs(3))?;
+            let hook_base = req.env.get("MARSHAL_BASE_URL").map(String::as_str);
+            address::probe(&plan.launch_address, hook_base, Duration::from_secs(3))?;
         }
     }
     let launched = adapter

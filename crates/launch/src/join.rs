@@ -30,6 +30,22 @@ pub enum Join<'a> {
     Waiting(Vec<String>),
 }
 
+/// Whether two host names are the same machine. The shim reports the full
+/// `gethostname` from its own registration but only the first label from its
+/// hooks (`build-03.mesh` vs `build-03`), so names are compared by first label,
+/// ignoring case.
+pub fn same_host(a: &str, b: &str) -> bool {
+    let first = |h: &str| {
+        h.trim()
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let (a, b) = (first(a), first(b));
+    !a.is_empty() && a == b
+}
+
 fn same_dir(a: &str, b: &str) -> bool {
     let trim = |s: &str| {
         let t = s.trim_end_matches('/');
@@ -46,7 +62,7 @@ pub fn find<'a>(sessions: &'a [Arc<Session>], agent_id: &str, launched: &Launche
             continue;
         }
         let host = s.host.as_ref().map(|h| h.name.as_str());
-        if !host.is_some_and(|h| h.eq_ignore_ascii_case(&launched.host)) {
+        if !host.is_some_and(|h| same_host(h, &launched.host)) {
             refused.push(format!(
                 "session {} carries this launch's id but runs on {}, not {}",
                 s.id.0,
@@ -235,6 +251,18 @@ mod tests {
             Join::Joined(s) => assert_eq!(s.id.0.as_ref(), "mine"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn hosts_match_by_first_label_as_the_hooks_report_them() {
+        assert!(same_host("build-03.mesh", "build-03"));
+        assert!(same_host("Build-03", "build-03.mesh.example"));
+        assert!(!same_host("build-04", "build-03"));
+        assert!(!same_host("", ""));
+        let rows = [row("short", Some("build-03"), "/w/app", Some("launch-1"))];
+        let mut l = launched();
+        l.host = "build-03.mesh".into();
+        assert!(matches!(find(&rows, "launch-1", &l), Join::Joined(_)));
     }
 
     #[test]
