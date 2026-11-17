@@ -229,7 +229,8 @@ fn check_runs_its_probes_on_the_target_and_names_each_failure() {
         "has no folder",
         "no-such-folder",
         "the target's marshal-shim is 0.1.0, but this launcher is",
-        "has no marshal-shim plugin installed",
+        "has no MCP server that runs marshal-shim",
+        "don't run `marshal-shim claude-hook`",
     ] {
         assert!(err.contains(want), "missing `{want}` in:\n{err}");
     }
@@ -307,4 +308,62 @@ fn check_fails_when_the_targets_daemon_address_file_names_another_daemon() {
     req["env"]["XDG_CONFIG_HOME"] = serde_json::json!(xdg);
     let err = stderr(&e.run("check", &req, &[]));
     assert!(err.contains("naming ws://other:7000"), "{err}");
+}
+
+fn have_json_reader() -> bool {
+    ["python3", "jq"].iter().any(|p| {
+        Command::new(p)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+/// Wired by hand, as upstream's README documents: the MCP server in
+/// ~/.claude.json and the hooks in ~/.claude/settings.json.
+#[test]
+fn check_accepts_claude_wired_by_hand_once_it_has_the_wait_hook() {
+    if !have_json_reader() {
+        eprintln!("skipping: neither python3 nor jq");
+        return;
+    }
+    let e = Env::new();
+    e.bin(
+        "marshal-shim",
+        &format!("echo 'marshal-shim {}'", marshal_launch_ssh::VERSION),
+    );
+    e.bin("claude", "echo '[]'");
+    std::fs::write(
+        e.path("home/.claude.json"),
+        r#"{"numStartups": 3, "mcpServers": {"marshal": {"command": "marshal-shim"}},
+            "projects": {"/elsewhere": {"history": ["kept on the target"]}}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(e.path("home/.claude")).unwrap();
+    let settings = |extra: &str| {
+        std::fs::write(
+            e.path("home/.claude/settings.json"),
+            format!(
+                r#"{{"env": {{"SOME_TOKEN": "stays-on-the-target"}}, "hooks": {{
+                  "SessionStart": [{{"hooks": [{{"type": "command", "command": "marshal-shim claude-hook session-start", "timeout": 15}}]}}],
+                  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "marshal-shim claude-hook prompt-submit", "timeout": 15}}]}}]{extra}
+                }}}}"#
+            ),
+        )
+        .unwrap()
+    };
+
+    // The README's hooks alone: the only Claude reason is the missing waiter.
+    settings("");
+    let err = stderr(&e.run("check", &e.request(&["claude"]), &[]));
+    assert!(err.contains("not `marshal-shim claude-hook wait`"), "{err}");
+    assert!(!err.contains("MCP server"), "{err}");
+    assert!(!err.contains("don't run"), "{err}");
+
+    settings(
+        r#", "Stop": [{"hooks": [{"type": "command", "command": "marshal-shim claude-hook wait", "asyncRewake": true}]}]"#,
+    );
+    let err = stderr(&e.run("check", &e.request(&["claude"]), &[]));
+    assert!(err.contains("can't reach the daemon at"), "{err}");
+    assert!(!err.contains("Claude"), "{err}");
 }
