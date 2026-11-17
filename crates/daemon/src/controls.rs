@@ -24,7 +24,8 @@ use myko::{core::item::Eventable as _, server::MykoServerContext, utils::downcas
 pub const FORGET_FILE: &str = "forget-sessions";
 pub const RESULTS_FILE: &str = "forget-results";
 /// `allowed-senders` (MAR-89): machines that may send, one name per line;
-/// `#` starts a comment. Absent or empty, everyone may send.
+/// `#` starts a comment. Absent, everyone may send; present with no names
+/// (empty, or only comments), no one may.
 pub const ALLOWED_SENDERS_FILE: &str = "allowed-senders";
 /// How soon the running daemon sees a change.
 pub const REFRESH: Duration = Duration::from_secs(2);
@@ -425,42 +426,85 @@ pub fn apply(dir: &Path, ctx: &MykoServerContext) {
 /// Keep applying the control files, every [`REFRESH`]. Spawn on a tokio task.
 pub async fn run(dir: PathBuf, ctx: MykoServerContext) {
     let mut interval = tokio::time::interval(REFRESH);
-    let mut last_list: Option<Option<Vec<String>>> = None;
+    let mut in_force: Option<Option<Vec<String>>> = None;
     loop {
         interval.tick().await;
         apply(&dir, &ctx);
-        // A file that can't be trusted or read keeps the last good list in
-        // force (a truncate-then-write, a chmod, a symlink swap must not open
-        // the daemon to everyone); only an absent file means everyone.
-        let list = match read_allowed_senders(&dir) {
-            AllowedSenders::Absent => None,
-            AllowedSenders::List(machines) => Some(machines),
-            AllowedSenders::Unusable(why) => {
-                if last_list.is_some() {
-                    log::warn!(
-                        "[controls] {ALLOWED_SENDERS_FILE}: {why}; keeping the last good list"
-                    );
-                    continue;
-                }
-                log::warn!("[controls] {ALLOWED_SENDERS_FILE}: {why}; no list is in force");
-                None
-            }
-        };
-        if last_list.as_ref() != Some(&list) {
-            match &list {
-                Some(machines) => log::info!(
-                    "[controls] messages are allowed only from: {}",
-                    machines.join(", ")
-                ),
-                None if last_list.is_some() => {
-                    log::info!("[controls] the sender allow-list is gone; everyone may send");
-                }
-                None => {}
-            }
+        let (set, note) = refresh_allow_list(in_force.as_ref(), read_allowed_senders(&dir));
+        match note {
+            Some(Note::Warn(m)) => log::warn!("[controls] {m}"),
+            Some(Note::Info(m)) => log::info!("[controls] {m}"),
+            None => {}
+        }
+        if let Some(list) = set {
             marshal_entities::controls::set_allowed_senders(list.clone());
-            last_list = Some(list);
+            in_force = Some(list);
         }
     }
+}
+
+/// A line for the daemon's log.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Note {
+    Warn(String),
+    Info(String),
+}
+
+/// One refresh of the sender allow-list. `in_force` is the list set last
+/// (`Some(None)` for everyone), or `None` before the first read; `read` is what
+/// the file says now. Returns the list to set, if it changes, and what to log.
+///
+/// Only an absent file means everyone may send. A file with no names refuses
+/// everyone, so a read that lands mid-rewrite only ever refuses more. A file
+/// that can't be trusted or read (a chmod, a symlink swap) changes nothing: the
+/// last good list stays, and if there was none, no list is in force.
+pub fn refresh_allow_list(
+    in_force: Option<&Option<Vec<String>>>,
+    read: AllowedSenders,
+) -> (Option<Option<Vec<String>>>, Option<Note>) {
+    let list = match read {
+        AllowedSenders::Absent => None,
+        AllowedSenders::List(machines) => Some(machines),
+        AllowedSenders::Unusable(why) => {
+            return match in_force {
+                Some(Some(_)) => (
+                    None,
+                    Some(Note::Warn(format!(
+                        "{ALLOWED_SENDERS_FILE}: {why}; keeping the last good list"
+                    ))),
+                ),
+                Some(None) => (
+                    None,
+                    Some(Note::Warn(format!(
+                        "{ALLOWED_SENDERS_FILE}: {why}; no list is in force, so everyone may send"
+                    ))),
+                ),
+                None => (
+                    Some(None),
+                    Some(Note::Warn(format!(
+                        "{ALLOWED_SENDERS_FILE}: {why}; no list is in force, so everyone may send"
+                    ))),
+                ),
+            };
+        }
+    };
+    if in_force == Some(&list) {
+        return (None, None);
+    }
+    let note = match &list {
+        Some(machines) if machines.is_empty() => Some(Note::Info(format!(
+            "{ALLOWED_SENDERS_FILE} names no machine; no one may send"
+        ))),
+        Some(machines) => Some(Note::Info(format!(
+            "messages are allowed only from: {}",
+            machines.join(", ")
+        ))),
+        None if in_force.is_some() => Some(Note::Info(
+            "the sender allow-list is gone; everyone may send".to_string(),
+        )),
+        None => None,
+    };
+    (Some(list), note)
 }
 
 /// What `allowed-senders` says right now.
@@ -468,11 +512,11 @@ pub async fn run(dir: PathBuf, ctx: MykoServerContext) {
 pub enum AllowedSenders {
     /// No file: everyone may send.
     Absent,
-    /// The machines named. An empty file is an empty list, which
-    /// `set_allowed_senders` treats as no list.
+    /// The machines named. A file with no names (empty, or only comments) is
+    /// an empty list, which lets no one send.
     List(Vec<String>),
     /// The file is there but can't be trusted (mode or owner) or read; the
-    /// reason. The caller keeps whatever list it had.
+    /// reason. The caller keeps whatever list it had (see [`refresh_allow_list`]).
     Unusable(String),
 }
 
@@ -654,5 +698,57 @@ mod tests {
                 "a world-writable list is unusable, not empty"
             );
         }
+    }
+
+    #[test]
+    fn a_file_with_no_names_lets_no_one_send() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in ["", "# nobody yet\n\n"] {
+            std::fs::write(dir.path().join(ALLOWED_SENDERS_FILE), text).unwrap();
+            let read = read_allowed_senders(dir.path());
+            assert_eq!(read, AllowedSenders::List(vec![]), "{text:?}");
+            // From everyone, as after a truncate caught mid-rewrite: it closes,
+            // it doesn't stay open.
+            let (set, note) = refresh_allow_list(Some(&None), read);
+            assert_eq!(set, Some(Some(vec![])), "{text:?} left sending open");
+            assert!(
+                matches!(&note, Some(Note::Info(m)) if m.contains("no one may send")),
+                "{note:?}"
+            );
+        }
+        // Only an absent file opens it again.
+        let (set, _) = refresh_allow_list(Some(&Some(vec![])), AllowedSenders::Absent);
+        assert_eq!(set, Some(None));
+    }
+
+    #[test]
+    fn an_unusable_file_keeps_what_was_in_force_and_says_which() {
+        let why = || AllowedSenders::Unusable("group- or world-writable".to_string());
+        // A list was in force: it stays, and the log says so.
+        let (set, note) = refresh_allow_list(Some(&Some(vec!["desk".into()])), why());
+        assert_eq!(set, None);
+        assert!(
+            matches!(&note, Some(Note::Warn(m)) if m.contains("keeping the last good list")),
+            "{note:?}"
+        );
+        // No file before it: nothing changes, and the log doesn't claim a
+        // list it hasn't got.
+        for in_force in [Some(&None), None] {
+            let (set, note) = refresh_allow_list(in_force, why());
+            assert_ne!(set, Some(Some(vec![])));
+            match &note {
+                Some(Note::Warn(m)) => {
+                    assert!(!m.contains("last good list"), "{m}");
+                    assert!(m.contains("no list is in force"), "{m}");
+                }
+                other => panic!("no warning: {other:?}"),
+            }
+        }
+        // Unchanged reads log nothing.
+        let (set, note) = refresh_allow_list(
+            Some(&Some(vec!["desk".into()])),
+            AllowedSenders::List(vec!["desk".into()]),
+        );
+        assert_eq!((set, note), (None, None));
     }
 }
