@@ -13,7 +13,8 @@ fn main() {
         "check" | "launch" | "stop" | "status" => {}
         _ => {
             eprintln!(
-                "usage: marshal-launch-ssh <check|launch|stop|status>  (one JSON request on stdin)\n\
+                "marshal-launch-ssh: unknown verb `{verb}`\n\
+                 usage: marshal-launch-ssh <check|launch|stop|status>  (one JSON request on stdin)\n\
                  A marshal-launch adapter; see docs/agent-launcher.md."
             );
             std::process::exit(2);

@@ -20,6 +20,24 @@ use crate::{Adapter, LaunchRequest, Launched, PROTOCOL_VERSION};
 /// The prefix every external adapter's executable name starts with.
 pub const ADAPTER_PREFIX: &str = "marshal-launch-";
 
+/// The exit an adapter gives for a verb it doesn't implement. `status` is
+/// optional: an adapter without it exits 2, and [`Adapter::status`] is then
+/// `Ok(None)`, "can't tell". For any other verb exit 2 is a failure like any
+/// other.
+pub const UNKNOWN_VERB_EXIT: i32 = 2;
+
+/// An adapter exited [`UNKNOWN_VERB_EXIT`].
+#[derive(Debug)]
+struct UnknownVerb(String);
+
+impl std::fmt::Display for UnknownVerb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnknownVerb {}
+
 /// An adapter found as `marshal-launch-<name>` on `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAdapter {
@@ -99,6 +117,14 @@ impl ExternalAdapter {
         };
         match out.status.code() {
             Some(0) => {}
+            Some(UNKNOWN_VERB_EXIT) => {
+                return Err(UnknownVerb(format!(
+                    "{ADAPTER_PREFIX}{} {verb} failed (exit {UNKNOWN_VERB_EXIT}): {}",
+                    self.name,
+                    reason()
+                ))
+                .into());
+            }
             Some(c) => bail!(
                 "{ADAPTER_PREFIX}{} {verb} failed (exit {c}): {}",
                 self.name,
@@ -171,11 +197,14 @@ impl Adapter for ExternalAdapter {
     }
 
     fn status(&self, handle: &str) -> Result<Option<bool>> {
-        self.call::<Status>(
+        match self.call::<Status>(
             "status",
             &json!({ "version": PROTOCOL_VERSION, "handle": handle }),
-        )
-        .map(|s| s.running)
+        ) {
+            Ok(s) => Ok(s.running),
+            Err(e) if e.downcast_ref::<UnknownVerb>().is_some() => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -77,6 +77,13 @@ fn stop_and_status() {
     fake().stop("fake-ok").unwrap();
     assert_eq!(fake().status("fake-ok").unwrap(), Some(true));
     assert_eq!(fake().status("fake-gone").unwrap(), Some(false));
+    // No status verb (exit 2) is "can't tell"; any other failure is an error.
+    assert_eq!(fake().status("fake-no-status").unwrap(), None);
+    let e = fake()
+        .status("fake-fail=unreachable")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("status failed (exit 1)"), "{e}");
     let e = fake()
         .stop("fake-fail=unreachable")
         .unwrap_err()

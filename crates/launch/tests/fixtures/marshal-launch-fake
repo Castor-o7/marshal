@@ -2,7 +2,8 @@
 # A fake marshal-launch adapter for the launcher's tests (contract v1).
 # It starts nothing. What it does is chosen by the request:
 #   check/launch: an option `--fail=<reason>` in the request's options;
-#   stop/status:  the handle (`fake-ok`, `fake-gone`, or `fake-fail=<reason>`).
+#   stop/status:  the handle (`fake-ok`, `fake-gone`, `fake-no-status`, or
+#                 `fake-fail=<reason>`).
 # `--log=<file>` (check/launch) appends "<verb> <request>" to <file>.
 verb=${1:-}
 req=$(cat)
@@ -16,6 +17,8 @@ case "$verb" in stop|status)
 ;; esac
 
 fail() { echo "$1" >&2; exit "${2:-1}"; }
+# An adapter without a status verb, as the contract allows.
+[ "$verb" = status ] && [ "${handle:-}" = fake-no-status ] && fail "unknown verb status" 2
 case "$reason" in
   "") ;;
   unreachable) fail "can't reach fake-host: No route to host; nothing was started" ;;
