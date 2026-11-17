@@ -9,6 +9,7 @@
 //! `marshal-launch-<name>` adapters agree on them.
 
 pub mod address;
+pub mod external;
 pub mod first_task;
 pub mod join;
 pub mod record;
@@ -19,6 +20,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+pub use external::ExternalAdapter;
 
 /// The version of the adapter request/response contract this crate speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
