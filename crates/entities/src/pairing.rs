@@ -130,6 +130,80 @@ impl Pairing {
     }
 }
 
+/// What a pairing code or token in a message body is replaced with (MAR-86).
+pub const CODE_REDACTED: &str = "[marshal pairing code redacted]";
+pub const TOKEN_REDACTED: &str = "[marshal token redacted]";
+
+/// Says whether a base64url run in a body is a token the daemon knows. The
+/// daemon installs one over its store with `--tls`; without one (plain mode)
+/// only codes are redacted, since a bare token can't be told from any other
+/// base64 by its shape.
+pub type SecretCheck = dyn Fn(&str) -> bool + Send + Sync;
+
+static SECRET_CHECK: std::sync::OnceLock<std::sync::Arc<SecretCheck>> = std::sync::OnceLock::new();
+
+/// Install the token check. Once; a later call changes nothing.
+pub fn install_secret_check(check: std::sync::Arc<SecretCheck>) {
+    let _ = SECRET_CHECK.set(check);
+}
+
+/// The length of a token or invite secret: 32 random bytes as base64url.
+const TOKEN_LEN: usize = 43;
+
+fn is_base64url(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+/// `body` with every pairing code, and every run the installed check knows
+/// as a token, replaced; and how many were. Everything else is untouched.
+pub fn redact_secrets(body: &str) -> (String, usize) {
+    let check = SECRET_CHECK.get();
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut redacted = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        // A code: its prefix and the base64url run after it.
+        let code = [INVITE_PREFIX, PAIRING_PREFIX]
+            .iter()
+            .find(|prefix| body[i..].starts_with(*prefix));
+        if let Some(prefix) = code {
+            let start = i + prefix.len();
+            let end = start
+                + bytes[start..]
+                    .iter()
+                    .take_while(|b| is_base64url(**b))
+                    .count();
+            if end > start {
+                out.push_str(CODE_REDACTED);
+                redacted += 1;
+                i = end;
+                continue;
+            }
+        }
+        // A bare run of base64url, maybe a token.
+        if is_base64url(bytes[i]) && (i == 0 || !is_base64url(bytes[i - 1])) {
+            let end = i + bytes[i..].iter().take_while(|b| is_base64url(**b)).count();
+            if end - i == TOKEN_LEN
+                && let Some(check) = check
+                && check(&body[i..end])
+            {
+                out.push_str(TOKEN_REDACTED);
+                redacted += 1;
+                i = end;
+                continue;
+            }
+            out.push_str(&body[i..end]);
+            i = end;
+            continue;
+        }
+        let ch = body[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, redacted)
+}
+
 /// A machine name: 1 to 64 letters, digits, `-`, `_` or `.`. It appears in
 /// file lines and log lines, so nothing else.
 pub fn valid_name(name: &str) -> bool {
@@ -208,5 +282,47 @@ mod tests {
         assert!(hashes_match(&h, &token_hash("a")));
         assert!(!hashes_match(&h, &token_hash("b")));
         assert!(!hashes_match(&h, "short"));
+    }
+
+    #[test]
+    fn codes_are_redacted_wherever_they_sit_and_nothing_else_is() {
+        let invite = Invite {
+            address: "murph:6155".into(),
+            hooks: "murph:6156".into(),
+            fingerprint: "ab".repeat(32),
+            invite: "s3cret".into(),
+            name: "laptop".into(),
+        }
+        .to_code();
+        let body = format!("pair with {invite} please, and keep marshal-invite-v1: as a word");
+        let (out, n) = redact_secrets(&body);
+        assert_eq!(n, 1, "{out}");
+        assert!(
+            !out.contains(&invite) && out.contains(CODE_REDACTED),
+            "{out}"
+        );
+        assert!(out.ends_with("keep marshal-invite-v1: as a word"), "{out}");
+        assert_eq!(
+            redact_secrets("nothing here, 01a1c2a0-dfa5-7a33-a234-1eabc97d86e8").1,
+            0
+        );
+        assert_eq!(redact_secrets("héllo wörld").0, "héllo wörld");
+    }
+
+    #[test]
+    fn a_known_token_is_redacted_only_through_the_installed_check() {
+        let token = "A".repeat(TOKEN_LEN);
+        let other = "B".repeat(TOKEN_LEN);
+        let known = token.clone();
+        install_secret_check(std::sync::Arc::new(move |run: &str| run == known));
+        let (out, n) = redact_secrets(&format!(
+            "token {token} and not {other}, nor {}",
+            "A".repeat(42)
+        ));
+        assert_eq!(n, 1, "{out}");
+        assert!(
+            out.contains(TOKEN_REDACTED) && out.contains(&other),
+            "{out}"
+        );
     }
 }

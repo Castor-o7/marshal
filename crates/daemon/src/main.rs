@@ -160,6 +160,11 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("marshal-daemon --tls: no state directory (set HOME)"))?
             .with_local_token(&local);
         daemon::pairing::install(store.clone());
+        // Message bodies lose any token the store knows (MAR-86).
+        let check_store = store.clone();
+        marshal_entities::pairing::install_secret_check(Arc::new(move |run: &str| {
+            check_store.verify(run).is_some()
+        }));
         // MAR-80: a connection acts only as its own sessions, and sessions
         // registered through the hook listener belong to the daemon host.
         let local = myko_auth::Principal {

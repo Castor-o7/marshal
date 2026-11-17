@@ -98,6 +98,8 @@ impl CommandHandler for BroadcastMessage {
         // `asSession` (HTTP-MCP agent). Same path as SendMessage.
         let sessions: Vec<Arc<Session>> = ctx.exec_query(GetAllSessions {})?;
         let sender = resolve_caller(&ctx, &sessions, self.as_session.as_ref())?;
+        // Pairing secrets are replaced before anything is stored (MAR-86).
+        let body = crate::send_message::redacted(&self.body, &sender.id);
 
         // Resolve room.
         let rooms: Vec<Arc<Room>> = ctx.exec_query(GetAllRooms {})?;
@@ -148,7 +150,7 @@ impl CommandHandler for BroadcastMessage {
             to_session_id: None,
             to_room_id: Some(room.id.clone()),
             to_operator: None,
-            body: self.body.clone(),
+            body: body.clone(),
             sent_at: now,
             from_kind: sender.kind.clone(),
             from_machine: sender.host.as_ref().map(|h| h.name.clone()),
@@ -226,7 +228,7 @@ impl CommandHandler for BroadcastMessage {
                 to_session_id: Some(target.id.clone()),
                 to_room_id: None,
                 to_operator: to_operator.clone(),
-                body: format!("[@mention in {}] {}", room.name, self.body),
+                body: format!("[@mention in {}] {}", room.name, body),
                 sent_at: now,
                 from_kind: sender.kind.clone(),
                 from_machine: sender.host.as_ref().map(|h| h.name.clone()),
