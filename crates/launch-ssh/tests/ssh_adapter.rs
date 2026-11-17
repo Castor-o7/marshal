@@ -762,3 +762,81 @@ fn status_stop_and_attach_work_when_the_login_shell_is_zsh() {
     stdout_json(&e.run("stop", &h, &shell));
     assert_eq!(stdout_json(&e.run("status", &h, &shell))["running"], false);
 }
+
+/// `--oauth-token-file`: the agent gets CLAUDE_CODE_OAUTH_TOKEN, read from a
+/// file on the target. The token itself is nowhere in the response, the
+/// adapter's output or the tmux session's command; only its path is.
+#[test]
+fn the_token_file_is_read_on_the_target_and_never_carried() {
+    if !have_tmux() {
+        eprintln!("skipping: no tmux");
+        return;
+    }
+    let e = Env::new();
+    let secret = "sk-ant-oat01-mar94-not-a-real-token";
+    let file = e.path("home").join("claude-oauth-token");
+    std::fs::write(&file, format!("{secret}\n")).unwrap();
+    let mut req = e.request(&[
+        "sh",
+        "-c",
+        "printf '%s\\n' \"$CLAUDE_CODE_OAUTH_TOKEN\" > out; sleep 60",
+    ]);
+    req["options"] = json!([
+        "--host",
+        "target-1",
+        "--oauth-token-file",
+        file.display().to_string()
+    ]);
+    let o = e.run("launch", &req, &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), stderr(&o));
+    assert!(!said.contains(secret), "{said}");
+
+    let out = e.path("work").join("out");
+    for _ in 0..100 {
+        if std::fs::read_to_string(&out).is_ok_and(|s| s.ends_with('\n')) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        format!("{secret}\n")
+    );
+    let cmd = e.tmux(&[
+        "list-panes",
+        "-t",
+        "=mar94-test",
+        "-F",
+        "#{pane_start_command}",
+    ]);
+    let cmd = String::from_utf8_lossy(&cmd.stdout);
+    assert!(cmd.contains("claude-oauth-token"), "{cmd}");
+    assert!(!cmd.contains(secret), "{cmd}");
+    let h = json!({"version": 1, "handle": "target-1 mar94-test"});
+    stdout_json(&e.run("stop", &h, &[]));
+
+    // Without the file, check names it and launch starts nothing.
+    std::fs::remove_file(&file).unwrap();
+    let c = e.run("check", &req, &[]);
+    assert!(
+        stderr(&c).contains(&format!(
+            "no readable, non-empty token file at {}",
+            file.display()
+        )),
+        "{}",
+        stderr(&c)
+    );
+    let l = e.run("launch", &req, &[]);
+    assert!(!l.status.success());
+    assert!(
+        stderr(&l).contains("no readable, non-empty token file"),
+        "{}",
+        stderr(&l)
+    );
+    assert!(
+        !e.tmux(&["has-session", "-t", "=mar94-test"])
+            .status
+            .success()
+    );
+}

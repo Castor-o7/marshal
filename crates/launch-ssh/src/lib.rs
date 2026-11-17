@@ -107,6 +107,10 @@ pub struct Target {
     pub xdg: Option<String>,
     /// `--tmux`: the tmux to run, when the target's login PATH has none.
     pub tmux: Option<String>,
+    /// `--oauth-token-file`: a file on the target holding Claude's long-lived
+    /// token. The agent's shell reads it there into CLAUDE_CODE_OAUTH_TOKEN,
+    /// so the token never leaves the target or enters a request or log.
+    pub token_file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +134,12 @@ impl Target {
     /// launch address: the agent runs on another machine, where `localhost`
     /// is not the daemon.
     pub fn from_request(req: &LaunchRequest) -> Result<Target> {
-        let Options { dest, xdg, tmux } = parse_options(&req.options)?;
+        let Options {
+            dest,
+            xdg,
+            tmux,
+            token_file,
+        } = parse_options(&req.options)?;
         validate_name(&req.name)?;
         if req.argv.is_empty() {
             bail!("the request's argv is empty");
@@ -172,6 +181,7 @@ impl Target {
             hook,
             xdg,
             tmux,
+            token_file,
         })
     }
 }
@@ -185,14 +195,16 @@ pub struct Options {
     pub xdg: Option<String>,
     /// `--tmux <absolute path>`.
     pub tmux: Option<String>,
+    /// `--oauth-token-file <absolute path>`.
+    pub token_file: Option<String>,
 }
 
-const OPTIONS_USAGE: &str =
-    "the ssh adapter takes --host <destination>, --xdg-config-home <path> and --tmux <path>";
+const OPTIONS_USAGE: &str = "the ssh adapter takes --host <destination>, --xdg-config-home <path>, \
+     --tmux <path> and --oauth-token-file <path>";
 
 /// Read the adapter options: `--name value` or `--name=value`.
 pub fn parse_options(options: &[String]) -> Result<Options> {
-    let (mut host, mut xdg, mut tmux) = (None, None, None);
+    let (mut host, mut xdg, mut tmux, mut token_file) = (None, None, None, None);
     let mut it = options.iter();
     while let Some(o) = it.next() {
         let (name, inline) = match o.split_once('=') {
@@ -203,6 +215,7 @@ pub fn parse_options(options: &[String]) -> Result<Options> {
             "--host" => &mut host,
             "--xdg-config-home" => &mut xdg,
             "--tmux" => &mut tmux,
+            "--oauth-token-file" => &mut token_file,
             _ => bail!("unknown option `{o}` ({OPTIONS_USAGE})"),
         };
         let value = match inline {
@@ -216,12 +229,21 @@ pub fn parse_options(options: &[String]) -> Result<Options> {
     }
     let dest = host.ok_or_else(|| anyhow!("the ssh adapter needs --host <destination>"))?;
     validate_dest(&dest)?;
-    for (name, v) in [("--xdg-config-home", &xdg), ("--tmux", &tmux)] {
+    for (name, v) in [
+        ("--xdg-config-home", &xdg),
+        ("--tmux", &tmux),
+        ("--oauth-token-file", &token_file),
+    ] {
         if let Some(v) = v {
             validate_target_path(name, v)?;
         }
     }
-    Ok(Options { dest, xdg, tmux })
+    Ok(Options {
+        dest,
+        xdg,
+        tmux,
+        token_file,
+    })
 }
 
 /// A path on the target: absolute, one word.
@@ -478,7 +500,7 @@ claude_wiring() {
 /// The `check` script: reports each probe, starts nothing.
 pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
     let mut s = format!(
-        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\nreq_xdg={}\nreq_base={}\n",
+        "daemon_host={}\ndaemon_port={}\nhook_host={}\nhook_port={}\ncwd={}\nharness={}\nargv0={}\nreq_xdg={}\nreq_base={}\ntoken_file={}\n",
         sq(&t.daemon.host),
         t.daemon.port,
         sq(&t.hook.host),
@@ -497,6 +519,7 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
             .get("MARSHAL_BASE_URL")
             .map(String::as_str)
             .unwrap_or("")),
+        sq(t.token_file.as_deref().unwrap_or("")),
     );
     s.push_str(&script_head(t.tmux.as_deref()));
     s.push_str(PRELUDE);
@@ -528,6 +551,10 @@ if probe "$hook_host" "$hook_port"; then say "hook-port ok"; else say "hook-port
 if cd "$cwd" 2>/dev/null; then cwd=$(pwd -P); say "cwd $cwd"; else say "cwd-missing $cwd"; fi
 if command -v "$tmux_bin" >/dev/null 2>&1; then say "tmux ok"; else say "tmux missing"; fi
 if command -v "$argv0" >/dev/null 2>&1; then say "harness ok"; else say "harness missing"; fi
+# Only whether the token file can be read and isn't empty, never its contents.
+if [ -n "$token_file" ]; then
+  if [ -r "$token_file" ] && [ -s "$token_file" ]; then say "token-file ok"; else say "token-file missing"; fi
+fi
 if command -v marshal-shim >/dev/null 2>&1; then
   say "shim $(marshal-shim --version 2>&1 | head -n 1)"
 else
@@ -626,6 +653,8 @@ pub struct Probe {
     /// The shim's `marshal/daemon-address` file, if one names an address:
     /// its path and that address.
     pub daemon_address_file: Option<(String, String)>,
+    /// `--oauth-token-file` is readable and not empty there (never its contents).
+    pub token_file: Option<bool>,
     pub done: bool,
 }
 
@@ -656,6 +685,7 @@ impl Probe {
                 "cwd-missing" => p.cwd_missing = Some(v.to_string()),
                 "tmux" => p.tmux = Some(v == "ok"),
                 "harness" => p.harness = Some(v == "ok"),
+                "token-file" => p.token_file = Some(v == "ok"),
                 "shim" => p.shim = Some(v.to_string()),
                 "codex-config-missing" => p.codex_config_missing = Some(v.to_string()),
                 "no-json-reader" => p.no_json_reader = true,
@@ -767,6 +797,13 @@ impl Probe {
             f.push(format!(
                 "{host} has no `{}` on PATH (in a login shell)",
                 req.argv[0]
+            ));
+        }
+        if let Some(path) = &t.token_file
+            && self.token_file != Some(true)
+        {
+            f.push(format!(
+                "{host} has no readable, non-empty token file at {path} (--oauth-token-file)"
             ));
         }
         // The shims the harness's wiring runs are versioned where they are
@@ -987,6 +1024,14 @@ pub fn launch_script(t: &Target, req: &LaunchRequest) -> String {
     if let Some(x) = &t.xdg {
         inner.push_str(&format!("export XDG_CONFIG_HOME={}\n", sq(x)));
     }
+    // Read on the target when the agent starts: the script, the tmux command
+    // and the request carry only the path.
+    if let Some(f) = &t.token_file {
+        inner.push_str(&format!(
+            "CLAUDE_CODE_OAUTH_TOKEN=$(cat {}) || exit 1\nexport CLAUDE_CODE_OAUTH_TOKEN\n",
+            sq(f)
+        ));
+    }
     inner.push_str("exec");
     for a in &req.argv {
         inner.push(' ');
@@ -994,10 +1039,11 @@ pub fn launch_script(t: &Target, req: &LaunchRequest) -> String {
     }
     inner.push('\n');
     let mut s = format!(
-        "name={}\ncwd={}\ninner={}\n",
+        "name={}\ncwd={}\ninner={}\ntoken_file={}\n",
         sq(&t.name),
         sq(&req.cwd),
-        sq(&inner)
+        sq(&inner),
+        sq(t.token_file.as_deref().unwrap_or(""))
     );
     s.push_str(&script_head(t.tmux.as_deref()));
     s.push_str(PRELUDE);
@@ -1006,6 +1052,9 @@ pub fn launch_script(t: &Target, req: &LaunchRequest) -> String {
 cd "$cwd" 2>/dev/null || { echo "$h has no folder $cwd" >&2; exit 1; }
 cwd=$(pwd -P)
 command -v "$tmux_bin" >/dev/null 2>&1 || { echo "$h has no tmux ($tmux_bin)" >&2; exit 1; }
+if [ -n "$token_file" ] && ! { [ -r "$token_file" ] && [ -s "$token_file" ]; }; then
+  echo "$h has no readable, non-empty token file at $token_file" >&2; exit 1
+fi
 # The harness gets this login PATH, after its own login profile has run
 # (macOS's path_helper reorders PATH), and whatever env the tmux server has.
 inner="export PATH=$(q "$PATH")
@@ -1313,8 +1362,17 @@ mod tests {
                 dest: "a1".into(),
                 xdg: Some("/Users/j/x".into()),
                 tmux: Some("/opt/homebrew/bin/tmux".into()),
+                token_file: None,
             }
         );
+        assert_eq!(
+            o(&["--host", "a1", "--oauth-token-file=/Users/j/t"])
+                .unwrap()
+                .token_file
+                .as_deref(),
+            Some("/Users/j/t")
+        );
+        assert!(o(&["--host", "a1", "--oauth-token-file", "~/t"]).is_err());
         assert!(
             o(&["--host", "a1", "--tmux", "tmux"])
                 .unwrap_err()
