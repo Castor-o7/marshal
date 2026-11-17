@@ -181,7 +181,12 @@ fn silent_daemon_cannot_stall_a_claude_turn() {
 fn shipped_hooks_answer_for_the_event_they_are_registered_under() {
     let hooks: serde_json::Value = serde_json::from_str(HOOKS_JSON).unwrap();
     let events = hooks["hooks"].as_object().unwrap();
-    for event in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PostToolUse",
+        "SessionEnd",
+    ] {
         assert!(events.contains_key(event), "hooks.json is missing {event}");
     }
     let mut waiter_events = Vec::new();
@@ -199,6 +204,21 @@ fn shipped_hooks_answer_for_the_event_they_are_registered_under() {
                 if args.get(1) == Some(&"wait") {
                     assert_eq!(hook["asyncRewake"], true, "{event}: {command}");
                     waiter_events.push(event.as_str());
+                    continue;
+                }
+                // SessionEnd removes the session and gives Claude nothing back:
+                // the daemon answers it with an empty body.
+                if args.get(1) == Some(&"session-end") {
+                    assert_eq!(event, "SessionEnd", "{command}");
+                    let (base, seen) = fake_hook_listener("");
+                    let stdout = run_hook(&args, &base);
+                    assert!(stdout.is_empty(), "{stdout:?}");
+                    let seen = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        seen.request_line.starts_with("POST /hook/session-end?"),
+                        "{}",
+                        seen.request_line
+                    );
                     continue;
                 }
 
