@@ -657,7 +657,7 @@ fn check_passes_a1s_layout() {
     std::fs::write(
         e.path("home/.claude.json"),
         r#"{"mcpServers": {"marshal": {"command": "marshal-shim",
-              "env": {"MARSHAL_DAEMON_ADDRESS": "ws://192.168.1.241:6155"}}}}"#,
+              "env": {"MARSHAL_DAEMON_ADDRESS": "ws://192.0.2.1:6155"}}}}"#,
     )
     .unwrap();
     let work = e.path("work");

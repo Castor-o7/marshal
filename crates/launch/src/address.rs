@@ -301,7 +301,7 @@ mod tests {
                 "{err}"
             );
         }
-        assert!(check_hook_base_for_adapter("ssh", Some("http://192.168.1.241:26156")).is_ok());
+        assert!(check_hook_base_for_adapter("ssh", Some("http://192.0.2.1:26156")).is_ok());
         assert!(check_hook_base_for_adapter("ssh", None).is_ok());
         assert!(check_hook_base_for_adapter("ssh", Some(" ")).is_ok());
         assert!(check_hook_base_for_adapter("ssh", Some("ws://h:1")).is_err());

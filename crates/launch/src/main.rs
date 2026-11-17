@@ -304,18 +304,12 @@ mod tests {
 
     #[test]
     fn the_launcher_watches_the_daemon_it_hands_the_agent() {
-        let args = parse_args(&v(&[
-            "ssh",
-            "claude",
-            "--daemon",
-            "ws://192.168.1.241:26155",
-        ]))
-        .unwrap();
+        let args = parse_args(&v(&["ssh", "claude", "--daemon", "ws://192.0.2.1:26155"])).unwrap();
         // The local resolution would give another daemon; the join wait must not use it.
         let resolve = |flag: Option<String>| flag.unwrap_or_else(|| "ws://localhost:6155".into());
         let plan = plan_for(args, "/w".into(), "n".into(), resolve, PathBuf::from("/r"));
-        assert_eq!(plan.launch_address, "ws://192.168.1.241:26155");
-        assert_eq!(plan.daemon_address, "ws://192.168.1.241:26155");
+        assert_eq!(plan.launch_address, "ws://192.0.2.1:26155");
+        assert_eq!(plan.daemon_address, "ws://192.0.2.1:26155");
         let args = parse_args(&v(&["tmux", "claude"])).unwrap();
         let plan = plan_for(args, "/w".into(), "n".into(), resolve, PathBuf::from("/r"));
         assert_eq!(plan.daemon_address, "ws://localhost:6155");
