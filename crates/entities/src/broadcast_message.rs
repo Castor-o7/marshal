@@ -100,6 +100,9 @@ impl CommandHandler for BroadcastMessage {
         let sender = resolve_caller(&ctx, &sessions, self.as_session.as_ref())?;
         // Pairing secrets are replaced before anything is stored (MAR-86).
         let body = crate::send_message::redacted(&self.body, &sender.id);
+        // Not on the operator's allow-list, if one is set (MAR-89).
+        crate::controls::sender_allowed(sender.host.as_ref().map(|h| h.name.as_str()))
+            .map_err(|why| err(&ctx, &why))?;
         // One broadcast is one message against the allowance (MAR-88).
         crate::rate::take(
             sender.id.0.as_ref(),
