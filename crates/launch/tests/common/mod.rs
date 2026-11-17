@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod cell;
 pub mod daemon;
 
 use std::path::PathBuf;

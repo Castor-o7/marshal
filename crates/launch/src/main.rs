@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use marshal_launch::{Adapter, Plan, address, record, tmux};
+use marshal_launch::{Adapter, ExternalAdapter, Plan, address, record, tmux};
 
 const USAGE: &str =
     "usage: marshal-launch <adapter> <claude|codex> [--cwd <dir>] [--name <label>] \
@@ -76,10 +76,11 @@ fn parse_args(args: &[String]) -> Result<Args> {
     Ok(a)
 }
 
+/// The built-in tmux adapter, or `marshal-launch-<name>` found on `PATH`.
 fn adapter_for(name: &str) -> Result<Box<dyn Adapter>> {
     match name {
         address::LOCAL_ADAPTER => Ok(Box::new(tmux::Tmux::default())),
-        other => bail!("no adapter named {other:?}: this build has the built-in tmux adapter"),
+        other => Ok(Box::new(ExternalAdapter::find(other)?)),
     }
 }
 
@@ -277,7 +278,15 @@ mod tests {
         assert!(parse_args(&v(&["tmux", "claude", "--cwd"])).is_err());
         assert!(parse_args(&v(&["tmux", "claude", "--timeout", "0"])).is_err());
         assert!(parse_args(&v(&["tmux", "claude", "--dangerously-skip-permissions"])).is_err());
-        assert!(adapter_for("ssh").is_err());
+        let missing = adapter_for("no-such-adapter-here")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            missing.contains("marshal-launch-no-such-adapter-here"),
+            "{missing}"
+        );
+        assert!(adapter_for("../evil").is_err());
         assert!(dispatch(&v(&["list", "x"])).is_err());
         assert!(dispatch(&v(&["stop"])).is_err());
     }
