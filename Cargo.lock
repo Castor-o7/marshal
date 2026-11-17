@@ -3317,6 +3317,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "marshal-launch"
+version = "0.60.2"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "marshal-shim"
 version = "0.60.2"
 dependencies = [
