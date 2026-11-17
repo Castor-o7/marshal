@@ -9,7 +9,9 @@
 //! `marshal-launch-<name>` adapters agree on them.
 
 pub mod address;
+pub mod first_task;
 pub mod join;
+pub mod record;
 pub mod tmux;
 
 use std::collections::BTreeMap;
@@ -186,6 +188,10 @@ pub struct Plan {
     pub timeout: Duration,
     pub check: bool,
     pub options: Vec<String>,
+    /// Sent to the joined session as one direct message.
+    pub task: Option<String>,
+    /// Where to record the launch (`launches.json`); `None` records nothing.
+    pub records: Option<std::path::PathBuf>,
 }
 
 /// A launch that joined.
@@ -194,6 +200,8 @@ pub struct Outcome {
     pub agent_id: String,
     pub launched: Launched,
     pub joined: join::Joined,
+    /// The first task's message id, if a task was sent.
+    pub task_message_id: Option<String>,
 }
 
 /// Launch `plan` through `adapter` and wait for it to join. Nothing starts if
@@ -232,6 +240,32 @@ pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
     let launched = adapter
         .launch(&req)
         .with_context(|| format!("the {} adapter started nothing", adapter.name()))?;
+    let store = plan.records.as_ref().map(record::Store::at);
+    if let Some(store) = &store {
+        // Recorded before the wait, so a launch that never joins can be stopped.
+        let entry = record::Launch {
+            adapter: adapter.name().into(),
+            handle: launched.handle.clone(),
+            agent_id: agent_id.clone(),
+            name: plan.name.clone(),
+            harness: plan.harness.clone(),
+            host: launched.host.clone(),
+            cwd: launched.cwd.clone(),
+            r#where: launched.r#where.clone(),
+            attach: launched.attach.clone(),
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            session_id: None,
+        };
+        if let Err(e) = store.add(entry) {
+            eprintln!(
+                "warning: the launch wasn't recorded in {}: {e:#}",
+                store.path().display()
+            );
+        }
+    }
     eprintln!(
         "started `{}` at {}; waiting up to {}s for it to join",
         req.argv.join(" "),
@@ -241,10 +275,39 @@ pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
     let joined = roster
         .wait(adapter, &agent_id, &launched, plan.timeout)
         .await?;
+    if let Some(store) = &store
+        && let Err(e) = store.joined(&agent_id, &joined.session_id)
+    {
+        eprintln!("warning: {}: {e:#}", store.path().display());
+    }
+    let task_message_id = match &plan.task {
+        None => None,
+        Some(task) => {
+            let operator = std::env::var("MARSHAL_OPERATOR").ok();
+            let host = tmux::this_host();
+            let body = first_task::labelled(task, &host, operator.as_deref(), &agent_id);
+            let id = first_task::send(
+                &roster,
+                &joined.session_id,
+                body,
+                &host,
+                operator.as_deref(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "{} ({}) joined, but its first task wasn't sent. It's still running at {}",
+                    joined.nickname, joined.session_id, launched.r#where
+                )
+            })?;
+            Some(id)
+        }
+    };
     Ok(Outcome {
         agent_id,
         launched,
         joined,
+        task_message_id,
     })
 }
 

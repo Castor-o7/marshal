@@ -31,3 +31,6 @@ hyphae = { workspace = true }
 marshal-entities = { workspace = true }
 gethostname = "1"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+myko-server = { workspace = true }

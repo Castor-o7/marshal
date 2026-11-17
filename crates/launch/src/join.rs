@@ -124,6 +124,11 @@ impl Roster {
         &self.client
     }
 
+    /// The roster as last seen.
+    pub fn sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions.get()
+    }
+
     /// Wait for the launched agent's row. Fails early if the adapter says the
     /// launch has exited, and says what may still be running on a timeout.
     pub async fn wait(

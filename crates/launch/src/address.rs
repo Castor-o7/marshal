@@ -52,22 +52,61 @@ pub fn from_environment(flag: Option<String>) -> String {
 
 /// The first non-empty line of `marshal/<name>` in the first config dir that has it.
 fn read_config(name: &str) -> Option<String> {
-    config_dirs()
-        .into_iter()
+    read_config_in(&config_dirs(), name)
+}
+
+/// The first non-empty line of `marshal/<name>` in the first of `dirs` that has it.
+pub fn read_config_in(dirs: &[PathBuf], name: &str) -> Option<String> {
+    dirs.iter()
         .filter_map(|d| std::fs::read_to_string(d.join("marshal").join(name)).ok())
         .map(|s| s.lines().next().unwrap_or("").trim().to_string())
         .find(|s| !s.is_empty())
 }
 
 fn config_dirs() -> Vec<PathBuf> {
+    config_dirs_from(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// The shim's config dirs: `$XDG_CONFIG_HOME`, then `~/.config`.
+pub fn config_dirs_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
-        dirs.push(PathBuf::from(x));
+    if let Some(x) = xdg.filter(|x| !x.as_os_str().is_empty()) {
+        dirs.push(x);
     }
-    if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        dirs.push(PathBuf::from(h).join(".config"));
+    if let Some(h) = home.filter(|h| !h.as_os_str().is_empty()) {
+        dirs.push(h.join(".config"));
     }
     dirs
+}
+
+/// Refuse a `marshal/daemon-address` file that names another address than the
+/// launch address. The shim reads that file ahead of `MARSHAL_DAEMON_ADDRESS`,
+/// so it would silently send the agent to another daemon.
+pub fn check_daemon_address_file(dirs: &[PathBuf], launch_address: &str) -> Result<()> {
+    for d in dirs {
+        let path = d.join("marshal").join("daemon-address");
+        let Ok(s) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let line = s.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.trim_end_matches('/') != launch_address.trim().trim_end_matches('/') {
+            bail!(
+                "{} names {line}, and the shim reads it ahead of the launch address {launch_address}, \
+                 so the agent would join another daemon. Nothing was started. Launch with \
+                 --daemon {line}, or change that file",
+                path.display()
+            );
+        }
+        // The shim takes the first file it finds, as this does.
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// The host and port of a `ws://` or `wss://` address. The port defaults to
@@ -105,16 +144,21 @@ pub fn host_port(address: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
-/// Whether `host` is loopback: `localhost` (and `*.localhost`), 127.0.0.0/8, or ::1.
+/// Whether `host` is local: `localhost` (and `*.localhost`), 127.0.0.0/8, ::1, or the
+/// unspecified 0.0.0.0 and ::, which a remote agent dialling would reach itself with.
 pub fn is_loopback_host(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     if h == "localhost" || h.ends_with(".localhost") {
         return true;
     }
     match h.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_unspecified(),
         Ok(IpAddr::V6(v6)) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
         }
         Err(_) => false,
     }
@@ -230,6 +274,9 @@ mod tests {
             "127.9.8.7",
             "::1",
             "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "::ffff:0.0.0.0",
         ] {
             assert!(is_loopback_host(h), "{h}");
         }
@@ -251,6 +298,8 @@ mod tests {
             "ws://localhost:6155",
             "ws://127.0.0.1:6155",
             "ws://[::1]:6155",
+            "ws://0.0.0.0:6155",
+            "ws://[::]:6155",
         ] {
             assert!(check_for_adapter("tmux", a).is_ok(), "{a}");
             let err = check_for_adapter("ssh", a).unwrap_err().to_string();

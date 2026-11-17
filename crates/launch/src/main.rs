@@ -5,10 +5,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use marshal_launch::{Adapter, Plan, address, tmux};
+use marshal_launch::{Adapter, Plan, address, record, tmux};
 
-const USAGE: &str = "usage: marshal-launch <adapter> <claude|codex> [--cwd <dir>] [--name <label>] \
-[--daemon <url>] [--timeout <secs>] [--no-check] [-- <adapter options>]";
+const USAGE: &str =
+    "usage: marshal-launch <adapter> <claude|codex> [--cwd <dir>] [--name <label>] \
+[--task <text>] [--daemon <url>] [--timeout <secs>] [--no-check] [-- <adapter options>]
+       marshal-launch list
+       marshal-launch stop <name|agent_id>";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,6 +24,7 @@ struct Args {
     timeout: Duration,
     check: bool,
     options: Vec<String>,
+    task: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -37,6 +41,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
         timeout: DEFAULT_TIMEOUT,
         check: true,
         options: vec![],
+        task: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -56,6 +61,11 @@ fn parse_args(args: &[String]) -> Result<Args> {
                 a.timeout = Duration::from_secs(secs);
             }
             "--no-check" => a.check = false,
+            "--task" => {
+                let task = value()?;
+                ensure!(!task.trim().is_empty(), "--task needs some text\n{USAGE}");
+                a.task = Some(task);
+            }
             // Everything after `--` is the adapter's, never the harness's.
             "--" => {
                 a.options = it.by_ref().cloned().collect();
@@ -97,12 +107,10 @@ fn run(args: Args) -> Result<()> {
         timeout: args.timeout,
         check: args.check,
         options: args.options,
+        task: args.task,
+        records: Some(record::default_path()?),
     };
-    let outcome = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building tokio runtime")?
-        .block_on(marshal_launch::launch(adapter.as_ref(), &plan))?;
+    let outcome = runtime()?.block_on(marshal_launch::launch(adapter.as_ref(), &plan))?;
     let attach = outcome
         .launched
         .attach
@@ -113,12 +121,107 @@ fn run(args: Args) -> Result<()> {
         "{} ({}) joined from {}{attach}",
         outcome.joined.nickname, outcome.joined.session_id, outcome.launched.r#where
     );
+    if let Some(id) = outcome.task_message_id {
+        println!("first task sent as message {id}");
+    }
     Ok(())
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")
+}
+
+/// What `list` says of one launch's process, from its adapter.
+fn process_state(l: &record::Launch) -> String {
+    match adapter_for(&l.adapter).and_then(|a| a.status(&l.handle)) {
+        Ok(Some(true)) => "running".into(),
+        Ok(Some(false)) => "exited".into(),
+        Ok(None) => "unknown".into(),
+        Err(e) => format!("unknown ({e})"),
+    }
+}
+
+fn list() -> Result<()> {
+    let store = record::Store::open_default()?;
+    let launches = store.list()?;
+    if launches.is_empty() {
+        println!("no launches recorded in {}", store.path().display());
+        return Ok(());
+    }
+    let address = address::from_environment(None);
+    let rt = runtime()?;
+    let roster = rt.block_on(marshal_launch::join::Roster::connect(&address));
+    if let Err(e) = &roster {
+        eprintln!("roster state unknown: {e:#}");
+    }
+    for l in &launches {
+        let on_roster = match &roster {
+            Ok(r) => {
+                let sessions = r.sessions();
+                let launched = marshal_launch::Launched {
+                    handle: l.handle.clone(),
+                    host: l.host.clone(),
+                    cwd: l.cwd.clone(),
+                    r#where: l.r#where.clone(),
+                    attach: None,
+                };
+                match marshal_launch::join::find(&sessions, &l.agent_id, &launched) {
+                    marshal_launch::join::Join::Joined(s) => format!("on the roster as {}", s.id.0),
+                    _ if l.session_id.is_some() => "joined, now off the roster".into(),
+                    _ => "not on the roster".into(),
+                }
+            }
+            Err(_) => "roster unknown".into(),
+        };
+        println!(
+            "{}\t{}\t{} {}\t{}\t{}\t{}",
+            l.name,
+            l.agent_id,
+            l.adapter,
+            l.harness,
+            l.r#where,
+            process_state(l),
+            on_roster
+        );
+    }
+    Ok(())
+}
+
+fn stop(key: &str) -> Result<()> {
+    let store = record::Store::open_default()?;
+    let launches = store.list()?;
+    let l = record::find(&launches, key)?;
+    adapter_for(&l.adapter)?
+        .stop(&l.handle)
+        .with_context(|| format!("stopping {} at {}", l.name, l.r#where))?;
+    store.remove(&l.agent_id)?;
+    println!(
+        "stopped {} ({}) at {}; its roster row clears when the harness exits",
+        l.name, l.agent_id, l.r#where
+    );
+    Ok(())
+}
+
+fn dispatch(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            ensure!(args.len() == 1, "list takes no arguments\n{USAGE}");
+            list()
+        }
+        Some("stop") => match &args[1..] {
+            [key] => stop(key),
+            _ => bail!("stop takes one name or agent id\n{USAGE}"),
+        },
+        _ => parse_args(args).and_then(run),
+    }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(e) = parse_args(&args).and_then(run) {
+    if let Err(e) = dispatch(&args) {
         eprintln!("marshal-launch: {e:#}");
         std::process::exit(1);
     }
@@ -159,6 +262,9 @@ mod tests {
         assert_eq!(a.timeout, Duration::from_secs(5));
         assert!(!a.check);
         assert_eq!(a.options, ["--host", "build-03"]);
+        let a = parse_args(&v(&["tmux", "claude", "--task", "say ready"])).unwrap();
+        assert_eq!(a.task.as_deref(), Some("say ready"));
+        assert!(parse_args(&v(&["tmux", "claude", "--task", " "])).is_err());
         let a = parse_args(&v(&["tmux", "claude"])).unwrap();
         assert_eq!((a.timeout, a.check), (DEFAULT_TIMEOUT, true));
     }
@@ -172,5 +278,7 @@ mod tests {
         assert!(parse_args(&v(&["tmux", "claude", "--timeout", "0"])).is_err());
         assert!(parse_args(&v(&["tmux", "claude", "--dangerously-skip-permissions"])).is_err());
         assert!(adapter_for("ssh").is_err());
+        assert!(dispatch(&v(&["list", "x"])).is_err());
+        assert!(dispatch(&v(&["stop"])).is_err());
     }
 }

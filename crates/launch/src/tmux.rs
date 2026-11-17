@@ -22,10 +22,13 @@ pub const MAX_NAME: usize = 64;
 #[derive(Debug, Clone)]
 pub struct Tmux {
     program: String,
-    /// A private server (`tmux -L <socket>`), for tests; `None` is the user's own.
-    socket: Option<String>,
+    /// A private server's socket path (`tmux -S <path>`), for tests; `None` is the user's own.
+    socket: Option<PathBuf>,
     /// The command whose `--version` is checked (`MARSHAL_SHIM_BIN`, or `marshal-shim`).
     shim: Vec<String>,
+    /// Environment for the tmux client itself, which a private server it
+    /// starts inherits; for tests. Never passed to the agent through `-e`.
+    client_env: Vec<(String, String)>,
 }
 
 impl Default for Tmux {
@@ -40,7 +43,15 @@ impl Tmux {
             program: program.into(),
             socket: None,
             shim: vec![std::env::var("MARSHAL_SHIM_BIN").unwrap_or_else(|_| "marshal-shim".into())],
+            client_env: vec![],
         }
+    }
+
+    /// Set a variable in the tmux client's environment, for tests: a private
+    /// server started by this adapter inherits it (`PATH`, to find a stub harness).
+    pub fn with_client_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.client_env.push((key.into(), value.into()));
+        self
     }
 
     /// Check this command's `--version` instead of `marshal-shim`'s, for tests.
@@ -49,8 +60,8 @@ impl Tmux {
         self
     }
 
-    /// Use the private tmux server named `socket` instead of the user's own.
-    pub fn with_socket(mut self, socket: impl Into<String>) -> Self {
+    /// Use the private tmux server at socket path `socket` instead of the user's own.
+    pub fn with_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.socket = Some(socket.into());
         self
     }
@@ -58,8 +69,9 @@ impl Tmux {
     fn tmux(&self) -> Command {
         let mut c = Command::new(&self.program);
         if let Some(s) = &self.socket {
-            c.args(["-L", s]);
+            c.arg("-S").arg(s);
         }
+        c.envs(self.client_env.iter().map(|(k, v)| (k, v)));
         c
     }
 
@@ -198,7 +210,13 @@ impl Adapter for Tmux {
             req.name
         );
         resolve_cwd(&req.cwd)?;
-        let path = std::env::var_os("PATH");
+        // The PATH the agent will run with: the client's, if a test set one.
+        let path = self
+            .client_env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| OsString::from(v))
+            .or_else(|| std::env::var_os("PATH"));
         ensure!(
             on_path(&self.program, path.clone()),
             "{} isn't installed (not found on PATH), so nothing was started",
@@ -221,6 +239,17 @@ impl Adapter for Tmux {
                 )
             })?;
         crate::check_shim_version(&String::from_utf8_lossy(&out.stdout), &req.marshal_version)?;
+        if let Some(addr) = req.env.get("MARSHAL_DAEMON_ADDRESS") {
+            // The agent's config dirs: the XDG_CONFIG_HOME it's given, else ours.
+            let xdg = req
+                .env
+                .get("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from));
+            let dirs =
+                crate::address::config_dirs_from(xdg, std::env::var_os("HOME").map(PathBuf::from));
+            crate::address::check_daemon_address_file(&dirs, addr)?;
+        }
         ensure!(
             !self.has_session(&req.name)?,
             "a tmux session named {0} already exists: attach with `tmux attach -t ={0}`, or pick another --name",
@@ -265,7 +294,7 @@ impl Adapter for Tmux {
             host,
             cwd: cwd.display().to_string(),
             attach: Some(match &self.socket {
-                Some(s) => format!("tmux -L {s} attach -t ={}", req.name),
+                Some(s) => format!("tmux -S {} attach -t ={}", s.display(), req.name),
                 None => format!("tmux attach -t ={}", req.name),
             }),
         })
@@ -413,87 +442,5 @@ mod tests {
                 .to_string()
                 .contains("no options")
         );
-    }
-
-    /// A real tmux session on a private server: launch runs argv in the
-    /// canonical folder with env added, status follows it, stop ends it.
-    #[test]
-    fn launch_status_and_stop_on_a_private_tmux_server() {
-        if !on_path("tmux", std::env::var_os("PATH")) {
-            eprintln!("skipped: no tmux here");
-            return;
-        }
-        let socket = format!("marshal-launch-test-{}", std::process::id());
-        let shim = |ver: &str| v(&["sh", "-c", &format!("echo marshal-shim {ver}")]);
-        let t = Tmux::new("tmux")
-            .with_socket(&socket)
-            .with_shim(shim(crate::MARSHAL_VERSION));
-        // Ends the private server even if an assertion fails.
-        struct KillServer(String);
-        impl Drop for KillServer {
-            fn drop(&mut self) {
-                let _ = Command::new("tmux")
-                    .args(["-L", &self.0, "kill-server"])
-                    .stderr(Stdio::null())
-                    .status();
-            }
-        }
-        let _server = KillServer(socket.clone());
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let req = LaunchRequest {
-            version: 1,
-            harness: "claude".into(),
-            argv: v(&["sh", "-c", "echo \"[$MARSHAL_AGENT_ID $PWD]\"; sleep 30"]),
-            cwd: dir.display().to_string(),
-            name: "launch-test".into(),
-            agent_id: "launch-t".into(),
-            marshal_version: crate::MARSHAL_VERSION.into(),
-            env: [("MARSHAL_AGENT_ID".to_string(), "launch-t".to_string())].into(),
-            options: vec![],
-        };
-        let old = Tmux::new("tmux")
-            .with_socket(&socket)
-            .with_shim(shim("0.1.0"));
-        let err = old.check(&req).unwrap_err().to_string();
-        assert!(
-            err.contains("0.1.0") && err.contains("major.minor"),
-            "{err}"
-        );
-        t.check(&req).unwrap();
-        let l = t.launch(&req).unwrap();
-        let canon = std::fs::canonicalize(&dir).unwrap();
-        assert_eq!(l.handle, "launch-test");
-        assert_eq!(l.host, this_host());
-        assert_eq!(l.cwd, canon.display().to_string());
-        assert_eq!(l.r#where, format!("{} tmux:launch-test", this_host()));
-        assert_eq!(t.status(&l.handle).unwrap(), Some(true));
-        // A second launch under the same name is refused by check.
-        assert!(
-            t.check(&req)
-                .unwrap_err()
-                .to_string()
-                .contains("already exists")
-        );
-        let want = format!("[launch-t {}]", canon.display());
-        let mut seen = String::new();
-        for _ in 0..50 {
-            let out = t
-                .tmux()
-                .args(["capture-pane", "-p", "-J", "-t", "=launch-test:"])
-                .output()
-                .unwrap();
-            seen = String::from_utf8_lossy(&out.stdout).into_owned();
-            if seen.contains(&want) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(seen.contains(&want), "{seen:?}");
-        t.stop(&l.handle).unwrap();
-        assert_eq!(t.status(&l.handle).unwrap(), Some(false));
-        t.stop(&l.handle).unwrap();
-        let _ = Command::new("tmux")
-            .args(["-L", &socket, "kill-server"])
-            .status();
     }
 }
