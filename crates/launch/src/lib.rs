@@ -5,12 +5,17 @@
 //! it to join, its first task). An [`Adapter`] does only the part that does:
 //! run this command, with these environment variables, over there.
 //!
-//! This module fixes the shared types first, so the built-in tmux adapter and
-//! the external `marshal-launch-<name>` adapters agree on them.
+//! The shared types come first, so the built-in tmux adapter and the external
+//! `marshal-launch-<name>` adapters agree on them.
+
+pub mod address;
+pub mod join;
+pub mod tmux;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// The version of the adapter request/response contract this crate speaks.
@@ -61,6 +66,22 @@ pub struct Launched {
     pub attach: Option<String>,
 }
 
+/// Something that can start an agent somewhere.
+///
+/// An adapter is never asked whether the agent joined; the roster answers that.
+pub trait Adapter {
+    /// The adapter's name, as in `marshal-launch <name> ...`.
+    fn name(&self) -> &str;
+    /// Confirm the target can run this request, starting nothing.
+    fn check(&self, req: &LaunchRequest) -> Result<()>;
+    /// Start the request's `argv` in its `cwd` with its `env` added.
+    fn launch(&self, req: &LaunchRequest) -> Result<Launched>;
+    /// Stop what `handle` names.
+    fn stop(&self, handle: &str) -> Result<()>;
+    /// Whether what `handle` names is still running; `None` if the adapter can't tell.
+    fn status(&self, handle: &str) -> Result<Option<bool>>;
+}
+
 /// This build's version, sent as the request's `marshal_version`.
 pub const MARSHAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -102,20 +123,129 @@ pub fn check_shim_version(output: &str, wanted: &str) -> Result<()> {
     Ok(())
 }
 
-/// Something that can start an agent somewhere.
-///
-/// An adapter is never asked whether the agent joined; the roster answers that.
-pub trait Adapter {
-    /// The adapter's name, as in `marshal-launch <name> ...`.
-    fn name(&self) -> &str;
-    /// Confirm the target can run this request, starting nothing.
-    fn check(&self, req: &LaunchRequest) -> Result<()>;
-    /// Start the request's `argv` in its `cwd` with its `env` added.
-    fn launch(&self, req: &LaunchRequest) -> Result<Launched>;
-    /// Stop what `handle` names.
-    fn stop(&self, handle: &str) -> Result<()>;
-    /// Whether what `handle` names is still running; `None` if the adapter can't tell.
-    fn status(&self, handle: &str) -> Result<Option<bool>>;
+/// A fresh id for one launch. No earlier row can carry it.
+pub fn new_agent_id() -> String {
+    format!("launch-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The command a harness starts with. It takes no flags: the agent starts in
+/// the harness's default permission mode. Codex goes through `codex-run`,
+/// which gives an idle Codex thread live wakes.
+pub fn harness_argv(harness: &str) -> Result<Vec<String>> {
+    match harness {
+        "claude" => Ok(vec!["claude".into()]),
+        "codex" => Ok(vec!["marshal-shim".into(), "codex-run".into()]),
+        other => bail!("unknown harness {other:?}: marshal-launch starts claude or codex"),
+    }
+}
+
+/// Settings passed from the launcher's environment to any target. None is a secret.
+const PASSED_ENV: &[&str] = &["MARSHAL_OPERATOR", "MARSHAL_WAITER_LOCK_WAIT_SECS"];
+
+/// Settings that only mean something on this machine, passed to the local
+/// adapter only: a running tmux server would otherwise give the agent the
+/// server's values. None is a secret, and none names an identity.
+const LOCAL_ENV: &[&str] = &[
+    "MARSHAL_BASE_URL",
+    "MARSHAL_HOST",
+    "MARSHAL_BIN_DIR",
+    "MARSHAL_CODEX_BIN",
+    // A test's guard against the default daemon, passed only if set.
+    "MARSHAL_TEST",
+    // Where the shim reads its daemon-address file from.
+    "XDG_CONFIG_HOME",
+];
+
+/// The agent's added environment: the launch address, this launch's id (never
+/// the launcher's own), and the listed settings that are set here.
+pub fn launch_env(
+    get: impl Fn(&str) -> Option<String>,
+    local: bool,
+    launch_address: &str,
+    agent_id: &str,
+) -> BTreeMap<String, String> {
+    let names = PASSED_ENV.iter().chain(if local { LOCAL_ENV } else { &[] });
+    let mut env: BTreeMap<String, String> = names
+        .filter_map(|k| get(k).map(|v| (k.to_string(), v)))
+        .collect();
+    env.insert("MARSHAL_DAEMON_ADDRESS".into(), launch_address.into());
+    env.insert("MARSHAL_AGENT_ID".into(), agent_id.into());
+    env
+}
+
+/// What `marshal-launch <adapter> <harness>` was asked for.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub harness: String,
+    pub cwd: String,
+    pub name: String,
+    /// Where the agent finds the daemon.
+    pub launch_address: String,
+    /// Where the launcher itself reaches the daemon.
+    pub daemon_address: String,
+    pub timeout: Duration,
+    pub check: bool,
+    pub options: Vec<String>,
+}
+
+/// A launch that joined.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub agent_id: String,
+    pub launched: Launched,
+    pub joined: join::Joined,
+}
+
+/// Launch `plan` through `adapter` and wait for it to join. Nothing starts if
+/// the launch address is loopback for a non-local adapter, if the daemon can't
+/// be reached, or if the adapter's `check` fails.
+pub async fn launch(adapter: &dyn Adapter, plan: &Plan) -> Result<Outcome> {
+    let local = adapter.name() == address::LOCAL_ADAPTER;
+    address::check_for_adapter(adapter.name(), &plan.launch_address)?;
+    let roster = join::Roster::connect(&plan.daemon_address).await?;
+    let agent_id = new_agent_id();
+    let req = LaunchRequest {
+        version: PROTOCOL_VERSION,
+        harness: plan.harness.clone(),
+        argv: harness_argv(&plan.harness)?,
+        cwd: plan.cwd.clone(),
+        name: plan.name.clone(),
+        agent_id: agent_id.clone(),
+        marshal_version: MARSHAL_VERSION.into(),
+        env: launch_env(
+            |k| std::env::var(k).ok(),
+            local,
+            &plan.launch_address,
+            &agent_id,
+        ),
+        options: plan.options.clone(),
+    };
+    if plan.check {
+        adapter
+            .check(&req)
+            .with_context(|| format!("the {} adapter's check failed", adapter.name()))?;
+        if local {
+            // The agent runs here, so this machine's view of both ports is the agent's.
+            address::probe(&plan.launch_address, Duration::from_secs(3))?;
+        }
+    }
+    let launched = adapter
+        .launch(&req)
+        .with_context(|| format!("the {} adapter started nothing", adapter.name()))?;
+    eprintln!(
+        "started `{}` at {}; waiting up to {}s for it to join",
+        req.argv.join(" "),
+        launched.r#where,
+        plan.timeout.as_secs()
+    );
+    let joined = roster
+        .wait(adapter, &agent_id, &launched, plan.timeout)
+        .await?;
+    Ok(Outcome {
+        agent_id,
+        launched,
+        joined,
+    })
 }
 
 #[cfg(test)]
@@ -155,6 +285,35 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_gets_the_launch_address_and_this_launchs_id_and_never_the_launchers() {
+        let get = |k: &str| match k {
+            "MARSHAL_AGENT_ID" => Some("the-launcher".to_string()),
+            "MARSHAL_DAEMON_ADDRESS" => Some("ws://localhost:6155".to_string()),
+            "MARSHAL_CODEX_APP_SERVER_SOCKET" | "XDG_CONFIG_HOME" | "MARSHAL_OPERATOR" => {
+                Some(format!("{k}-value"))
+            }
+            _ => None,
+        };
+        let id = new_agent_id();
+        let env = launch_env(get, false, "ws://marshal.mesh:6155", &id);
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "MARSHAL_AGENT_ID",
+                "MARSHAL_DAEMON_ADDRESS",
+                "MARSHAL_OPERATOR"
+            ]
+        );
+        assert_eq!(env["MARSHAL_AGENT_ID"], id);
+        assert_eq!(env["MARSHAL_DAEMON_ADDRESS"], "ws://marshal.mesh:6155");
+        let local = launch_env(get, true, "ws://localhost:6155", &id);
+        assert!(local.contains_key("XDG_CONFIG_HOME"));
+        assert!(!local.keys().any(|k| k.contains("APP_SERVER")));
+        assert!(id.starts_with("launch-") && id.len() == "launch-".len() + 32);
+        assert_ne!(new_agent_id(), id);
+    }
+
+    #[test]
     fn the_target_shim_must_share_major_minor() {
         assert!(same_major_minor("0.60.2", "0.60.9"));
         assert!(same_major_minor("v1.2.3-rc1", "1.2.0"));
@@ -172,6 +331,16 @@ mod tests {
             "{err}"
         );
         assert!(check_shim_version("command not found", "0.60.2").is_err());
+    }
+
+    #[test]
+    fn harnesses_start_with_no_flags() {
+        assert_eq!(harness_argv("claude").unwrap(), ["claude"]);
+        assert_eq!(
+            harness_argv("codex").unwrap(),
+            ["marshal-shim", "codex-run"]
+        );
+        assert!(harness_argv("bash").is_err());
     }
 
     #[test]

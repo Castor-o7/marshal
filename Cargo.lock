@@ -3321,8 +3321,14 @@ name = "marshal-launch"
 version = "0.60.2"
 dependencies = [
  "anyhow",
+ "gethostname",
+ "hyphae",
+ "marshal-entities",
+ "myko",
  "serde",
  "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
