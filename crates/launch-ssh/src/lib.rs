@@ -270,52 +270,128 @@ say() { printf '@@%s\n' "$*"; }
 case "$cwd" in "~") cwd=$HOME ;; "~/"*) cwd=$HOME/${cwd#"~/"} ;; esac
 "#;
 
-/// Claude wired by hand, as upstream's README documents: an MCP server in
-/// `~/.claude.json` (user, or this folder's local entry) or the folder's
-/// `.mcp.json`, and hooks in a `settings.json`. Only the `hooks` and
-/// `mcpServers` keys leave the target, never the whole file: these files can
-/// hold other settings, `env` among them. Reading JSON needs python3 or jq.
-const CLAUDE_HAND_WIRED: &str = r#"jget() {
-  [ -f "$1" ] || return 0
+/// Claude's marshal wiring, worked out on the target, through the
+/// marshal-shim plugin or by hand as upstream's README documents (an MCP
+/// server in `~/.claude.json`, user or this folder's local entry, or the
+/// folder's `.mcp.json`; hooks in a `settings.json`). Only facts leave the
+/// target: which file, each hook that runs `marshal-shim claude-hook <verb>`
+/// (its verb and executable), each MCP server that runs marshal-shim (its
+/// executable and any fixed MARSHAL_DAEMON_ADDRESS), and each shim
+/// executable's `--version`. Other servers, env values, hook arguments and
+/// history stay there (rule 2). Reading the JSON needs python3 or jq.
+const CLAUDE_FACTS: &str = r#"jfacts() {
+  [ -f "$2" ] || return 0
   if command -v python3 >/dev/null 2>&1; then
     python3 -c '
 import json, sys
-path, key, cwd = sys.argv[1:4]
+mode, path, cwd = sys.argv[1:4]
 try:
     d = json.load(open(path))
 except Exception:
     sys.exit(0)
-if key == "local":
-    v = ((d.get("projects") or {}).get(cwd) or {}).get("mcpServers") or {}
+one = lambda s: " ".join(str(s).split())
+if mode == "plugins":
+    for p in d if isinstance(d, list) else []:
+        if isinstance(p, dict) and str(p.get("id", "")).startswith("marshal-shim@"):
+            print(("enabled" if p.get("enabled") is True else "disabled") + "\t" + one(p.get("installPath", "")))
+elif mode == "hooks":
+    def walk(v):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if k == "command" and isinstance(x, str):
+                    print(one(x))
+                else:
+                    walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    walk(d.get("hooks") if isinstance(d, dict) else None)
 else:
-    v = d.get(key) or {}
-print(json.dumps(v))
+    if mode == "local":
+        d = ((d.get("projects") or {}).get(cwd) or {}) if isinstance(d, dict) else {}
+    servers = d.get("mcpServers") if isinstance(d, dict) else None
+    for s in (servers or {}).values() if isinstance(servers, dict) else []:
+        if isinstance(s, dict):
+            e = s.get("env") if isinstance(s.get("env"), dict) else {}
+            print(one(s.get("command", "")) + "\t" + one(e.get("MARSHAL_DAEMON_ADDRESS", "")))
 ' "$1" "$2" "$cwd"
-  elif command -v jq >/dev/null 2>&1; then
-    if [ "$2" = local ]; then
-      jq -c --arg c "$cwd" '.projects[$c].mcpServers // {}' "$1" 2>/dev/null
-    else
-      jq -c --arg k "$2" '.[$k] // {}' "$1" 2>/dev/null
-    fi
+  else
+    case "$1" in
+      plugins) jq -r '.[]? | objects | select((.id // "" | tostring) | startswith("marshal-shim@"))
+                 | [(if .enabled == true then "enabled" else "disabled" end), (.installPath // "" | tostring)]
+                 | map(gsub("\\s+"; " ")) | join("\t")' "$2" 2>/dev/null ;;
+      hooks) jq -r '.hooks? // {} | .. | objects | .command? | strings | gsub("\\s+"; " ")' "$2" 2>/dev/null ;;
+      *) jq -r --arg m "$1" --arg c "$cwd" '(if $m == "local" then (.projects[$c]? // {}) else . end)
+           | .mcpServers? // {} | .[]? | objects
+           | [(.command // "" | tostring), (.env.MARSHAL_DAEMON_ADDRESS? // "" | tostring)]
+           | map(gsub("\\s+"; " ")) | join("\t")' "$2" 2>/dev/null ;;
+    esac
   fi
 }
-claude_hand_wired() {
+is_shim() { case "${1##*/}" in marshal-shim|marshal-shim.exe) return 0 ;; esac; return 1; }
+unq() { u=${1#[\"\']}; printf '%s' "${u%[\"\']}"; }
+tab=$(printf '\t')
+hook_facts() {
+  w=$1
+  jfacts hooks "$2" | while IFS= read -r c; do
+    set -f; set -- $c; set +f
+    e=$(unq "${1:-}")
+    if is_shim "$e" && [ "${2:-}" = claude-hook ] && [ -n "${3:-}" ]; then
+      printf '@@claude-hook %s\t%s\t%s\n' "$3" "$e" "$w"
+    fi
+  done
+}
+mcp_facts() {
+  w=$2
+  jfacts "$1" "$3" | while IFS="$tab" read -r c a; do
+    set -f; set -- $c; set +f
+    e=$(unq "${1:-}")
+    is_shim "$e" || continue
+    case "$a" in *'${MARSHAL_DAEMON_ADDRESS'*) a= ;; esac
+    printf '@@claude-mcp %s\t%s\t%s\n' "$e" "$a" "$w"
+  done
+}
+claude_facts() {
   if ! command -v python3 >/dev/null 2>&1 && ! command -v jq >/dev/null 2>&1; then
     say "no-json-reader"
     return 0
   fi
+  if command -v claude >/dev/null 2>&1; then
+    list=$(mktemp)
+    claude plugin list --json > "$list" 2>/dev/null
+    jfacts plugins "$list" | while IFS="$tab" read -r state p; do
+      printf '@@claude-plugin %s\t%s\n' "$state" "$p"
+      if [ "$state" = enabled ]; then
+        hook_facts "$p/hooks/hooks.json" "$p/hooks/hooks.json"
+        mcp_facts plugin "$p/.mcp.json" "$p/.mcp.json"
+      fi
+    done
+    rm -f "$list"
+  fi
   for f in "$HOME/.claude/settings.json" "$cwd/.claude/settings.json" \
            "$cwd/.claude/settings.local.json" /etc/claude-code/managed-settings.json; do
-    [ -f "$f" ] || continue
-    say "begin claude-settings-hooks $f"; jget "$f" hooks; say "end"
+    hook_facts "$f" "$f"
   done
-  if [ -f "$HOME/.claude.json" ]; then
-    say "begin claude-mcp ~/.claude.json"; jget "$HOME/.claude.json" mcpServers; say "end"
-    say "begin claude-mcp ~/.claude.json for $cwd"; jget "$HOME/.claude.json" local; say "end"
-  fi
-  if [ -f "$cwd/.mcp.json" ]; then
-    say "begin claude-mcp $cwd/.mcp.json"; jget "$cwd/.mcp.json" mcpServers; say "end"
-  fi
+  mcp_facts mcpServers "~/.claude.json" "$HOME/.claude.json"
+  mcp_facts local "~/.claude.json for $cwd" "$HOME/.claude.json"
+  mcp_facts mcpServers "$cwd/.mcp.json" "$cwd/.mcp.json"
+}
+claude_wiring() {
+  facts=$(claude_facts)
+  printf '%s\n' "$facts"
+  # The version of each shim the wiring names by path (a bare marshal-shim
+  # is the one on PATH, checked already).
+  printf '%s\n' "$facts" | awk -F'\t' '
+    /^@@claude-hook / { print $2 }
+    /^@@claude-mcp / { sub(/^@@claude-mcp /, "", $1); print $1 }' \
+    | sort -u | while IFS= read -r e; do
+        case "$e" in */*) ;; *) continue ;; esac
+        if [ -x "$e" ]; then
+          printf '@@shim-at %s\t%s\n' "$e" "$("$e" --version 2>&1 | head -n 1)"
+        else
+          printf '@@shim-at-missing %s\n' "$e"
+        fi
+      done
 }
 "#;
 
@@ -342,7 +418,7 @@ pub fn check_script(t: &Target, req: &LaunchRequest) -> String {
             .unwrap_or("")),
     );
     s.push_str(PRELUDE);
-    s.push_str(CLAUDE_HAND_WIRED);
+    s.push_str(CLAUDE_FACTS);
     s.push_str(&format!(
         r#"probe() {{
   if command -v timeout >/dev/null 2>&1; then
@@ -389,20 +465,7 @@ for f in ${{xdg:+"$xdg/marshal/daemon-address"}} "$HOME/.config/marshal/daemon-a
 done
 case "$harness" in
 claude)
-  if command -v claude >/dev/null 2>&1; then
-    say "begin claude-plugins"
-    claude plugin list --json 2>/dev/null
-    say "end"
-    claude plugin list --json 2>/dev/null \
-      | grep -o '"installPath": *"[^"]*"' | sed 's/^.*"\([^"]*\)"$/\1/' \
-      | while IFS= read -r p; do
-          case "$p" in */marshal-shim/*|*/marshal-shim)
-            say "begin claude-plugin-hooks $p"; cat "$p/hooks/hooks.json" 2>/dev/null; echo; say "end"
-            say "begin claude-plugin-mcp $p"; cat "$p/.mcp.json" 2>/dev/null; echo; say "end"
-          ;; esac
-        done
-  fi
-  claude_hand_wired
+  claude_wiring
   ;;
 codex)
   cfg="${{CODEX_HOME:-$HOME/.codex}}/config.toml"
@@ -423,6 +486,25 @@ say "done"
     s
 }
 
+/// A Claude hook that runs `marshal-shim claude-hook <verb>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeHook {
+    pub verb: String,
+    pub exe: String,
+    /// The file it's in.
+    pub from: String,
+}
+
+/// A Claude MCP server that runs marshal-shim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeMcp {
+    pub exe: String,
+    /// A MARSHAL_DAEMON_ADDRESS fixed in its config, if any.
+    pub fixed_address: Option<String>,
+    /// The file it's in.
+    pub from: String,
+}
+
 /// What the `check` script reported.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Probe {
@@ -435,9 +517,17 @@ pub struct Probe {
     pub harness: Option<bool>,
     /// `marshal-shim --version` output; `None` if not on PATH.
     pub shim: Option<String>,
-    /// Multi-line blocks, keyed by their `begin` line (`claude-plugins`,
-    /// `claude-plugin-hooks <path>`, `codex-managed`, ...).
+    /// Multi-line blocks, keyed by their `begin` line (`codex-managed`).
     pub blocks: BTreeMap<String, String>,
+    /// The marshal-shim plugin, if Claude lists it: enabled, and its path.
+    pub claude_plugin: Option<(bool, String)>,
+    /// Each Claude hook that runs `marshal-shim claude-hook <verb>`.
+    pub claude_hooks: Vec<ClaudeHook>,
+    /// Each Claude MCP server that runs marshal-shim.
+    pub claude_mcp: Vec<ClaudeMcp>,
+    /// Each shim the wiring names by path: its `--version`, or `None` if
+    /// it isn't there.
+    pub shims_at: Vec<(String, Option<String>)>,
     pub codex_config_missing: Option<String>,
     /// The hook listener the target's own `MARSHAL_BASE_URL` names, when the
     /// request sets none: the shim there uses it, so the check probes it.
@@ -481,6 +571,36 @@ impl Probe {
                 "shim" => p.shim = Some(v.to_string()),
                 "codex-config-missing" => p.codex_config_missing = Some(v.to_string()),
                 "no-json-reader" => p.no_json_reader = true,
+                "claude-plugin" => {
+                    if let Some((state, path)) = v.split_once('\t') {
+                        p.claude_plugin = Some((state == "enabled", path.to_string()));
+                    }
+                }
+                "claude-hook" => {
+                    let f: Vec<&str> = v.splitn(3, '\t').collect();
+                    if let [verb, exe, from] = f[..] {
+                        p.claude_hooks.push(ClaudeHook {
+                            verb: verb.into(),
+                            exe: exe.into(),
+                            from: from.into(),
+                        });
+                    }
+                }
+                "claude-mcp" => {
+                    let f: Vec<&str> = v.splitn(3, '\t').collect();
+                    if let [exe, addr, from] = f[..] {
+                        p.claude_mcp.push(ClaudeMcp {
+                            exe: exe.into(),
+                            fixed_address: (!addr.is_empty()).then(|| addr.to_string()),
+                            from: from.into(),
+                        });
+                    }
+                }
+                "shim-at" => {
+                    let (exe, ver) = v.split_once('\t').unwrap_or((v, ""));
+                    p.shims_at.push((exe.into(), Some(ver.into())));
+                }
+                "shim-at-missing" => p.shims_at.push((v.into(), None)),
                 "hook-from-target" => {
                     p.hook_from_target = v.split_once(' ').and_then(|(h, port)| {
                         Some(HostPort {
@@ -562,7 +682,7 @@ impl Probe {
             ));
         }
         match req.harness.as_str() {
-            "claude" => f.extend(self.claude_wiring(host, t)),
+            "claude" => f.extend(self.claude_wiring(host, t, req)),
             "codex" => f.extend(self.codex_wiring(host, t)),
             other => f.push(format!(
                 "the ssh adapter can't check the wiring of harness `{other}` (it knows claude and codex)"
@@ -573,48 +693,12 @@ impl Probe {
 
     /// Claude is wired when some MCP server it loads runs marshal-shim and
     /// its hooks run `marshal-shim claude-hook`, including `wait`, through
-    /// the marshal-shim plugin or by hand.
-    fn claude_wiring(&self, host: &str, t: &Target) -> Vec<String> {
-        let mut hooks: Vec<String> = Vec::new();
-        let mut servers: Vec<(String, Value)> = Vec::new();
+    /// the marshal-shim plugin or by hand; and every shim they name by path
+    /// is there at this launch's major.minor.
+    fn claude_wiring(&self, host: &str, t: &Target, req: &LaunchRequest) -> Vec<String> {
         let mut notes: Vec<String> = Vec::new();
-        let json = |k: &str| {
-            self.blocks
-                .get(k)
-                .and_then(|b| serde_json::from_str::<Value>(b).ok())
-        };
-        let plugins: Vec<Value> = self
-            .blocks
-            .get("claude-plugins")
-            .and_then(|b| serde_json::from_str(b).ok())
-            .unwrap_or_default();
-        if let Some(p) = plugins.iter().find(|p| {
-            p["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("marshal-shim@"))
-        }) {
-            let path = p["installPath"].as_str().unwrap_or("");
-            if p["enabled"] == Value::Bool(true) {
-                if let Some(h) = json(&format!("claude-plugin-hooks {path}")) {
-                    collect_commands(&h, &mut hooks);
-                }
-                if let Some(m) = json(&format!("claude-plugin-mcp {path}")) {
-                    push_servers(&m["mcpServers"], &format!("{path}/.mcp.json"), &mut servers);
-                }
-            } else {
-                notes.push("the marshal-shim plugin is installed but not enabled".into());
-            }
-        }
-        for k in self.blocks.keys() {
-            if k.starts_with("claude-settings-hooks ") {
-                if let Some(h) = json(k) {
-                    collect_commands(&h, &mut hooks);
-                }
-            } else if let Some(w) = k.strip_prefix("claude-mcp ")
-                && let Some(m) = json(k)
-            {
-                push_servers(&m, w, &mut servers);
-            }
+        if matches!(self.claude_plugin, Some((false, _))) {
+            notes.push("the marshal-shim plugin is installed but not enabled".into());
         }
         if self.no_json_reader {
             notes.push("it has neither python3 nor jq to read Claude's settings files".into());
@@ -626,42 +710,50 @@ impl Probe {
         };
 
         let mut f = Vec::new();
-        let shim_servers: Vec<_> = servers
-            .iter()
-            .filter(|(_, s)| s["command"].as_str().is_some_and(is_shim_command))
-            .collect();
-        if shim_servers.is_empty() {
+        if self.claude_mcp.is_empty() {
             f.push(format!(
                 "Claude on {host} has no MCP server that runs marshal-shim: none in the \
                  marshal-shim plugin, ~/.claude.json or the folder's .mcp.json{why}"
             ));
         }
-        for (w, server) in shim_servers {
+        for m in &self.claude_mcp {
             // A fixed address elsewhere would send the agent to another daemon.
-            if let Some(a) = server["env"]["MARSHAL_DAEMON_ADDRESS"].as_str()
-                && !a.contains("${MARSHAL_DAEMON_ADDRESS")
+            if let Some(a) = &m.fixed_address
                 && ws_host_port(a).as_ref() != Some(&t.daemon)
             {
                 f.push(format!(
-                    "Claude's marshal-shim MCP server on {host} ({w}) is fixed to {a}, not the \
+                    "Claude's marshal-shim MCP server on {host} ({}) is fixed to {a}, not the \
                      launch address {}",
-                    t.daemon
+                    m.from, t.daemon
                 ));
             }
         }
-        let verbs: Vec<&str> = hooks.iter().filter_map(|c| shim_hook_verb(c)).collect();
-        if verbs.is_empty() {
+        if self.claude_hooks.is_empty() {
             f.push(format!(
                 "Claude's hooks on {host} don't run `marshal-shim claude-hook`: none in the \
                  marshal-shim plugin or a settings.json, so a launched agent would not get its \
                  mail{why}"
             ));
-        } else if !verbs.contains(&"wait") {
+        } else if !self.claude_hooks.iter().any(|h| h.verb == "wait") {
             f.push(format!(
                 "Claude's hooks on {host} run marshal-shim but not `marshal-shim claude-hook \
                  wait`, which wakes an idle agent when its first task arrives. Add it as an \
                  asyncRewake hook on SessionStart and Stop, as the marshal-shim plugin does"
             ));
+        }
+        for (exe, ver) in &self.shims_at {
+            match ver {
+                None => f.push(format!(
+                    "Claude's marshal wiring on {host} runs {exe}, which isn't there"
+                )),
+                Some(v) => {
+                    if let Err(e) = check_shim_version(v, &req.marshal_version) {
+                        f.push(format!(
+                            "on {host}, {exe} (in Claude's marshal wiring): {e:#}"
+                        ));
+                    }
+                }
+            }
         }
         f
     }
@@ -722,43 +814,6 @@ fn toml_string_after(s: &str, key: &str) -> Option<String> {
         .trim_start();
     let rest = rest.strip_prefix('"')?;
     Some(rest[..rest.find('"')?].to_string())
-}
-
-/// Every `"command"` string anywhere under `v`.
-fn collect_commands(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::Object(m) => {
-            for (k, x) in m {
-                match (k.as_str(), x.as_str()) {
-                    ("command", Some(c)) => out.push(c.to_string()),
-                    _ => collect_commands(x, out),
-                }
-            }
-        }
-        Value::Array(a) => a.iter().for_each(|x| collect_commands(x, out)),
-        _ => {}
-    }
-}
-
-/// Each server in an `mcpServers` object, with where it came from.
-fn push_servers(v: &Value, from: &str, out: &mut Vec<(String, Value)>) {
-    if let Some(m) = v.as_object() {
-        out.extend(m.values().map(|s| (from.to_string(), s.clone())));
-    }
-}
-
-/// `marshal-shim claude-hook wait` (the executable may be a path, quoted) → `wait`.
-fn shim_hook_verb(command: &str) -> Option<&str> {
-    let mut w = command.split_whitespace();
-    if !is_shim_command(w.next()?.trim_matches(['\'', '"'])) || w.next()? != "claude-hook" {
-        return None;
-    }
-    w.next()
-}
-
-fn is_shim_command(c: &str) -> bool {
-    let base = c.rsplit(['/', '\\']).next().unwrap_or(c);
-    base == "marshal-shim" || base == "marshal-shim.exe"
 }
 
 /// The `launch` script: start `argv` in a detached tmux session, in `cwd`,
@@ -1044,13 +1099,15 @@ mod tests {
         assert!(parse_handle("nospace").is_err());
     }
 
+    /// The facts a target wired through the marshal-shim plugin reports.
     fn good_claude_probe(path: &str) -> String {
         format!(
             "profile noise\n@@host build-03\n@@daemon-port ok\n@@hook-port ok\n@@cwd /home/u/work/app\n\
              @@tmux ok\n@@harness ok\n@@shim marshal-shim {VERSION}\n\
-             @@begin claude-plugins\n[{{\"id\":\"marshal-shim@marshal\",\"enabled\":true,\"installPath\":\"{path}\"}}]\n@@end\n\
-             @@begin claude-plugin-hooks {path}\n{{\"hooks\":{{\"Stop\":[{{\"hooks\":[{{\"command\":\"marshal-shim claude-hook wait\"}}]}}]}}}}\n@@end\n\
-             @@begin claude-plugin-mcp {path}\n{{\"mcpServers\":{{\"marshal\":{{\"command\":\"marshal-shim\",\"env\":{{\"MARSHAL_DAEMON_ADDRESS\":\"${{MARSHAL_DAEMON_ADDRESS:-ws://localhost:6155}}\"}}}}}}}}\n@@end\n\
+             @@claude-plugin enabled\t{path}\n\
+             @@claude-hook session-start\tmarshal-shim\t{path}/hooks/hooks.json\n\
+             @@claude-hook wait\tmarshal-shim\t{path}/hooks/hooks.json\n\
+             @@claude-mcp marshal-shim\t\t{path}/.mcp.json\n\
              @@done\n"
         )
     }
@@ -1070,53 +1127,68 @@ mod tests {
         f[0].clone()
     }
 
-    /// Wired by hand as upstream's README documents, with the wait hook added.
-    fn hand_wired_claude_probe(hooks: &str) -> String {
-        format!(
+    /// Wired by hand as upstream's README documents: an MCP server in
+    /// ~/.claude.json and hooks in ~/.claude/settings.json, the shim by path.
+    fn hand_wired_claude_probe(verbs: &[&str]) -> String {
+        let mut s = format!(
             "@@host build-03\n@@daemon-port ok\n@@hook-port ok\n@@cwd /home/u/work/app\n\
-             @@tmux ok\n@@harness ok\n@@shim marshal-shim {VERSION}\n\
-             @@begin claude-plugins\n[]\n@@end\n\
-             @@begin claude-settings-hooks /home/u/.claude/settings.json\n{hooks}\n@@end\n\
-             @@begin claude-mcp ~/.claude.json\n{{\"marshal\":{{\"command\":\"/home/u/.local/bin/marshal-shim\"}}}}\n@@end\n\
-             @@begin claude-mcp ~/.claude.json for /home/u/work/app\n{{}}\n@@end\n\
-             @@done\n"
-        )
+             @@tmux ok\n@@harness ok\n@@shim marshal-shim {VERSION}\n"
+        );
+        for v in verbs {
+            s.push_str(&format!(
+                "@@claude-hook {v}\t/home/u/.local/bin/marshal-shim\t/home/u/.claude/settings.json\n"
+            ));
+        }
+        s.push_str("@@claude-mcp /home/u/.local/bin/marshal-shim\t\t~/.claude.json\n");
+        s.push_str(&format!(
+            "@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}\n@@done\n"
+        ));
+        s
     }
-
-    const README_HOOKS: &str = r#"{"SessionStart":[{"hooks":[{"type":"command","command":"marshal-shim claude-hook session-start","timeout":15}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"marshal-shim claude-hook prompt-submit","timeout":15}]}]}"#;
 
     #[test]
     fn a_hand_wired_claude_target_passes_once_it_has_the_wait_hook() {
         let r = req("ws://marshal.mesh:6155");
         let t = Target::from_request(&r).unwrap();
-        let with_wait = README_HOOKS.replace(
-            r#""UserPromptSubmit""#,
-            r#""Stop":[{"hooks":[{"type":"command","command":"'/home/u/.local/bin/marshal-shim' claude-hook wait","asyncRewake":true}]}],"UserPromptSubmit""#,
-        );
-        let p = Probe::parse(&hand_wired_claude_probe(&with_wait));
+        let p = Probe::parse(&hand_wired_claude_probe(&[
+            "session-start",
+            "prompt-submit",
+            "wait",
+        ]));
         assert_eq!(p.failures(&t, &r), Vec::<String>::new());
         // The README's hooks alone have no waiter.
-        let e = one_failure(&hand_wired_claude_probe(README_HOOKS), &r);
+        let e = one_failure(
+            &hand_wired_claude_probe(&["session-start", "prompt-submit"]),
+            &r,
+        );
         assert!(e.contains("not `marshal-shim claude-hook wait`"), "{e}");
-        // An MCP server in this folder's ~/.claude.json entry counts too.
-        let local = hand_wired_claude_probe(&with_wait)
-            .replace(
-                "@@begin claude-mcp ~/.claude.json\n{\"marshal\":{\"command\":\"/home/u/.local/bin/marshal-shim\"}}",
-                "@@begin claude-mcp ~/.claude.json\n{}",
-            )
-            .replace(
-                "for /home/u/work/app\n{}",
-                "for /home/u/work/app\n{\"m\":{\"command\":\"marshal-shim\"}}",
-            );
-        assert_eq!(Probe::parse(&local).failures(&t, &r), Vec::<String>::new());
+        // A shim named by path is checked at this launch's version too.
+        let old = hand_wired_claude_probe(&["wait"]).replace(
+            &format!("@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}"),
+            "@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim 0.1.0",
+        );
+        let e = one_failure(&old, &r);
+        assert!(
+            e.contains("/home/u/.local/bin/marshal-shim (in Claude's marshal wiring)")
+                && e.contains("0.1.0"),
+            "{e}"
+        );
+        let gone = hand_wired_claude_probe(&["wait"]).replace(
+            &format!("@@shim-at /home/u/.local/bin/marshal-shim\tmarshal-shim {VERSION}"),
+            "@@shim-at-missing /home/u/.local/bin/marshal-shim",
+        );
+        assert!(one_failure(&gone, &r).contains("which isn't there"));
     }
 
     #[test]
     fn a_disabled_or_missing_plugin_with_nothing_by_hand_says_so() {
         let r = req("ws://marshal.mesh:6155");
         let t = Target::from_request(&r).unwrap();
-        let good = good_claude_probe("/p/marshal-shim/0.60.2");
-        let off = good.replace("\"enabled\":true", "\"enabled\":false");
+        let bare = format!(
+            "@@host build-03\n@@daemon-port ok\n@@hook-port ok\n@@cwd /w\n@@tmux ok\n\
+             @@harness ok\n@@shim marshal-shim {VERSION}\n"
+        );
+        let off = format!("{bare}@@claude-plugin disabled\t/p\n@@done\n");
         let f = Probe::parse(&off).failures(&t, &r);
         assert_eq!(f.len(), 2, "{f:#?}");
         assert!(
@@ -1133,9 +1205,9 @@ mod tests {
             f.iter().all(|x| x.contains("installed but not enabled")),
             "{f:#?}"
         );
-        let none = good.replace("marshal-shim@marshal", "other@marshal");
+        let none = format!("{bare}@@done\n");
         assert_eq!(Probe::parse(&none).failures(&t, &r).len(), 2);
-        let nojson = none.replace("@@done\n", "@@no-json-reader\n@@done\n");
+        let nojson = format!("{bare}@@no-json-reader\n@@done\n");
         let f = Probe::parse(&nojson).failures(&t, &r);
         assert!(
             f.iter().all(|x| x.contains("neither python3 nor jq")),
@@ -1147,6 +1219,8 @@ mod tests {
     fn each_failure_says_why() {
         let r = req("ws://marshal.mesh:6155");
         let good = good_claude_probe("/p/marshal-shim/0.60.2");
+        let hooks = "@@claude-hook session-start\tmarshal-shim\t/p/marshal-shim/0.60.2/hooks/hooks.json\n\
+                     @@claude-hook wait\tmarshal-shim\t/p/marshal-shim/0.60.2/hooks/hooks.json\n";
         let cases = [
             (
                 "@@daemon-port ok",
@@ -1166,24 +1240,18 @@ mod tests {
             ("@@tmux ok", "@@tmux missing", "no tmux"),
             ("@@harness ok", "@@harness missing", "no `claude`"),
             (
-                "marshal-shim claude-hook wait",
-                "other",
+                hooks,
+                "",
                 "hooks on build-03 don't run `marshal-shim claude-hook`",
             ),
             (
-                "marshal-shim claude-hook wait",
-                "marshal-shim claude-hook prompt-submit",
+                "@@claude-hook wait\t",
+                "@@claude-hook prompt-submit\t",
                 "not `marshal-shim claude-hook wait`",
             ),
             (
-                // Text that merely mentions the hook is not a hook that runs it.
-                "marshal-shim claude-hook wait",
-                "echo marshal-shim claude-hook wait",
-                "don't run `marshal-shim claude-hook`",
-            ),
-            (
-                "\"command\":\"marshal-shim\"",
-                "\"command\":\"other\"",
+                "@@claude-mcp marshal-shim\t\t/p/marshal-shim/0.60.2/.mcp.json\n",
+                "",
                 "has no MCP server that runs marshal-shim",
             ),
             ("@@done\n", "", "stopped before it finished"),
@@ -1216,10 +1284,18 @@ mod tests {
         let none = good.replace(&format!("@@shim marshal-shim {VERSION}"), "@@shim-missing");
         assert!(one_failure(&none, &r).contains("no marshal-shim on PATH"));
         let fixed = good.replace(
-            "${MARSHAL_DAEMON_ADDRESS:-ws://localhost:6155}",
-            "ws://other:6155",
+            "@@claude-mcp marshal-shim\t\t",
+            "@@claude-mcp marshal-shim\tws://other:6155\t",
         );
         assert!(one_failure(&fixed, &r).contains("fixed to ws://other:6155"));
+        let same_addr = good.replace(
+            "@@claude-mcp marshal-shim\t\t",
+            "@@claude-mcp marshal-shim\tws://marshal.mesh:6155\t",
+        );
+        assert_eq!(
+            Probe::parse(&same_addr).failures(&Target::from_request(&r).unwrap(), &r),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

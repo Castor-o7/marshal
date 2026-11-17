@@ -3,6 +3,16 @@
 # The adapter calls `<ssh> -o ... -o ... -- <dest> 'bash -l -s'`; this runs
 # `bash -s` (no -l, so the test's PATH survives /etc/profile) with the
 # script on stdin. FAKE_SSH_UNREACHABLE=1 exits 255, as ssh does when the
-# host can't be reached.
+# host can't be reached. FAKE_SSH_TRANSCRIPT=<file> appends everything the
+# "target" sends back (stdout and stderr) to <file>, so a test can see what
+# would cross the wire.
 [ "${FAKE_SSH_UNREACHABLE:-}" = 1 ] && { echo "ssh: connect to host: No route to host" >&2; exit 255; }
+if [ -n "${FAKE_SSH_TRANSCRIPT:-}" ]; then
+  out=$(mktemp); err=$(mktemp)
+  bash -s > "$out" 2> "$err"; rc=$?
+  cat "$out" "$err" >> "$FAKE_SSH_TRANSCRIPT"
+  cat "$out"; cat "$err" >&2
+  rm -f "$out" "$err"
+  exit $rc
+fi
 exec bash -s

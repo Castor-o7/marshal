@@ -433,3 +433,62 @@ fn check_reaches_listening_ports() {
     assert!(err.contains("can't run this launch"), "{err}");
     assert!(!err.contains("can't reach the daemon"), "{err}");
 }
+
+/// Rule 2: check brings back facts about the wiring, never the target's
+/// secrets. Other MCP servers' env, settings env, hook arguments and
+/// history stay on the target.
+#[test]
+fn check_brings_no_secrets_back_from_the_target() {
+    if !have_json_reader() {
+        eprintln!("skipping: neither python3 nor jq");
+        return;
+    }
+    let e = Env::new();
+    e.bin(
+        "marshal-shim",
+        &format!("echo 'marshal-shim {}'", marshal_launch_ssh::VERSION),
+    );
+    e.bin(
+        "claude",
+        "echo '[{\"id\":\"other@x\",\"enabled\":true,\"installPath\":\"/p/SECRET-PLUGIN-PATH\"}]'",
+    );
+    std::fs::write(
+        e.path("home/.claude.json"),
+        r#"{"oauthAccount": {"accessToken": "SECRET-OAUTH-TOKEN"},
+            "mcpServers": {
+              "marshal": {"command": "marshal-shim", "env": {"API_KEY": "SECRET-MARSHAL-ENV"}},
+              "github": {"command": "gh-mcp", "env": {"GITHUB_TOKEN": "SECRET-GITHUB-TOKEN"}}},
+            "projects": {"/elsewhere": {"history": ["SECRET-HISTORY"]}}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(e.path("home/.claude")).unwrap();
+    std::fs::write(
+        e.path("home/.claude/settings.json"),
+        r#"{"env": {"ANTHROPIC_API_KEY": "SECRET-ANTHROPIC-KEY"}, "hooks": {
+              "SessionStart": [{"hooks": [
+                {"type": "command", "command": "marshal-shim claude-hook session-start --token SECRET-HOOK-ARG"},
+                {"type": "command", "command": "TOKEN=SECRET-OTHER-HOOK other-tool run"}]}]}}"#,
+    )
+    .unwrap();
+    let transcript = e.path("transcript");
+    let o = e.run(
+        "check",
+        &e.request(&["claude"]),
+        &[("FAKE_SSH_TRANSCRIPT", transcript.to_str().unwrap())],
+    );
+    let wire = std::fs::read_to_string(&transcript).unwrap();
+    // The facts check needs did come back.
+    assert!(
+        wire.contains("@@claude-hook session-start\tmarshal-shim\t"),
+        "{wire}"
+    );
+    assert!(
+        wire.contains("@@claude-mcp marshal-shim\t\t~/.claude.json"),
+        "{wire}"
+    );
+    let shown = format!("{wire}{}{}", String::from_utf8_lossy(&o.stdout), stderr(&o));
+    assert!(
+        !shown.contains("SECRET"),
+        "a secret left the target:\n{shown}"
+    );
+}
